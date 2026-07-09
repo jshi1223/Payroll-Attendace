@@ -1,0 +1,1346 @@
+require('dotenv').config();
+
+const express = require('express');
+const session = require('express-session');
+const pgSession = require('connect-pg-simple')(session);
+const bcrypt = require('bcryptjs');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const { Pool } = require('pg');
+const path = require('path');
+const fs = require('fs');
+
+if (!process.env.DATABASE_URL) {
+  console.error('FATAL: DATABASE_URL environment variable is required.');
+  process.exit(1);
+}
+if (!process.env.SESSION_SECRET) {
+  console.error('FATAL: SESSION_SECRET environment variable is required.');
+  process.exit(1);
+}
+
+const app = express();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
+
+const PORT = process.env.PORT || 3001;
+
+const uploadsDir = path.join(__dirname, 'public', 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, `emp_${req.params.id}_${Date.now()}${ext}`);
+  }
+});
+const upload = multer({
+  storage,
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) return cb(new Error('Only image files allowed.'));
+    cb(null, true);
+  }
+});
+
+app.use('/uploads', express.static(uploadsDir));
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(session({
+  store: new pgSession({
+    pool,
+    tableName: 'user_sessions',
+    createTableIfMissing: true
+  }),
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: 1000 * 60 * 60 * 8
+  }
+}));
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many login attempts. Please try again later.' }
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: 'Login required.' });
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (req.session.user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+  next();
+}
+
+function parseDateOnly(dateInput) {
+  const value = typeof dateInput === 'string' ? dateInput.slice(0, 10) : todayInManila();
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function formatDateOnly(date) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function todayInManila() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Manila',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function weekStartOf(dateInput) {
+  const date = parseDateOnly(dateInput);
+  const day = date.getUTCDay();
+  date.setUTCDate(date.getUTCDate() - day);
+  return formatDateOnly(date);
+}
+
+function payrollWeekStartOf(dateInput) {
+  const date = parseDateOnly(dateInput);
+  const day = date.getUTCDay();
+  const offset = day === 0 ? -6 : 1 - day;
+  date.setUTCDate(date.getUTCDate() + offset);
+  return formatDateOnly(date);
+}
+
+function addDays(dateInput, days) {
+  const date = parseDateOnly(dateInput);
+  date.setUTCDate(date.getUTCDate() + days);
+  return formatDateOnly(date);
+}
+
+function money(value) {
+  return Number(value || 0);
+}
+
+function calculatePayrollWeekState({ previousBaleBalance = 0, previousUnpaidBalance = 0, salary = 0, cashAdvance = 0, salaryPaidAmount = 0, deductBale = false, balePaymentAmount = 0 }) {
+  const paymentToPreviousUnpaid = Math.min(salaryPaidAmount, previousUnpaidBalance);
+  const currentSalaryPaidAmount = Math.min(Math.max(salaryPaidAmount - paymentToPreviousUnpaid, 0), salary);
+  const totalBale = previousBaleBalance + cashAdvance;
+
+  let baleDeduction, remainingBaleBalance, takeHome;
+  if (deductBale && salary === 0) {
+    // When walang pasok (no salary), payment goes directly to reduce bale
+    const afterPreviousUnpaid = Math.max(salaryPaidAmount - paymentToPreviousUnpaid, 0);
+    baleDeduction = Math.min(totalBale, afterPreviousUnpaid);
+    remainingBaleBalance = Math.max(totalBale - baleDeduction - balePaymentAmount, 0);
+    takeHome = 0;
+    currentUnpaidBalance = Math.max(takeHome - currentSalaryPaidAmount - balePaymentAmount, 0);
+
+  } else {
+    // Cash advance (bale) increases bale balance (debt tracking)
+    baleDeduction = 0;
+    remainingBaleBalance = Math.max(totalBale - balePaymentAmount, 0);
+    takeHome = Math.max(salary, 0);
+    currentUnpaidBalance = Math.max(takeHome - currentSalaryPaidAmount - balePaymentAmount, 0);
+  }
+
+  const balance = Math.max(previousUnpaidBalance - paymentToPreviousUnpaid, 0) + currentUnpaidBalance;
+  const paymentLimit = Math.max(0, previousUnpaidBalance + Math.max(salary, 0)) + (deductBale && salary === 0 ? totalBale : 0);
+
+  return {
+    totalBale,
+    baleDeduction,
+    remainingBaleBalance,
+    takeHome,
+    balance,
+    paymentLimit,
+    currentSalaryPaidAmount,
+    paymentToPreviousUnpaid
+  };
+}
+
+async function assertPaymentWithinBalance(employee_id, paymentDate, newAmount, type, excludeId) {
+  const weekStart = payrollWeekStartOf(paymentDate);
+  const weekEnd = addDays(weekStart, 6);
+
+  const [totals, carryovers, payStatus, salaryPays, balePays] = await Promise.all([
+    pool.query(`
+      WITH attendance AS (
+        SELECT COALESCE(SUM(rate_snapshot), 0)::numeric(12,2) AS salary
+        FROM attendance_logs
+        WHERE employee_id = $1 AND work_date BETWEEN $2 AND $3
+      ),
+      advances AS (
+        SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS cash_advance
+        FROM cash_advances
+        WHERE employee_id = $1 AND advance_date BETWEEN $2 AND $3
+      )
+      SELECT attendance.salary, advances.cash_advance
+      FROM attendance, advances`,
+      [employee_id, weekStart, weekEnd]),
+    getPayrollCarryoversBefore(employee_id, weekStart),
+    pool.query(`SELECT COALESCE(paid_amount, 0)::numeric(12,2) AS paid_amount
+      FROM payroll_statuses WHERE employee_id = $1 AND week_start = $2`,
+      [employee_id, weekStart]),
+    pool.query(`SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS total
+      FROM salary_payments
+      WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3
+        ${type === 'salary' && excludeId ? `AND id != ${Number(excludeId)}` : ''}`,
+      [employee_id, weekStart, weekEnd]),
+    pool.query(`SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS total
+      FROM bale_payments
+      WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3
+        ${type === 'bale' && excludeId ? `AND id != ${Number(excludeId)}` : ''}`,
+      [employee_id, weekStart, weekEnd])
+  ]);
+
+  const salary = money(totals.rows[0]?.salary);
+  const cashAdvance = money(totals.rows[0]?.cash_advance);
+  const existingSalaryPaid = money(salaryPays.rows[0]?.total) + money(payStatus.rows[0]?.paid_amount);
+  const existingBalePaid = money(balePays.rows[0]?.total);
+
+  let proposedSalaryPaid = existingSalaryPaid;
+  let proposedBalePaid = existingBalePaid;
+  if (type === 'salary') proposedSalaryPaid += Number(newAmount);
+  if (type === 'bale') proposedBalePaid += Number(newAmount);
+
+  const weekState = calculatePayrollWeekState({
+    previousBaleBalance: carryovers.baleBalance,
+    previousUnpaidBalance: carryovers.unpaidBalance,
+    salary,
+    cashAdvance,
+    salaryPaidAmount: proposedSalaryPaid,
+    balePaymentAmount: proposedBalePaid
+  });
+
+  if (proposedSalaryPaid + proposedBalePaid > weekState.paymentLimit) {
+    throw new Error('Hindi sapat ang balance para sa payment na ito.');
+  }
+}
+
+async function getPayrollCarryoversBefore(employeeId, weekStart) {
+  const result = await pool.query(
+    `WITH salary_weeks AS (
+       SELECT work_date + (CASE WHEN EXTRACT(DOW FROM work_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM work_date) END)::int AS week_start,
+         SUM(rate_snapshot)::numeric(12,2) AS salary
+       FROM attendance_logs
+       WHERE employee_id = $1 AND work_date < $2
+       GROUP BY 1
+     ),
+     advance_weeks AS (
+       SELECT advance_date + (CASE WHEN EXTRACT(DOW FROM advance_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM advance_date) END)::int AS week_start,
+         SUM(amount)::numeric(12,2) AS advance
+       FROM cash_advances
+       WHERE employee_id = $1 AND advance_date < $2
+       GROUP BY 1
+     ),
+     payment_weeks AS (
+       SELECT week_start,
+         SUM(paid_amount)::numeric(12,2) AS payment,
+         bool_or(bale_deducted) AS bale_deducted
+       FROM payroll_statuses
+       WHERE employee_id = $1 AND week_start < $2
+       GROUP BY week_start
+     ),
+     bale_payment_weeks AS (
+       SELECT payment_date + (CASE WHEN EXTRACT(DOW FROM payment_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM payment_date) END)::int AS week_start,
+         SUM(amount)::numeric(12,2) AS bale_paid
+       FROM bale_payments
+       WHERE employee_id = $1 AND payment_date < $2
+       GROUP BY 1
+     ),
+     salary_pay_weeks AS (
+       SELECT payment_date + (CASE WHEN EXTRACT(DOW FROM payment_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM payment_date) END)::int AS week_start,
+         SUM(amount)::numeric(12,2) AS salary_pay
+       FROM salary_payments
+       WHERE employee_id = $1 AND payment_date < $2
+       GROUP BY 1
+     ),
+     weeks AS (
+       SELECT week_start FROM salary_weeks
+       UNION
+       SELECT week_start FROM advance_weeks
+       UNION
+       SELECT week_start FROM payment_weeks
+       UNION
+       SELECT week_start FROM bale_payment_weeks
+       UNION
+       SELECT week_start FROM salary_pay_weeks
+     )
+     SELECT w.week_start,
+       COALESCE(s.salary, 0)::numeric(12,2) AS salary,
+       COALESCE(a.advance, 0)::numeric(12,2) AS advance,
+       (COALESCE(p.payment, 0) + COALESCE(sp.salary_pay, 0))::numeric(12,2) AS payment,
+       COALESCE(p.bale_deducted, false) AS bale_deducted,
+       COALESCE(bp.bale_paid, 0)::numeric(12,2) AS bale_paid
+     FROM weeks w
+     LEFT JOIN salary_weeks s ON s.week_start = w.week_start
+     LEFT JOIN advance_weeks a ON a.week_start = w.week_start
+     LEFT JOIN payment_weeks p ON p.week_start = w.week_start
+     LEFT JOIN bale_payment_weeks bp ON bp.week_start = w.week_start
+     LEFT JOIN salary_pay_weeks sp ON sp.week_start = w.week_start
+     ORDER BY w.week_start ASC`,
+    [employeeId, weekStart]
+  );
+
+  return result.rows.reduce((state, row) => {
+    const weekState = calculatePayrollWeekState({
+      previousBaleBalance: state.baleBalance,
+      previousUnpaidBalance: state.unpaidBalance,
+      salary: money(row.salary),
+      cashAdvance: money(row.advance),
+      salaryPaidAmount: money(row.payment),
+      deductBale: row.bale_deducted,
+      balePaymentAmount: money(row.bale_paid)
+    });
+    return {
+      baleBalance: weekState.remainingBaleBalance,
+      unpaidBalance: weekState.balance
+    };
+  }, { baleBalance: 0, unpaidBalance: 0 });
+}
+
+function workingDaysInWeek(weekStart, currentDate = todayInManila()) {
+  const today = currentDate.slice(0, 10);
+  const weekEnd = addDays(weekStart, 6);
+
+  if (today < weekStart) return 0;
+
+  const cutoff = today > weekEnd ? weekEnd : today;
+  return Array.from({ length: 7 }, (_, index) => addDays(weekStart, index))
+    .filter(date => date >= weekStart && date <= cutoff)
+    .length;
+}
+
+async function initDatabase() {
+  const schema = fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8');
+  await pool.query(schema);
+  await pool.query('ALTER TABLE attendance_logs ALTER COLUMN time_in DROP NOT NULL');
+  await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS photo_url VARCHAR(500)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payroll_statuses (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      week_start DATE NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'unpaid' CHECK (status IN ('paid', 'unpaid')),
+      paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0),
+      extra_payment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (extra_payment_amount >= 0),
+      extra_payment_notes TEXT DEFAULT '',
+      paid_at TIMESTAMPTZ,
+      updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (employee_id, week_start)
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_statuses_week ON payroll_statuses(week_start);
+    ALTER TABLE payroll_statuses
+    ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0);
+    ALTER TABLE payroll_statuses
+    ADD COLUMN IF NOT EXISTS extra_payment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (extra_payment_amount >= 0);
+    ALTER TABLE payroll_statuses
+    ADD COLUMN IF NOT EXISTS extra_payment_notes TEXT DEFAULT '';
+    ALTER TABLE payroll_statuses
+    ADD COLUMN IF NOT EXISTS bale_deducted BOOLEAN NOT NULL DEFAULT false;
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      action VARCHAR(80) NOT NULL,
+      entity VARCHAR(80) NOT NULL,
+      entity_id INTEGER,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity, entity_id);
+    CREATE TABLE IF NOT EXISTS extra_payments (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+      extra_date DATE NOT NULL,
+      notes TEXT DEFAULT '',
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_extra_payments_date ON extra_payments(extra_date);
+    CREATE TABLE IF NOT EXISTS bale_payments (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+      payment_date DATE NOT NULL,
+      notes TEXT DEFAULT '',
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_bale_payments_date ON bale_payments(payment_date);
+    CREATE TABLE IF NOT EXISTS salary_payments (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+      payment_date DATE NOT NULL,
+      notes TEXT DEFAULT '',
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_salary_payments_date ON salary_payments(payment_date);
+  `);
+  await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS phone VARCHAR(20) NOT NULL DEFAULT ''`);
+  await pool.query(`
+    DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'attendance_logs_employee_id_fkey'
+        AND confdeltype <> 'c'
+      ) THEN
+        ALTER TABLE attendance_logs
+          DROP CONSTRAINT attendance_logs_employee_id_fkey,
+          ADD CONSTRAINT attendance_logs_employee_id_fkey
+            FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE;
+      END IF;
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'cash_advances_employee_id_fkey'
+        AND confdeltype <> 'c'
+      ) THEN
+        ALTER TABLE cash_advances
+          DROP CONSTRAINT cash_advances_employee_id_fkey,
+          ADD CONSTRAINT cash_advances_employee_id_fkey
+            FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE;
+      END IF;
+    END $$;
+  `);
+  await pool.query(`
+    CREATE SEQUENCE IF NOT EXISTS employee_number_seq START 1;
+    ALTER TABLE employees
+    ALTER COLUMN emp_number SET DEFAULT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0'));
+    WITH last_number AS (
+      SELECT COALESCE(MAX((regexp_match(emp_number, '[0-9]+$'))[1]::int), 0) AS value
+      FROM employees
+      WHERE emp_number ~ '[0-9]+$'
+    )
+    SELECT setval(
+      'employee_number_seq',
+      CASE WHEN value < 1 THEN 1 ELSE value END,
+      value >= 1
+    )
+    FROM last_number;
+  `);
+
+  if (process.env.BOOTSTRAP_USERNAME && process.env.BOOTSTRAP_PASSWORD && process.env.BOOTSTRAP_ROLE) {
+    const exists = await pool.query('SELECT id FROM users WHERE username = $1', [process.env.BOOTSTRAP_USERNAME]);
+    if (!exists.rowCount) {
+      const hash = await bcrypt.hash(process.env.BOOTSTRAP_PASSWORD, 10);
+      await pool.query(
+        'INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)',
+        [process.env.BOOTSTRAP_USERNAME, hash, process.env.BOOTSTRAP_ROLE]
+      );
+    }
+  }
+}
+
+async function logAudit(userId, action, entity, entityId, details = {}) {
+  await pool.query(
+    `INSERT INTO audit_logs (user_id, action, entity, entity_id, details)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [userId || null, action, entity, entityId || null, details]
+  );
+}
+
+app.get('/api/me', (req, res) => {
+  let sessionTTL = null;
+  if (req.session?.cookie?._expires) {
+    sessionTTL = Math.max(0, Math.floor((new Date(req.session.cookie._expires) - new Date()) / 1000));
+  }
+  res.json({ user: req.session.user || null, sessionTTL });
+});
+
+app.post('/api/login', loginLimiter, async (req, res) => {
+  const { username, password } = req.body;
+  const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  const user = result.rows[0];
+  if (!user || !(await bcrypt.compare(password || '', user.password_hash))) {
+    return res.status(401).json({ error: 'Invalid username or password.' });
+  }
+  req.session.user = { id: user.id, username: user.username, role: user.role };
+  const sessionTTL = req.session?.cookie?.maxAge ? Math.floor(req.session.cookie.maxAge / 1000) : null;
+  res.json({ user: req.session.user, sessionTTL });
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get('/api/employees', requireAuth, async (req, res) => {
+  const search = `%${req.query.search || ''}%`;
+  const active = req.query.active;
+  const params = [search];
+  let where = 'WHERE (emp_number ILIKE $1 OR name ILIKE $1)';
+  if (active === 'true' || active === 'false') {
+    params.push(active === 'true');
+    where += ` AND active = $${params.length}`;
+  } else if (active !== 'all') {
+    where += ' AND active = true';
+  }
+  const result = await pool.query(
+    `SELECT * FROM employees ${where} ORDER BY name ASC`,
+    params
+  );
+  res.json(result.rows);
+});
+
+app.post('/api/employees', requireAuth, async (req, res) => {
+  const { name, phone, rate, active = true } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Employee name is required.' });
+  if (!phone?.trim()) return res.status(400).json({ error: 'Phone number is required.' });
+  if (rate === undefined || rate === '' || Number(rate) < 0) {
+    return res.status(400).json({ error: 'Valid employee rate is required.' });
+  }
+  const empNumber = await pool.query(
+    `SELECT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0')) AS emp_number`
+  );
+  const result = await pool.query(
+    `INSERT INTO employees (emp_number, name, phone, rate, active)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [empNumber.rows[0].emp_number, name, phone, rate, active]
+  );
+  await logAudit(req.session.user.id, 'create', 'employee', result.rows[0].id, {
+    name,
+    phone,
+    rate,
+    emp_number: empNumber.rows[0].emp_number
+  });
+  res.status(201).json(result.rows[0]);
+});
+
+app.put('/api/employees/:id', requireAuth, async (req, res) => {
+  const { name, phone, rate, active = true } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Employee name is required.' });
+  if (!phone?.trim()) return res.status(400).json({ error: 'Phone number is required.' });
+  if (rate === undefined || rate === '' || Number(rate) < 0) {
+    return res.status(400).json({ error: 'Valid employee rate is required.' });
+  }
+  const before = await pool.query('SELECT * FROM employees WHERE id = $1', [req.params.id]);
+  const result = await pool.query(
+    `UPDATE employees
+     SET name = $1, phone = $2, rate = $3, active = $4, updated_at = NOW()
+     WHERE id = $5
+     RETURNING *`,
+    [name, phone, rate, active, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  await logAudit(req.session.user.id, 'update', 'employee', Number(req.params.id), {
+    before: before.rows[0] || null,
+    after: result.rows[0]
+  });
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/employees/:id', requireAuth, requireAdmin, async (req, res) => {
+  await pool.query('UPDATE employees SET active = false WHERE id = $1', [req.params.id]);
+  await logAudit(req.session.user.id, 'archive', 'employee', Number(req.params.id), {});
+  res.json({ ok: true });
+});
+
+app.post('/api/employees/:id/photo', requireAuth, upload.single('photo'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+  const photoUrl = '/uploads/' + req.file.filename;
+  const result = await pool.query(
+    'UPDATE employees SET photo_url = $1 WHERE id = $2 RETURNING photo_url',
+    [photoUrl, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  res.json({ photo_url: result.rows[0].photo_url });
+});
+
+app.delete('/api/employees/:id/photo', requireAuth, async (req, res) => {
+  const result = await pool.query(
+    `UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING photo_url`,
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  res.json({ photo_url: null });
+});
+
+app.put('/api/employees/:id/restore', requireAuth, requireAdmin, async (req, res) => {
+  const result = await pool.query(
+    'UPDATE employees SET active = true WHERE id = $1 RETURNING *',
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  await logAudit(req.session.user.id, 'restore', 'employee', Number(req.params.id), {});
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/employees/:id/permanent', requireAuth, requireAdmin, async (req, res) => {
+  const empId = Number(req.params.id);
+  const existing = await pool.query('SELECT * FROM employees WHERE id = $1', [empId]);
+  if (!existing.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  const employee = existing.rows[0];
+  await pool.query('DELETE FROM payroll_statuses WHERE employee_id = $1', [empId]);
+  // attendance_logs & cash_advances are auto-deleted via ON DELETE CASCADE
+  await pool.query('DELETE FROM employees WHERE id = $1', [empId]);
+  await logAudit(req.session.user.id, 'permanent_delete', 'employee', empId, {
+    name: employee.name,
+    emp_number: employee.emp_number
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/attendance', requireAuth, async (req, res) => {
+  const weekStart = weekStartOf(req.query.week || todayInManila());
+  const weekEnd = addDays(weekStart, 6);
+  const search = `%${req.query.search || ''}%`;
+  const result = await pool.query(
+    `SELECT a.id, a.employee_id, to_char(a.work_date, 'YYYY-MM-DD') AS work_date,
+       a.time_in, a.time_out, a.rate_snapshot, a.notes, a.created_by, a.created_at, a.updated_at,
+       e.emp_number, e.name
+     FROM attendance_logs a
+     JOIN employees e ON e.id = a.employee_id
+     WHERE a.work_date BETWEEN $1 AND $2
+       AND (e.emp_number ILIKE $3 OR e.name ILIKE $3)
+     ORDER BY a.work_date DESC, e.name ASC`,
+    [weekStart, weekEnd, search]
+  );
+  res.json({ weekStart, weekEnd, rows: result.rows });
+});
+
+app.post('/api/attendance', requireAuth, async (req, res) => {
+  const { employee_id, work_date, time_in = null, time_out = null, notes = '' } = req.body;
+  const employee = await pool.query('SELECT rate FROM employees WHERE id = $1', [employee_id]);
+  if (!employee.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+
+  const result = await pool.query(
+    `INSERT INTO attendance_logs (employee_id, work_date, time_in, time_out, rate_snapshot, notes, created_by)
+     VALUES ($1, $2, NULLIF($3, '')::time, NULLIF($4, '')::time, $5, $6, $7)
+     ON CONFLICT (employee_id, work_date)
+     DO UPDATE SET time_in = EXCLUDED.time_in,
+       time_out = EXCLUDED.time_out,
+       notes = EXCLUDED.notes,
+       updated_at = NOW()
+     RETURNING *`,
+    [employee_id, work_date, time_in, time_out || null, employee.rows[0].rate, notes, req.session.user.id]
+  );
+  res.status(201).json(result.rows[0]);
+});
+
+app.post('/api/attendance/bulk', requireAuth, async (req, res) => {
+  const { weekStart, employeeIds = [], present = [] } = req.body;
+  const start = weekStartOf(weekStart || todayInManila());
+  const end = addDays(start, 6);
+  const presentSet = new Set(present.map(item => `${item.employee_id}:${item.work_date}`));
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    for (const employeeId of employeeIds) {
+      const employee = await client.query('SELECT rate FROM employees WHERE id = $1', [employeeId]);
+      if (!employee.rowCount) continue;
+
+      for (let day = 0; day < 7; day += 1) {
+        const workDate = addDays(start, day);
+        const key = `${employeeId}:${workDate}`;
+        if (presentSet.has(key)) {
+          await client.query(
+            `INSERT INTO attendance_logs (employee_id, work_date, rate_snapshot, notes, created_by)
+             VALUES ($1, $2, $3, 'Present', $4)
+             ON CONFLICT (employee_id, work_date) DO NOTHING`,
+            [employeeId, workDate, employee.rows[0].rate, req.session.user.id]
+          );
+        } else {
+          await client.query(
+            `DELETE FROM attendance_logs
+             WHERE employee_id = $1 AND work_date = $2 AND work_date BETWEEN $3 AND $4`,
+            [employeeId, workDate, start, end]
+          );
+        }
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/attendance/:id', requireAuth, async (req, res) => {
+  const { work_date, time_in = null, time_out = null, notes = '' } = req.body;
+  const result = await pool.query(
+    `UPDATE attendance_logs
+     SET work_date = $1, time_in = NULLIF($2, '')::time, time_out = NULLIF($3, '')::time, notes = $4, updated_at = NOW()
+     WHERE id = $5
+     RETURNING *`,
+    [work_date, time_in, time_out || null, notes, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Attendance log not found.' });
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/attendance/:id', requireAuth, requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM attendance_logs WHERE id = $1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.delete('/api/cash-advances/:id', requireAuth, requireAdmin, async (req, res) => {
+  const existing = await pool.query('SELECT * FROM cash_advances WHERE id = $1', [req.params.id]);
+  if (!existing.rowCount) return res.status(404).json({ error: 'C/A record not found.' });
+  await pool.query('DELETE FROM cash_advances WHERE id = $1', [req.params.id]);
+  await logAudit(req.session.user.id, 'delete', 'cash_advance', req.params.id, existing.rows[0] || {});
+  res.json({ ok: true });
+});
+
+/* ── Extra Payments API (no daily limit) ── */
+app.get('/api/extra-payments', requireAuth, async (req, res) => {
+  const weekStart = weekStartOf(req.query.week || todayInManila());
+  const weekEnd = addDays(weekStart, 6);
+  const employeeId = req.query.employee_id;
+  const params = [weekStart, weekEnd];
+  let employeeFilter = '';
+  if (employeeId) {
+    params.push(employeeId);
+    employeeFilter = `AND ep.employee_id = $${params.length}`;
+  }
+  const result = await pool.query(
+    `SELECT ep.id, ep.employee_id, ep.amount, to_char(ep.extra_date, 'YYYY-MM-DD') AS extra_date,
+       ep.notes, ep.created_by, ep.created_at, e.emp_number, e.name
+     FROM extra_payments ep
+     JOIN employees e ON e.id = ep.employee_id
+     WHERE ep.extra_date BETWEEN $1 AND $2
+       ${employeeFilter}
+     ORDER BY ep.extra_date DESC, e.name ASC`,
+    params
+  );
+  res.json({ weekStart, weekEnd, rows: result.rows });
+});
+
+app.post('/api/extra-payments', requireAuth, async (req, res) => {
+  const { employee_id, amount, extra_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero.' });
+  }
+  const existingAdvance = await pool.query(
+    'SELECT id FROM extra_payments WHERE employee_id = $1 AND extra_date = $2',
+    [employee_id, extra_date]
+  );
+  if (existingAdvance.rowCount) {
+    return res.status(409).json({ error: 'Only one extra payment is allowed per employee per day.' });
+  }
+  const result = await pool.query(
+    `INSERT INTO extra_payments (employee_id, amount, extra_date, notes, created_by)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [employee_id, amount, extra_date, notes, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'create', 'extra_payment', result.rows[0].id, {
+    employee_id,
+    amount,
+    extra_date,
+    notes
+  });
+  res.status(201).json(result.rows[0]);
+});
+
+app.put('/api/extra-payments/:id', requireAuth, async (req, res) => {
+  const { employee_id, amount, extra_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero.' });
+  }
+  const before = await pool.query('SELECT * FROM extra_payments WHERE id = $1', [req.params.id]);
+  const result = await pool.query(
+    `UPDATE extra_payments
+     SET employee_id = $1, amount = $2, extra_date = $3, notes = $4
+     WHERE id = $5
+     RETURNING *`,
+    [employee_id, amount, extra_date, notes, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Extra payment not found.' });
+  await logAudit(req.session.user.id, 'update', 'extra_payment', req.params.id, {
+    before: before.rows[0] || null,
+    after: result.rows[0]
+  });
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/extra-payments/:id', requireAuth, requireAdmin, async (req, res) => {
+  const existing = await pool.query('SELECT * FROM extra_payments WHERE id = $1', [req.params.id]);
+  if (!existing.rowCount) return res.status(404).json({ error: 'Extra payment not found.' });
+  await pool.query('DELETE FROM extra_payments WHERE id = $1', [req.params.id]);
+  await logAudit(req.session.user.id, 'delete', 'extra_payment', req.params.id, existing.rows[0] || {});
+  res.json({ ok: true });
+});
+
+/* ── Salary Payments API ── */
+app.get('/api/salary-payments', requireAuth, async (req, res) => {
+  const weekStart = payrollWeekStartOf(req.query.week || todayInManila());
+  const weekEnd = addDays(weekStart, 6);
+  const employeeId = req.query.employee_id;
+  const params = [weekStart, weekEnd];
+  let employeeFilter = '';
+  if (employeeId) {
+    params.push(employeeId);
+    employeeFilter = `AND sp.employee_id = $${params.length}`;
+  }
+  const result = await pool.query(
+    `SELECT sp.id, sp.employee_id, sp.amount,
+       to_char(sp.payment_date, 'YYYY-MM-DD') AS payment_date,
+       sp.notes, sp.created_by, sp.created_at,
+       e.emp_number, e.name
+     FROM salary_payments sp
+     JOIN employees e ON e.id = sp.employee_id
+     WHERE sp.payment_date BETWEEN $1 AND $2
+       ${employeeFilter}
+     ORDER BY sp.payment_date DESC, e.name ASC`,
+    params
+  );
+  res.json({ weekStart, weekEnd, rows: result.rows });
+});
+
+app.post('/api/salary-payments', requireAuth, async (req, res) => {
+  const { employee_id, amount, payment_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero.' });
+  }
+  try {
+    await assertPaymentWithinBalance(employee_id, payment_date || todayInManila(), amount, 'salary');
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const result = await pool.query(
+    `INSERT INTO salary_payments (employee_id, amount, payment_date, notes, created_by)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [employee_id, amount, payment_date || todayInManila(), notes, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'create', 'salary_payment', result.rows[0].id, {
+    employee_id,
+    amount,
+    payment_date,
+    notes
+  });
+  res.status(201).json(result.rows[0]);
+});
+
+app.put('/api/salary-payments/:id', requireAuth, async (req, res) => {
+  const { employee_id, amount, payment_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero.' });
+  }
+  const before = await pool.query('SELECT * FROM salary_payments WHERE id = $1', [req.params.id]);
+  if (!before.rowCount) return res.status(404).json({ error: 'Salary payment not found.' });
+  try {
+    await assertPaymentWithinBalance(employee_id, payment_date || todayInManila(), amount, 'salary', req.params.id);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const result = await pool.query(
+    `UPDATE salary_payments SET amount = $1, payment_date = $2, notes = $3 WHERE id = $4 RETURNING *`,
+    [amount, payment_date, notes, req.params.id]
+  );
+  await logAudit(req.session.user.id, 'update', 'salary_payment', req.params.id, {
+    before: before.rows[0] || null,
+    after: result.rows[0]
+  });
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/salary-payments/:id', requireAuth, requireAdmin, async (req, res) => {
+  const existing = await pool.query('SELECT * FROM salary_payments WHERE id = $1', [req.params.id]);
+  if (!existing.rowCount) return res.status(404).json({ error: 'Salary payment not found.' });
+  await pool.query('DELETE FROM salary_payments WHERE id = $1', [req.params.id]);
+  await logAudit(req.session.user.id, 'delete', 'salary_payment', req.params.id, existing.rows[0] || {});
+  res.json({ ok: true });
+});
+
+/* ── Bale Payments API ── */
+app.get('/api/bale-payments', requireAuth, async (req, res) => {
+  const weekStart = payrollWeekStartOf(req.query.week || todayInManila());
+  const weekEnd = addDays(weekStart, 6);
+  const employeeId = req.query.employee_id;
+  const params = [weekStart, weekEnd];
+  let employeeFilter = '';
+  if (employeeId) {
+    params.push(employeeId);
+    employeeFilter = `AND bp.employee_id = $${params.length}`;
+  }
+  const result = await pool.query(
+    `SELECT bp.id, bp.employee_id, bp.amount,
+       to_char(bp.payment_date, 'YYYY-MM-DD') AS payment_date,
+       bp.notes, bp.created_by, bp.created_at,
+       e.emp_number, e.name
+     FROM bale_payments bp
+     JOIN employees e ON e.id = bp.employee_id
+     WHERE bp.payment_date BETWEEN $1 AND $2
+       ${employeeFilter}
+     ORDER BY bp.payment_date DESC, e.name ASC`,
+    params
+  );
+  res.json({ weekStart, weekEnd, rows: result.rows });
+});
+
+app.post('/api/bale-payments', requireAuth, async (req, res) => {
+  const { employee_id, amount, payment_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero.' });
+  }
+  try {
+    await assertPaymentWithinBalance(employee_id, payment_date || todayInManila(), amount, 'bale');
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const result = await pool.query(
+    `INSERT INTO bale_payments (employee_id, amount, payment_date, notes, created_by)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [employee_id, amount, payment_date || todayInManila(), notes, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'create', 'bale_payment', result.rows[0].id, {
+    employee_id,
+    amount,
+    payment_date,
+    notes
+  });
+  res.status(201).json(result.rows[0]);
+});
+
+app.put('/api/bale-payments/:id', requireAuth, async (req, res) => {
+  const { employee_id, amount, payment_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero.' });
+  }
+  const before = await pool.query('SELECT * FROM bale_payments WHERE id = $1', [req.params.id]);
+  if (!before.rowCount) return res.status(404).json({ error: 'Bale payment not found.' });
+  try {
+    await assertPaymentWithinBalance(employee_id, payment_date || todayInManila(), amount, 'bale', req.params.id);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const result = await pool.query(
+    `UPDATE bale_payments SET amount = $1, payment_date = $2, notes = $3 WHERE id = $4 RETURNING *`,
+    [amount, payment_date, notes, req.params.id]
+  );
+  await logAudit(req.session.user.id, 'update', 'bale_payment', req.params.id, {
+    before: before.rows[0] || null,
+    after: result.rows[0]
+  });
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/bale-payments/:id', requireAuth, requireAdmin, async (req, res) => {
+  const existing = await pool.query('SELECT * FROM bale_payments WHERE id = $1', [req.params.id]);
+  if (!existing.rowCount) return res.status(404).json({ error: 'Bale payment not found.' });
+  await pool.query('DELETE FROM bale_payments WHERE id = $1', [req.params.id]);
+  await logAudit(req.session.user.id, 'delete', 'bale_payment', req.params.id, existing.rows[0] || {});
+  res.json({ ok: true });
+});
+
+
+
+app.get('/api/cash-advances', requireAuth, async (req, res) => {
+  const weekStart = weekStartOf(req.query.week || todayInManila());
+  const weekEnd = addDays(weekStart, 6);
+  const employeeId = req.query.employee_id;
+  const params = [weekStart, weekEnd];
+  let employeeFilter = '';
+  if (employeeId) {
+    params.push(employeeId);
+    employeeFilter = `AND c.employee_id = $${params.length}`;
+  }
+  const result = await pool.query(
+    `SELECT c.id, c.employee_id, c.amount, to_char(c.advance_date, 'YYYY-MM-DD') AS advance_date,
+       c.notes, c.created_by, c.created_at, e.emp_number, e.name
+     FROM cash_advances c
+     JOIN employees e ON e.id = c.employee_id
+     WHERE c.advance_date BETWEEN $1 AND $2
+       ${employeeFilter}
+     ORDER BY c.advance_date DESC, e.name ASC`,
+    params
+  );
+  res.json({ weekStart, weekEnd, rows: result.rows });
+});
+
+app.post('/api/cash-advances', requireAuth, async (req, res) => {
+  const { employee_id, amount, advance_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'C/A amount must be greater than zero.' });
+  }
+  const existingAdvance = await pool.query(
+    'SELECT id FROM cash_advances WHERE employee_id = $1 AND advance_date = $2',
+    [employee_id, advance_date]
+  );
+  if (existingAdvance.rowCount) {
+    return res.status(409).json({ error: 'Only one C/A is allowed per employee per day.' });
+  }
+  const result = await pool.query(
+    `INSERT INTO cash_advances (employee_id, amount, advance_date, notes, created_by)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [employee_id, amount, advance_date, notes, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'create', 'cash_advance', result.rows[0].id, {
+    employee_id,
+    amount,
+    advance_date,
+    notes
+  });
+  res.status(201).json(result.rows[0]);
+});
+
+app.put('/api/cash-advances/:id', requireAuth, async (req, res) => {
+  const { employee_id, amount, advance_date, notes = '' } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (amount === undefined || amount === '' || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'C/A amount must be greater than zero.' });
+  }
+  const existingAdvance = await pool.query(
+    'SELECT id FROM cash_advances WHERE employee_id = $1 AND advance_date = $2 AND id <> $3',
+    [employee_id, advance_date, req.params.id]
+  );
+  if (existingAdvance.rowCount) {
+    return res.status(409).json({ error: 'Only one C/A is allowed per employee per day.' });
+  }
+
+  const before = await pool.query('SELECT * FROM cash_advances WHERE id = $1', [req.params.id]);
+  const result = await pool.query(
+    `UPDATE cash_advances
+     SET employee_id = $1, amount = $2, advance_date = $3, notes = $4
+     WHERE id = $5
+     RETURNING *`,
+    [employee_id, amount, advance_date, notes, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'C/A record not found.' });
+  await logAudit(req.session.user.id, 'update', 'cash_advance', req.params.id, {
+    before: before.rows[0] || null,
+    after: result.rows[0]
+  });
+  res.json(result.rows[0]);
+});
+
+
+
+app.get('/api/payroll', requireAuth, async (req, res) => {
+  const weekStart = payrollWeekStartOf(req.query.week || todayInManila());
+  const weekEnd = addDays(weekStart, 6);
+  const currentDate = req.query.today || todayInManila();
+  const search = `%${req.query.search || ''}%`;
+  const result = await pool.query(
+    `WITH attendance AS (
+       SELECT employee_id,
+         COUNT(*)::int AS days,
+         SUM(rate_snapshot)::numeric(12,2) AS gross_salary,
+         MAX(rate_snapshot)::numeric(12,2) AS displayed_rate
+       FROM attendance_logs
+       WHERE work_date BETWEEN $1 AND $2
+       GROUP BY employee_id
+     ),
+     advances AS (
+       SELECT employee_id, SUM(amount)::numeric(12,2) AS cash_advance
+       FROM cash_advances
+       WHERE advance_date BETWEEN $1 AND $2
+       GROUP BY employee_id
+     ),
+     extras AS (
+       SELECT employee_id, SUM(amount)::numeric(12,2) AS extra_total
+       FROM extra_payments
+       WHERE extra_date BETWEEN $1 AND $2
+       GROUP BY employee_id
+     ),
+     bale_payments_cte AS (
+       SELECT employee_id, SUM(amount)::numeric(12,2) AS bale_paid
+       FROM bale_payments
+       WHERE payment_date BETWEEN $1 AND $2
+       GROUP BY employee_id
+     ),
+     salary_pay_cte AS (
+       SELECT employee_id, SUM(amount)::numeric(12,2) AS total_paid
+       FROM salary_payments
+       WHERE payment_date BETWEEN $1 AND $2
+       GROUP BY employee_id
+     )
+     SELECT e.id AS employee_id, e.emp_number, e.name,
+       COALESCE(a.displayed_rate, e.rate)::numeric(12,2) AS rate,
+       COALESCE(a.days, 0) AS days,
+       COALESCE(ad.cash_advance, 0)::numeric(12,2) AS cash_advance,
+       COALESCE(a.gross_salary, 0)::numeric(12,2) AS gross_salary,
+       COALESCE(a.gross_salary, 0)::numeric(12,2) AS salary,
+       (COALESCE(ps.paid_amount, 0) + COALESCE(sp.total_paid, 0))::numeric(12,2) AS salary_paid_amount,
+       COALESCE(ex.extra_total, 0)::numeric(12,2) AS extra_payment_amount,
+       '' AS extra_payment_notes,
+       COALESCE(ps.bale_deducted, false) AS bale_deducted,
+       (COALESCE(ps.paid_amount, 0) + COALESCE(sp.total_paid, 0))::numeric(12,2) AS paid_amount,
+       COALESCE(ps.paid_amount, 0)::numeric(12,2) AS legacy_paid_amount,
+       COALESCE(bp.bale_paid, 0)::numeric(12,2) AS bale_paid_amount,
+       ps.paid_at
+     FROM employees e
+     LEFT JOIN attendance a ON a.employee_id = e.id
+     LEFT JOIN advances ad ON ad.employee_id = e.id
+     LEFT JOIN extras ex ON ex.employee_id = e.id
+     LEFT JOIN bale_payments_cte bp ON bp.employee_id = e.id
+     LEFT JOIN salary_pay_cte sp ON sp.employee_id = e.id
+     LEFT JOIN payroll_statuses ps ON ps.employee_id = e.id AND ps.week_start = $1
+     WHERE (e.emp_number ILIKE $3 OR e.name ILIKE $3)
+       AND e.active = true
+     ORDER BY e.name ASC`,
+    [weekStart, weekEnd, search]
+  );
+
+  const rows = (await Promise.all(result.rows.map(async row => {
+    const salary = money(row.salary);
+    const cashAdvance = money(row.cash_advance);
+    const salaryPaidAmount = money(row.salary_paid_amount);
+    const extraPaymentAmount = money(row.extra_payment_amount);
+    const balePaymentAmount = money(row.bale_paid_amount);
+    const legacyPaidAmount = money(row.legacy_paid_amount);
+    const carryovers = await getPayrollCarryoversBefore(row.employee_id, weekStart);
+    const previousBaleBalance = carryovers.baleBalance;
+    const previousUnpaidBalance = carryovers.unpaidBalance;
+    const weekState = calculatePayrollWeekState({
+      previousBaleBalance,
+      previousUnpaidBalance,
+      salary,
+      cashAdvance,
+      salaryPaidAmount,
+      deductBale: row.bale_deducted,
+      balePaymentAmount
+    });
+    const totalDue = weekState.paymentLimit;
+    const paidAmount = salaryPaidAmount;
+    const balance = weekState.balance + extraPaymentAmount;
+    const paymentStatus = balance === 0 && weekState.remainingBaleBalance === 0 && (totalDue > 0 || salary > 0)
+      ? 'paid'
+      : (paidAmount > 0 || extraPaymentAmount > 0) && (balance > 0 || previousUnpaidBalance > 0 || weekState.remainingBaleBalance > 0)
+        ? 'partial'
+        : 'unpaid';
+
+    return {
+      ...row,
+      rate: money(row.rate),
+      days: Number(row.days),
+      cash_advance: cashAdvance,
+      previous_bale_balance: previousBaleBalance,
+      previous_unpaid_balance: previousUnpaidBalance,
+      total_bale: weekState.totalBale,
+      bale_deduction: weekState.baleDeduction,
+      remaining_bale_balance: weekState.remainingBaleBalance,
+      take_home: weekState.takeHome,
+      total_due: totalDue,
+      payment_limit: weekState.paymentLimit,
+      salary_payment_limit: Math.max(weekState.paymentLimit, 0),
+      extra_payment_limit: Math.max(weekState.paymentLimit - salaryPaidAmount, 0),
+      gross_salary: money(row.gross_salary),
+      salary,
+      salary_paid_amount: salaryPaidAmount,
+      extra_payment_amount: extraPaymentAmount,
+      extra_payment_notes: row.extra_payment_notes || '',
+      paid_amount: paidAmount,
+      legacy_paid_amount: legacyPaidAmount,
+      balance,
+      payment_status: paymentStatus,
+      paid_at: row.paid_at
+    };
+  }))).filter(row =>
+    row.days > 0 ||
+    row.cash_advance > 0 ||
+    row.salary_paid_amount > 0 ||
+    row.extra_payment_amount > 0 ||
+    row.previous_bale_balance > 0 ||
+    row.remaining_bale_balance > 0 ||
+    row.previous_unpaid_balance > 0
+  );
+
+  res.json({
+    weekStart,
+    weekEnd,
+    rows,
+    summary: {
+      employees: rows.length,
+      workingDays: workingDaysInWeek(weekStart, currentDate),
+      totalCashAdvance: rows.reduce((sum, row) => sum + row.cash_advance, 0),
+      totalPaidAmount: rows.reduce((sum, row) => sum + row.paid_amount, 0),
+      totalSalary: rows.reduce((sum, row) => sum + row.salary, 0),
+      totalBalance: rows.reduce((sum, row) => sum + row.balance, 0),
+      totalBaleBalance: rows.reduce((sum, row) => sum + row.remaining_bale_balance, 0),
+      totalPreviousUnpaid: rows.reduce((sum, row) => sum + row.previous_unpaid_balance, 0)
+    }
+  });
+});
+
+app.put('/api/payroll/payment', requireAuth, async (req, res) => {
+  const { employee_id, weekStart, paid_amount } = req.body;
+  if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
+  if (paid_amount === undefined || paid_amount === '' || Number(paid_amount) < 0) {
+    return res.status(400).json({ error: 'Valid paid amount is required.' });
+  }
+
+  const start = payrollWeekStartOf(weekStart || todayInManila());
+  const end = addDays(start, 6);
+  const [totals, carryovers, baleResult] = await Promise.all([
+    pool.query(
+      `WITH attendance AS (
+         SELECT COALESCE(SUM(rate_snapshot), 0)::numeric(12,2) AS salary
+         FROM attendance_logs
+         WHERE employee_id = $1 AND work_date BETWEEN $2 AND $3
+       ),
+       advances AS (
+         SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS cash_advance
+         FROM cash_advances
+         WHERE employee_id = $1 AND advance_date BETWEEN $2 AND $3
+       )
+       SELECT attendance.salary, advances.cash_advance
+       FROM attendance, advances`,
+      [employee_id, start, end]
+    ),
+    getPayrollCarryoversBefore(employee_id, start),
+    pool.query(
+      `SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS total FROM bale_payments
+       WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3`,
+      [employee_id, start, end]
+    )
+  ]);
+  const previousBaleBalance = carryovers.baleBalance;
+  const previousUnpaidBalance = carryovers.unpaidBalance;
+  const salary = money(totals.rows[0]?.salary);
+  const cashAdvance = money(totals.rows[0]?.cash_advance);
+  const existingBalePaid = money(baleResult.rows[0]?.total);
+  const weekState = calculatePayrollWeekState({
+    previousBaleBalance,
+    previousUnpaidBalance,
+    salary,
+    cashAdvance,
+    salaryPaidAmount: Number(paid_amount),
+    balePaymentAmount: existingBalePaid
+  });
+  if (Number(paid_amount) + existingBalePaid > weekState.paymentLimit) {
+    return res.status(400).json({ error: 'Salary payment cannot exceed previous unpaid plus current salary.' });
+  }
+
+  const result = await pool.query(
+    `INSERT INTO payroll_statuses (employee_id, week_start, status, paid_amount, paid_at, updated_by, updated_at)
+     VALUES ($1, $2, 'unpaid', $3, CASE WHEN $3::numeric > 0 THEN NOW() ELSE NULL END, $4, NOW())
+     ON CONFLICT (employee_id, week_start)
+     DO UPDATE SET paid_amount = EXCLUDED.paid_amount,
+       paid_at = EXCLUDED.paid_at,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = NOW()
+     RETURNING *`,
+    [employee_id, start, paid_amount, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'update', 'payroll_payment', result.rows[0].id, {
+    employee_id,
+    week_start: start,
+    paid_amount
+  });
+
+  res.json(result.rows[0]);
+});
+
+app.delete('/api/payroll/payment', requireAuth, requireAdmin, async (req, res) => {
+  const { employee_id, weekStart } = req.body;
+  if (!employee_id || !weekStart) {
+    return res.status(400).json({ error: 'Employee ID and week start are required.' });
+  }
+  const start = payrollWeekStartOf(weekStart);
+  const result = await pool.query(
+    `UPDATE payroll_statuses
+     SET paid_amount = 0, paid_at = NULL, updated_by = $1, updated_at = NOW()
+     WHERE employee_id = $2 AND week_start = $3
+     RETURNING *`,
+    [req.session.user.id, employee_id, start]
+  );
+  await logAudit(req.session.user.id, 'delete', 'payroll_payment', result.rows[0]?.id || null, {
+    employee_id,
+    week_start: start
+  });
+  res.json(result.rows[0] || { ok: true });
+});
+
+app.get('/api/audit-logs', requireAuth, requireAdmin, async (req, res) => {
+  const { entity, action, search, date_from, date_to, page = 1, pageSize = 50 } = req.query;
+  const params = [];
+  const conditions = [];
+  let paramIndex = 0;
+
+  if (entity) {
+    paramIndex++;
+    params.push(entity);
+    conditions.push(`a.entity = $${paramIndex}`);
+  }
+  if (action) {
+    paramIndex++;
+    params.push(action);
+    conditions.push(`a.action = $${paramIndex}`);
+  }
+  if (search) {
+    paramIndex++;
+    params.push(`%${search}%`);
+    conditions.push(`(a.details::text ILIKE $${paramIndex} OR u.username ILIKE $${paramIndex})`);
+  }
+  if (date_from) {
+    paramIndex++;
+    params.push(date_from);
+    conditions.push(`a.created_at >= $${paramIndex}`);
+  }
+  if (date_to) {
+    paramIndex++;
+    params.push(date_to + ' 23:59:59');
+    conditions.push(`a.created_at <= $${paramIndex}`);
+  }
+
+  const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const countResult = await pool.query(
+    `SELECT COUNT(*) AS total FROM audit_logs a
+     LEFT JOIN users u ON u.id = a.user_id ${whereClause}`,
+    params
+  );
+  const total = parseInt(countResult.rows[0].total, 10);
+  const totalPages = Math.ceil(total / Number(pageSize)) || 1;
+  const safePage = Math.min(Math.max(1, Number(page)), totalPages);
+  const offset = (safePage - 1) * Number(pageSize);
+
+  const result = await pool.query(
+    `SELECT a.*, u.username
+     FROM audit_logs a
+     LEFT JOIN users u ON u.id = a.user_id
+     ${whereClause}
+     ORDER BY a.created_at DESC
+     LIMIT $${paramIndex + 1} OFFSET $${paramIndex + 2}`,
+    [...params, String(pageSize), String(offset)]
+  );
+  res.json({ rows: result.rows, total, page: safePage, totalPages });
+});
+
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error.' });
+});
+
+initDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Payroll system running at http://localhost:${PORT}`);
+    });
+  })
+  .catch(error => {
+    console.error('Failed to start app:', error);
+    process.exit(1);
+  });
