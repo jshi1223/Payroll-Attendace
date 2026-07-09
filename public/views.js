@@ -13,7 +13,7 @@ function weekToolbar(className = '') {
   return `
     <div class="toolbar module-toolbar no-print${className ? ' ' + className : ''}">
       <label>Week Start<input type="date" id="weekInput" value="${state.week}"></label>
-      <label>Search<input id="searchInput" value="${state.searchPayroll}" placeholder="Emp no. or name"></label>
+      <label>Search<input id="searchInput" value="${state.searchPayroll}" placeholder="Type employee name or ID..."></label>
       <button class="ghost" id="prevWeek">Previous Week</button>
       <button class="ghost" id="nextWeek">Next Week</button>
     </div>
@@ -262,10 +262,6 @@ function renderPayroll() {
   const displaySummary = state.searchPayroll ? filteredSummary : summary;
   const pg = paginateRows(allRows, state.pages.payroll || 1);
   shell(`
-    <div class="toolbar module-toolbar" style="display:flex; justify-content:space-between;">
-      <div></div>
-      <button class="ghost" id="exportCSVBtn">Export CSV</button>
-    </div>
     ${weekToolbar()}
     <section class="summary">
       <div class="summary-card" style="border-left-color:#0f766e;">
@@ -306,11 +302,14 @@ function renderPayroll() {
           <h2>Payroll Records</h2>
           <p>Weekly salary, C/A, payment, and payslip actions.</p>
         </div>
-        ${state.user.role === 'admin' ? `<button class="ghost no-print" id="openAuditTrail">Audit Trail</button>` : ''}
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="ghost no-print" id="exportCSVBtn">Export CSV</button>
+          ${state.user.role === 'admin' ? `<button class="ghost no-print" id="openAuditTrail">Audit Trail</button>` : ''}
+        </div>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Emp Number</th><th>Name</th><th>Rate</th><th>No. of Days </th><th>Salary</th>              <th>Prev Unpaid</th><th>Prev Bale</th><th>C/A</th><th>Extra Payment</th><th>Total Bale</th><th>Salary Payment</th><th class="col-balance-header">Salary Balance</th><th class="col-bale-header">Bale Balance</th><th>Status</th><th>Action</th></tr></thead>
+          <thead><tr><th title="Unique employee identification number">Emp Number</th><th title="Full name of employee">Name</th><th title="Daily rate in Philippine Pesos">Rate</th><th title="Number of days worked this week">Days</th><th title="Gross salary for this week (Days × Rate)">Salary</th><th title="Unpaid salary balance carried over from previous weeks">Prev Unpaid</th><th title="Bale/cash advance balance carried over from previous weeks">Prev Bale</th><th title="Cash advance (bale) taken this week">C/A</th><th title="Extra payments or bonuses added this week">Extra</th><th title="Total bale/cash advance balance including previous">Total Bale</th><th title="Amount of salary paid this week">Payment</th><th class="col-balance-header" title="Remaining unpaid salary balance after payments">Salary Balance</th><th class="col-bale-header" title="Remaining bale/cash advance balance to repay">Bale Balance</th><th title="Payment status: Paid, Partial, or Unpaid">Status</th><th title="Actions available for this employee">Action</th></tr></thead>
           <tbody>
             ${pg.rows.map(row => {
               const flash = state._flash && state._flash.type === 'payroll' && Number(state._flash.id) === Number(row.employee_id);
@@ -339,7 +338,7 @@ function renderPayroll() {
               </td>
               </tr>
             `;
-            }).join('') || `<tr><td colspan="15" class="empty-state"><span class="empty-icon">--</span><strong>No Payroll Data</strong><span>No payroll records found for this week.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="15" class="empty-state"><span class="empty-icon">--</span><strong>No Payroll Data</strong><span>No records found for this week. Try changing the week or add attendance records first.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -418,7 +417,7 @@ function renderAttendance() {
   shell(`
     <div class="toolbar module-toolbar no-print toolbar-end">
       <label>Date<input type="date" id="attendanceDate" value="${state.attendanceDate}"></label>
-      <label>Search<input id="searchInput" value="${state.searchAttendance}" placeholder="Emp no. or name"></label>
+      <label>Search<input id="searchInput" value="${state.searchAttendance}" placeholder="Type employee name or ID..."></label>
       <button class="ghost" id="prevDay">Previous Day</button>
       <button class="ghost" id="nextDay">Next Day</button>
     </div>
@@ -464,20 +463,20 @@ function renderAttendance() {
             'Type to search employee...'
           )}
         </label>
-        <label>Notes<input name="notes" placeholder="Present, Late, etc."></label>
+        <label>Notes<input name="notes" placeholder="e.g. Present, Late 30min, OT 2hrs"></label>
         <button class="primary" ${availableEmployees.length ? '' : 'disabled'}>Add Attendance</button>
       </form>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Date</th>
-              <th>Emp Number</th>
-              <th>Name</th>
-              <th>Status</th>
-              <th>Rate</th>
-              <th>Notes</th>
-              <th>Actions</th>
+              <th title="Date of attendance">Date</th>
+              <th title="Unique employee identification number">Emp Number</th>
+              <th title="Full name of employee">Name</th>
+              <th title="Attendance status — always Present if recorded">Status</th>
+              <th title="Daily rate at time of attendance">Rate</th>
+              <th title="Optional notes about attendance (e.g., Late, OT)">Notes</th>
+              <th title="Delete this attendance record">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -491,7 +490,7 @@ function renderAttendance() {
                 <td>${row.notes ? escapeHtml(row.notes) : '<span class="muted">—</span>'}</td>
                 <td class="actions">${deleteButton('attendance', row.id)}</td>
               </tr>
-            `).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>No attendance recorded for this date yet.</span></td></tr>`}
+            `).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>Select an employee from the dropdown above and click "Add Attendance" to record their attendance for this date.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -548,7 +547,8 @@ function renderAttendance() {
         })
       });
       showToast('Attendance recorded.');
-      await refresh();
+      reRenderCurrentView();
+      partialRefresh(['attendance', 'payroll']).catch(() => {});
     } catch (error) {
       showToast(error.message, 'error');
       loadingButton(submitBtn, false);
@@ -566,7 +566,7 @@ function renderEmployees() {
   const inactiveCount = state.employees.length - activeCount;
   shell(`
     <section class="toolbar module-toolbar toolbar-end">
-      <label>Search<input id="employeeSearch" value="${state.searchEmployees}" placeholder="Emp no. or name"></label>
+      <label>Search<input id="employeeSearch" value="${state.searchEmployees}" placeholder="Type employee name or ID..."></label>
       <button class="primary" id="openEmployeeModal">Add Employee</button>
     </section>
     <section class="summary">
@@ -597,7 +597,7 @@ function renderEmployees() {
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Avatar</th><th>Emp Number</th><th>Name</th><th>Phone</th><th>Rate</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead><tr><th title="Employee profile photo">Avatar</th><th title="Unique employee identification number">Emp Number</th><th title="Full name of employee">Name</th><th title="Contact phone number (11 digits)">Phone</th><th title="Daily rate in Philippine Pesos">Rate</th><th title="Whether employee is Active or Inactive (archived)">Status</th><th title="Edit employee profile or archive this employee">Actions</th></tr></thead>
           <tbody>
             ${pg.rows.map(row => {
               const initials = row.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
@@ -618,7 +618,7 @@ function renderEmployees() {
                   ${deleteButton('employees', row.id)}
                 </td>
               </tr>
-            `}).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Employees</strong><span>Add your first employee to get started.</span></td></tr>`}
+            `            }).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Employees Yet</strong><span>Click the "Add Employee" button above to create your first employee record.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -672,7 +672,7 @@ function renderArchive() {
   const pg = paginateRows(rows, state.pages.archive || 1);
   shell(`
     <section class="toolbar module-toolbar toolbar-end">
-      <label>Search<input id="archiveSearch" value="${state.searchEmployees}" placeholder="Emp no. or name"></label>
+      <label>Search<input id="archiveSearch" value="${state.searchEmployees}" placeholder="Type employee name or ID..."></label>
       <span class="badge unpaid">${rows.length} Archived</span>
     </section>
     <section class="panel">
@@ -684,7 +684,7 @@ function renderArchive() {
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Emp Number</th><th>Name</th><th>Phone</th><th>Rate</th><th>Last Payroll</th><th>Total Paid</th><th>Balance</th><th>Actions</th></tr></thead>
+          <thead><tr><th title="Unique employee identification number">Emp Number</th><th title="Full name of employee">Name</th><th title="Contact phone number">Phone</th><th title="Previous daily rate when active">Rate</th><th title="Most recent week with payroll data">Last Payroll</th><th title="Total amount ever paid to this employee">Total Paid</th><th title="Total unpaid salary balance">Balance</th><th title="Restore, view payslip, or permanently delete">Actions</th></tr></thead>
           <tbody>
             ${pg.rows.map(row => {
               const empPayroll = state.payroll ? state.payroll.rows.filter(r => Number(r.employee_id) === Number(row.id)) : [];
@@ -707,7 +707,7 @@ function renderArchive() {
                 </td>
               </tr>
               `;
-            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No Archived Employees</strong><span>No employees are archived. Archive inactive employees from the Employees section.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No Archived Employees</strong><span>Inactive employees appear here after you archive them from the Employees section. No employees have been archived yet.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -729,7 +729,8 @@ function renderArchive() {
       try {
         await api(`/api/employees/${button.dataset.restoreEmployee}/restore`, { method: 'PUT' });
         showToast('Employee restored successfully.');
-        await refresh();
+        reRenderCurrentView();
+        partialRefresh(['employees', 'payroll']).catch(() => {});
       } catch (err) {
         showToast(err.message, 'error');
       }
@@ -754,7 +755,7 @@ function renderArchive() {
         resource: 'employees-permanent',
         id: button.dataset.permanentDelete
       };
-      refresh();
+      reRenderCurrentView();
     });
   });
   bindPagination('archive', refresh);
@@ -782,7 +783,7 @@ function renderCashAdvance() {
       </form>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Date</th><th>Emp Number</th><th>Name</th><th>Amount</th><th>Notes</th><th>Actions</th></tr></thead>
+          <thead><tr><th title="Date the cash advance was taken">Date</th><th title="Unique employee identification number">Emp Number</th><th title="Full name of employee">Name</th><th title="Amount of cash advance in Pesos">Amount</th><th title="Reason or remarks for the cash advance">Notes</th><th title="Edit or delete this cash advance">Actions</th></tr></thead>
           <tbody>
             ${pg.rows.map(row => `
               <tr>
@@ -793,7 +794,7 @@ function renderCashAdvance() {
                   ${deleteButton('cash-advances', row.id)}
                 </td>
               </tr>
-            `).join('') || `<tr><td colspan="6" class="empty-state"><span class="empty-icon">--</span><strong>No Cash Advances</strong><span>No C/A records this week. Use the form above to add one.</span></td></tr>`}
+            `).join('') || `<tr><td colspan="6" class="empty-state"><span class="empty-icon">--</span><strong>No Cash Advances</strong><span>No cash advances recorded this week. Select an employee and fill out the form above to add a C/A.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -829,7 +830,8 @@ function bindCashAdvanceForm(selector) {
     state.editingCashAdvance = null;
     state._flash = { id: Number(payload.employee_id), type: 'payroll' };
     showToast(id ? 'C/A updated successfully.' : 'C/A added successfully.');
-    await refresh();
+    reRenderCurrentView();
+    partialRefresh(['payroll', 'advances']).catch(() => {});
   });
 }
 
@@ -879,7 +881,7 @@ function renderPayslip(row) {
         <div class="company-box">
           <div>
             <strong>KVSK CCTV & IT SOLUTIONS</strong><br>
-            353 Brgy. San Felix, Sto. Tomas City<br>
+            195 B. Laurena Poblacion, President Jose P. Laurel Hwy, Tanauan City<br>
             Email Address: 
 kvsk.cctv.itsolutions@gmail.com<br>
             Contact No. 0917 846 6710

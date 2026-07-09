@@ -22,6 +22,7 @@ async function loadData() {
   if (!state.user) return;
   state.currentDate = todayInManila();
   const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate });
+  if (state.view === 'archive') payrollQs.set('include_inactive', 'true');
   const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate });
   const promises = [
     api(`/api/employees?search=${encodeURIComponent(state.searchEmployees)}&active=${state.view === 'archive' ? 'false' : 'true'}`),

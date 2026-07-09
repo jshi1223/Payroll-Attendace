@@ -39,7 +39,8 @@ const state = {
   pendingDelete: null,
   archivedEmployees: [],
   pages: { payroll: 1, attendance: 1, employees: 1, archive: 1 },
-  _flash: null
+  _flash: null,
+  sidebarCollapsed: savedState.sidebarCollapsed || false
 };
 
 function loadSavedState() {
@@ -54,7 +55,8 @@ function saveUiState() {
   localStorage.setItem('payrollUiState', JSON.stringify({
     view: state.view,
     week: state.view === 'payroll' ? state.week : state.payrollWeek,
-    search: state.searchPayroll
+    search: state.searchPayroll,
+    sidebarCollapsed: state.sidebarCollapsed
   }));
 }
 

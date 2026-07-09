@@ -59,7 +59,7 @@ function bindConfirmDeleteModal() {
 
   const close = () => {
     state.pendingDelete = null;
-    refresh();
+    reRenderCurrentView();
   };
 
   setupModalKeyboard('#confirmDeleteModal', close);
@@ -103,7 +103,20 @@ function bindConfirmDeleteModal() {
         showToast(`${resourceName.charAt(0).toUpperCase() + resourceName.slice(1)} deleted.`);
       }
       state.pendingDelete = null;
-      await refresh();
+      reRenderCurrentView();
+
+      /* Background refresh */
+      if (isPermanent || resource === 'employees') {
+        partialRefresh(['employees']).catch(() => {});
+      } else {
+        const partialMap = {
+          'salary-payments': ['payroll', 'salaryPayments'],
+          'bale-payments': ['payroll', 'balePayments'],
+          'cash-advances': ['payroll', 'advances'],
+          'extra-payments': ['payroll', 'extraPayments']
+        };
+        partialRefresh(partialMap[resource] || ['payroll', 'salaryPayments', 'balePayments', 'advances', 'extraPayments']).catch(() => {});
+      }
     } catch (error) {
       showToast(error.message, 'error');
       loadingButton(btn, false);
@@ -138,7 +151,7 @@ function bindLogoutConfirmModal() {
 
   const close = () => {
     state.showLogoutConfirm = false;
-    refresh();
+    reRenderCurrentView();
   };
 
   setupModalKeyboard('#logoutModal', close);
@@ -188,10 +201,10 @@ function paymentModal(employee) {
         <form class="form-grid" id="paymentForm">
           <input type="hidden" name="id" value="${editing?.id || ''}">
           <input type="hidden" name="employee_id" value="${employee.employee_id}">
-          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" max="${moneyValue(employee.balance) + (editing ? moneyValue(editing.amount) : 0)}" value="${editing?.amount || ''}" required placeholder="Enter payment amount"></label>
+          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" max="${moneyValue(employee.balance) + (editing ? moneyValue(editing.amount) : 0)}" value="${editing?.amount || ''}" required placeholder="Enter payment amount"><span class="field-hint">Max: ${formatMoney(employee.balance)}</span></label>
           <label>Date<input name="payment_date" type="date" value="${editing?.payment_date || todayInManila()}" required></label>
-          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Optional remarks"></label>
-          <div class="error" id="paymentFormError"></div>
+          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Any remarks or notes"></label>
+          <div class="error error-box" id="paymentFormError"></div>
           <div class="modal-actions">
             ${editing ? '<button class="ghost" type="button" id="clearPaymentEdit">New Payment</button>' : ''}
             <button class="ghost" type="button" id="cancelPaymentModal">Cancel</button>
@@ -266,7 +279,7 @@ function bindPaymentModal() {
         resource: 'salary-payments',
         id: button.dataset.deletePayment
       };
-      refresh();
+      reRenderCurrentView();
     });
   });
   document.querySelector('[data-delete-legacy-payment]')?.addEventListener('click', async () => {
@@ -275,7 +288,7 @@ function bindPaymentModal() {
       resource: 'legacy-payment',
       id: empId
     };
-    refresh();
+    reRenderCurrentView();
   });
   document.querySelector('#paymentForm').addEventListener('submit', async event => {
     event.preventDefault();
@@ -295,7 +308,9 @@ function bindPaymentModal() {
       state.editingSalaryPayment = null;
       state._flash = { id: Number(state.paymentEmployee.employee_id), type: 'payroll' };
       showToast(id ? 'Payment updated.' : 'Payment saved.');
-      await refresh();
+      state.paymentEmployee = null;
+      reRenderCurrentView();
+      partialRefresh(['payroll', 'salaryPayments']).catch(() => {});
     } catch (error) {
       errorBox.textContent = error.message;
     }
@@ -331,10 +346,10 @@ function baleDeductionModal(employee) {
         <form class="form-grid" id="baleDeductionForm">
           <input type="hidden" name="id" value="${editing?.id || ''}">
           <input type="hidden" name="employee_id" value="${employee.employee_id}">
-          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" max="${moneyValue(employee.remaining_bale_balance) + (editing ? moneyValue(editing.amount) : 0)}" value="${editing?.amount || ''}" required placeholder="Enter bale repayment amount"></label>
+          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" max="${moneyValue(employee.remaining_bale_balance) + (editing ? moneyValue(editing.amount) : 0)}" value="${editing?.amount || ''}" required placeholder="Enter payment amount"><span class="field-hint">Max: ${formatMoney(employee.remaining_bale_balance)}</span></label>
           <label>Date<input name="payment_date" type="date" value="${editing?.payment_date || todayInManila()}" required></label>
-          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Optional remarks"></label>
-          <div class="error" id="baleDeductionFormError"></div>
+          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Any remarks or notes"></label>
+          <div class="error error-box" id="baleDeductionFormError"></div>
           <div class="modal-actions">
             ${editing ? '<button class="ghost" type="button" id="clearBaleEdit">New Bale</button>' : ''}
             <button class="ghost" type="button" id="cancelBaleDeductionModal">Cancel</button>
@@ -411,7 +426,9 @@ function bindBaleDeductionModal() {
       state.editingBalePayment = null;
       state._flash = { id: Number(state.baleDeductionEmployee.employee_id), type: 'payroll' };
       showToast(id ? 'Bale payment updated.' : 'Bale payment saved.');
-      await refresh();
+      state.baleDeductionEmployee = null;
+      reRenderCurrentView();
+      partialRefresh(['payroll', 'balePayments']).catch(() => {});
     } catch (error) {
       errorBox.textContent = error.message;
     }
@@ -422,7 +439,7 @@ function bindBaleDeductionModal() {
         resource: 'bale-payments',
         id: button.dataset.baleDelete
       };
-      refresh();
+      reRenderCurrentView();
     });
   });
 }
@@ -459,7 +476,7 @@ function cashAdvanceModal(employee) {
           <label>Amount<input name="amount" type="number" min="0.01" step="0.01" value="${editing?.amount || ''}" required></label>
           <label>Date<input name="advance_date" type="date" value="${editing?.advance_date || todayInManila()}" required></label>
           <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Reason or remarks"></label>
-          <div class="error" id="cashFormError"></div>
+          <div class="error error-box" id="cashFormError"></div>
           <div class="modal-actions">
             ${editing ? '<button class="ghost" type="button" id="clearCashEdit">New C/A</button>' : ''}
             <button class="ghost" type="button" id="cancelCashModal">Cancel</button>
@@ -533,7 +550,9 @@ function bindCashAdvanceModal() {
       state.editingCashAdvance = null;
       state._flash = { id: Number(state.cashEmployee.employee_id), type: 'payroll' };
       showToast(id ? 'C/A updated successfully.' : 'C/A added successfully.');
-      await refresh();
+      state.cashEmployee = null;
+      reRenderCurrentView();
+      partialRefresh(['payroll', 'advances']).catch(() => {});
     } catch (error) {
       errorBox.textContent = error.message;
     }
@@ -569,7 +588,7 @@ function extraPaymentModal(employee) {
           <label>Amount<input name="amount" type="number" min="0.01" step="0.01" value="${editing?.amount || ''}" required></label>
           <label>Date<input name="extra_date" type="date" value="${editing?.extra_date || todayInManila()}" required></label>
           <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Reason or remarks"></label>
-          <div class="error" id="extraPaymentFormError"></div>
+          <div class="error error-box" id="extraPaymentFormError"></div>
           <div class="modal-actions">
             ${editing ? '<button class="ghost" type="button" id="clearExtraEdit">New Extra</button>' : ''}
             <button class="ghost" type="button" id="cancelExtraPaymentModal">Cancel</button>
@@ -643,7 +662,9 @@ function bindExtraPaymentModal() {
       state.editingExtraPayment = null;
       state._flash = { id: Number(state.extraPaymentEmployee.employee_id), type: 'payroll' };
       showToast(id ? 'Extra payment updated.' : 'Extra payment added.');
-      await refresh();
+      state.extraPaymentEmployee = null;
+      reRenderCurrentView();
+      partialRefresh(['payroll', 'extraPayments']).catch(() => {});
     } catch (error) {
       errorBox.textContent = error.message;
     }
@@ -683,11 +704,11 @@ function employeeModal(employee = {}) {
           <div class="section-title">Basic Information</div>
           ${isEdit ? `<label>Emp Number<div class="readonly-field">${employee.emp_number}</div></label>` : ''}
           <label>Full Name<input name="name" value="${escapeHtml(employee.name || '')}" placeholder="Enter full name" required></label>
-          <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="0917xxxxxxx" required></label>
+          <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="09171234567" pattern="[0-9]{11}" minlength="11" maxlength="11" inputmode="numeric" id="phoneInput" required><span class="field-hint">Must be exactly 11 digits. Numbers only.</span></label>
           <div class="section-title">Payroll Settings</div>
           <label>Daily Rate (₱)<input name="rate" type="number" min="0" step="0.01" value="${employee.rate || ''}" placeholder="0.00" required></label>
           <label>Status<select name="active"><option value="true" ${employee.active !== false ? 'selected' : ''}>Active</option><option value="false" ${employee.active === false ? 'selected' : ''}>Inactive (Archive)</option></select></label>
-          <div class="error" id="employeeFormError"></div>
+          <div class="error error-box" id="employeeFormError"></div>
           <div class="modal-actions">
             <button class="ghost" type="button" id="cancelEmployeeModal">Cancel</button>
             <button class="primary" type="submit">${isEdit ? 'Update Employee' : 'Add Employee'}</button>
@@ -740,6 +761,12 @@ function bindEmployeeModal() {
     removeBtn.style.display = 'none';
   });
 
+  /* Block non-numeric input on phone field */
+  const phoneInputEl = document.querySelector('#phoneInput');
+  phoneInputEl?.addEventListener('input', () => {
+    phoneInputEl.value = phoneInputEl.value.replace(/\D/g, '');
+  });
+
   setupModalKeyboard('#employeeModal', close);
   document.querySelector('#closeEmployeeModal').addEventListener('click', close);
   document.querySelector('#cancelEmployeeModal').addEventListener('click', close);
@@ -752,6 +779,21 @@ function bindEmployeeModal() {
     const submitButton = event.currentTarget.querySelector('button[type="submit"]');
     const photoInput = document.querySelector('#photoInput');
     errorBox.textContent = '';
+
+    /* Validate phone: exactly 11 digits */
+    const phoneInput = document.querySelector('input[name="phone"]');
+    const phone = phoneInput?.value?.trim() || '';
+    if (!/^[0-9]{11}$/.test(phone)) {
+      phoneInput?.classList.add('field-error');
+      errorBox.textContent = 'Phone number must be exactly 11 digits (numbers only). Example: 09171234567';
+      submitButton.disabled = false;
+      phoneInput?.focus();
+      return;
+    } else {
+      phoneInput?.classList.remove('field-error');
+      phoneInput?.classList.add('field-valid');
+    }
+
     submitButton.disabled = true;
     const formData = new FormData(event.currentTarget);
     const photoFile = photoInput?.files?.[0];
@@ -770,17 +812,32 @@ function bindEmployeeModal() {
       if (photoFile && employeeId) {
         const photoForm = new FormData();
         photoForm.append('photo', photoFile);
-        await api(`/api/employees/${employeeId}/photo`, {
+        const photoResult = await api(`/api/employees/${employeeId}/photo`, {
           method: 'POST',
           body: photoForm
         });
+        /* Sync photo_url to local state */
+        const empInState = state.employees.find(e => String(e.id) === String(employeeId));
+        if (empInState) empInState.photo_url = photoResult.photo_url;
       } else if (removePhoto && employeeId) {
         await api(`/api/employees/${employeeId}/photo`, { method: 'DELETE' });
+        /* Sync photo removal to local state */
+        const empInState = state.employees.find(e => String(e.id) === String(employeeId));
+        if (empInState) empInState.photo_url = null;
       }
       state.editingEmployee = null;
       state._flash = { id: Number(employeeId), type: 'employees' };
       showToast(id ? 'Employee updated successfully.' : 'Employee added successfully.');
-      await refresh();
+
+      /* Instant update: add/edit directly in local state, no refresh needed */
+      if (id) {
+        const idx = state.employees.findIndex(e => String(e.id) === String(id));
+        if (idx !== -1) state.employees[idx] = result;
+      } else {
+        state.employees.push(result);
+        state.employees.sort((a, b) => a.name.localeCompare(b.name));
+      }
+      reRenderCurrentView();
     } catch (error) {
       errorBox.textContent = error.message;
       submitButton.disabled = false;

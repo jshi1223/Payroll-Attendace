@@ -391,6 +391,36 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_salary_payments_date ON salary_payments(payment_date);
   `);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS phone VARCHAR(20) NOT NULL DEFAULT ''`);
+  /* Ensure no duplicates before adding unique constraint on phone */
+  await pool.query(`
+    UPDATE employees SET phone = CONCAT('0000000000', id)
+    WHERE phone = '' OR phone IS NULL;
+  `);
+  /* Fix any remaining duplicate phone numbers */
+  await pool.query(`
+    UPDATE employees e
+    SET phone = CONCAT(e.phone, '_', e.id)
+    FROM (
+      SELECT phone FROM employees
+      GROUP BY phone HAVING COUNT(*) > 1
+    ) dup
+    WHERE e.phone = dup.phone AND e.phone !~ '_';
+  `);
+  await pool.query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE tablename = 'employees' AND indexname = 'idx_employees_phone_unique'
+      ) THEN
+        CREATE UNIQUE INDEX idx_employees_phone_unique ON employees(phone);
+      END IF;
+    END $$;
+  `);
+  await pool.query(`
+    /* Reset auto-generated phone numbers back to proper 11-digit format */
+    UPDATE employees SET phone = LPAD(FLOOR(RANDOM() * 100000000000)::text, 11, '1')
+    WHERE phone ~ '^0000000000' OR phone ~ '_';
+  `);
   await pool.query(`
     DO $$ BEGIN
       IF EXISTS (
@@ -494,13 +524,25 @@ app.get('/api/employees', requireAuth, async (req, res) => {
   res.json(result.rows);
 });
 
-app.post('/api/employees', requireAuth, async (req, res) => {
-  const { name, phone, rate, active = true } = req.body;
+app.post('/api/employees', requireAuth, async (req, res) => {   const { name, phone, rate, active = true } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Employee name is required.' });
   if (!phone?.trim()) return res.status(400).json({ error: 'Phone number is required.' });
+  if (!/^[0-9]{11}$/.test(phone.trim())) {
+    return res.status(400).json({ error: 'Phone number must be exactly 11 digits (numbers only).' });
+  }
   if (rate === undefined || rate === '' || Number(rate) < 0) {
     return res.status(400).json({ error: 'Valid employee rate is required.' });
   }
+
+  /* Check phone uniqueness */
+  const existingPhone = await pool.query(
+    'SELECT id FROM employees WHERE phone = $1',
+    [phone.trim()]
+  );
+  if (existingPhone.rowCount > 0) {
+    return res.status(409).json({ error: 'Phone number is already in use by another employee.' });
+  }
+
   const empNumber = await pool.query(
     `SELECT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0')) AS emp_number`
   );
@@ -508,7 +550,7 @@ app.post('/api/employees', requireAuth, async (req, res) => {
     `INSERT INTO employees (emp_number, name, phone, rate, active)
      VALUES ($1, $2, $3, $4, $5)
      RETURNING *`,
-    [empNumber.rows[0].emp_number, name, phone, rate, active]
+    [empNumber.rows[0].emp_number, name, phone.trim(), rate, active]
   );
   await logAudit(req.session.user.id, 'create', 'employee', result.rows[0].id, {
     name,
@@ -523,16 +565,29 @@ app.put('/api/employees/:id', requireAuth, async (req, res) => {
   const { name, phone, rate, active = true } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Employee name is required.' });
   if (!phone?.trim()) return res.status(400).json({ error: 'Phone number is required.' });
+  if (!/^[0-9]{11}$/.test(phone.trim())) {
+    return res.status(400).json({ error: 'Phone number must be exactly 11 digits (numbers only).' });
+  }
   if (rate === undefined || rate === '' || Number(rate) < 0) {
     return res.status(400).json({ error: 'Valid employee rate is required.' });
   }
+
+  /* Check phone uniqueness (exclude current employee) */
+  const existingPhone = await pool.query(
+    'SELECT id FROM employees WHERE phone = $1 AND id != $2',
+    [phone.trim(), req.params.id]
+  );
+  if (existingPhone.rowCount > 0) {
+    return res.status(409).json({ error: 'Phone number is already in use by another employee.' });
+  }
+
   const before = await pool.query('SELECT * FROM employees WHERE id = $1', [req.params.id]);
   const result = await pool.query(
     `UPDATE employees
      SET name = $1, phone = $2, rate = $3, active = $4, updated_at = NOW()
      WHERE id = $5
      RETURNING *`,
-    [name, phone, rate, active, req.params.id]
+    [name, phone.trim(), rate, active, req.params.id]
   );
   if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
   await logAudit(req.session.user.id, 'update', 'employee', Number(req.params.id), {
@@ -1038,6 +1093,7 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
   const weekEnd = addDays(weekStart, 6);
   const currentDate = req.query.today || todayInManila();
   const search = `%${req.query.search || ''}%`;
+  const includeInactive = req.query.include_inactive === 'true';
   const result = await pool.query(
     `WITH attendance AS (
        SELECT employee_id,
@@ -1094,7 +1150,7 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
      LEFT JOIN salary_pay_cte sp ON sp.employee_id = e.id
      LEFT JOIN payroll_statuses ps ON ps.employee_id = e.id AND ps.week_start = $1
      WHERE (e.emp_number ILIKE $3 OR e.name ILIKE $3)
-       AND e.active = true
+       ${includeInactive ? '' : 'AND e.active = true'}
      ORDER BY e.name ASC`,
     [weekStart, weekEnd, search]
   );
@@ -1154,6 +1210,7 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
       paid_at: row.paid_at
     };
   }))).filter(row =>
+    includeInactive ||
     row.days > 0 ||
     row.cash_advance > 0 ||
     row.salary_paid_amount > 0 ||

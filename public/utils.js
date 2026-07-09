@@ -258,7 +258,7 @@ function bindDeletes() {
         resource: button.dataset.deleteResource,
         id: button.dataset.deleteId
       };
-      refresh();
+      reRenderCurrentView();
     });
   });
 }
@@ -297,6 +297,6 @@ function bindForm(selector, url) {
       method: 'POST',
       body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))
     });
-    await refresh();
+    reRenderCurrentView();
   });
 }
