@@ -178,8 +178,8 @@ function paymentModal(employee) {
           <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
           <div><span>Extra Payment</span><strong>${formatMoney(employee.extra_payment_amount || 0)}</strong></div>
           <div><span>Prev Unpaid (Salary)</span><strong>${formatMoney(employee.previous_unpaid_balance)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">💰 Current Salary Balance Due</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Salary + Extras - Payment</span></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">📦 Current Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
+          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance Due</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Salary + Extras - Payment</span></div>
+          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
           <div><span>Total Paid (Salary)</span><strong>${formatMoney(employee.paid_amount)}</strong></div>
           <div><span>C/A This Week</span><strong>${formatMoney(employee.cash_advance)}</strong></div>
           <div><span>Prev Bale Balance</span><strong>${formatMoney(employee.previous_bale_balance)}</strong></div>
@@ -224,7 +224,7 @@ function paymentModal(employee) {
                       <button class="danger" data-delete-payment="${log.id}">Delete</button>
                     </td>
                   </tr>
-                `).join('') || (legacyAmount === 0 ? `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">💵</span><strong>No Salary Payments</strong><span>No payments recorded this week. Use the form above to record one.</span></td></tr>` : '')}
+                `).join('') || (legacyAmount === 0 ? `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Salary Payments</strong><span>No payments recorded this week. Use the form above to record one.</span></td></tr>` : '')}
               </tbody>
             </table>
           </div>
@@ -322,8 +322,8 @@ function baleDeductionModal(employee) {
           <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
           <div><span>Extra Payment</span><strong>${formatMoney(employee.extra_payment_amount || 0)}</strong></div>
           <div><span>Prev Unpaid (Salary)</span><strong>${formatMoney(employee.previous_unpaid_balance)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">💰 Current Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Unpaid salary this week</span></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">📦 Current Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
+          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Unpaid salary this week</span></div>
+          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
           <div><span>Total Bale</span><strong>${formatMoney(employee.total_bale)}</strong></div>
           <div><span>C/A This Week</span><strong>${formatMoney(employee.cash_advance)}</strong></div>
           <div><span>Prev Bale Balance</span><strong>${formatMoney(employee.previous_bale_balance)}</strong></div>
@@ -357,7 +357,7 @@ function baleDeductionModal(employee) {
                       <button class="danger" data-bale-delete="${log.id}">Delete</button>
                     </td>
                   </tr>
-                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">📦</span><strong>No Bale Payments</strong><span>No bale payments recorded this week. Use the form above to record one.</span></td></tr>`}
+                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Bale Payments</strong><span>No bale payments recorded this week. Use the form above to record one.</span></td></tr>`}
               </tbody>
             </table>
           </div>
@@ -447,8 +447,8 @@ function cashAdvanceModal(employee) {
           <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
           <div><span>Extra Payment</span><strong>${formatMoney(employee.extra_payment_amount || 0)}</strong></div>
           <div><span>Prev Unpaid (Salary)</span><strong>${formatMoney(employee.previous_unpaid_balance)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">💰 Current Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Salary + Extras - C/A - Payment</span></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">📦 Current Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
+          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Salary + Extras - C/A - Payment</span></div>
+          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
           <div><span>Total Bale</span><strong>${formatMoney(employee.total_bale)}</strong></div>
           <div><span>C/A This Week</span><strong>${formatMoney(employee.cash_advance)}</strong></div>
           <div><span>Previous Bale</span><strong>${formatMoney(employee.previous_bale_balance)}</strong></div>
@@ -482,7 +482,7 @@ function cashAdvanceModal(employee) {
                       ${deleteButton('cash-advances', log.id)}
                     </td>
                   </tr>
-                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">💰</span><strong>No Cash Advances</strong><span>No C/A records this week. Use the form above to add one.</span></td></tr>`}
+                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Cash Advances</strong><span>No C/A records this week. Use the form above to add one.</span></td></tr>`}
               </tbody>
             </table>
           </div>
@@ -560,8 +560,8 @@ function extraPaymentModal(employee) {
           <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
           <div><span>Salary Payment</span><strong>${formatMoney(employee.salary_paid_amount)}</strong></div>
           <div><span>Total Extra</span><strong>${formatMoney(employee.extra_payment_amount)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">💰 Current Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">📦 Current Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong></div>
+          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong></div>
+          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong></div>
         </div>
         <form class="form-grid" id="extraPaymentForm">
           <input type="hidden" name="id" value="${editing?.id || ''}">
@@ -592,7 +592,7 @@ function extraPaymentModal(employee) {
                       ${deleteButton('extra-payments', log.id)}
                     </td>
                   </tr>
-                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">➕</span><strong>No Extra Payments</strong><span>No extra payments recorded this week. Use the form above to add one.</span></td></tr>`}
+                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Extra Payments</strong><span>No extra payments recorded this week. Use the form above to add one.</span></td></tr>`}
               </tbody>
             </table>
           </div>
@@ -675,10 +675,10 @@ function employeeModal(employee = {}) {
           <input type="hidden" name="id" value="${employee.id || ''}">
           <div class="profile-photo-wrap">
             <div class="profile-photo" id="profilePhotoPreview" style="${photoStyle}">${photoContent}</div>
-            <div class="profile-photo-overlay">📷</div>
+            <div class="profile-photo-overlay">+</div>
             <input name="photo" type="file" accept="image/*" id="photoInput" hidden>
             <div class="profile-photo-label">Click to ${hasPhoto ? 'change' : 'add'} photo</div>
-            ${isEdit && hasPhoto ? '<button type="button" class="profile-photo-remove" id="removePhotoBtn">✕ Remove Photo</button>' : ''}
+            ${isEdit && hasPhoto ? '<button type="button" class="profile-photo-remove" id="removePhotoBtn">Remove Photo</button>' : ''}
           </div>
           <div class="section-title">Basic Information</div>
           ${isEdit ? `<label>Emp Number<div class="readonly-field">${employee.emp_number}</div></label>` : ''}
@@ -686,11 +686,11 @@ function employeeModal(employee = {}) {
           <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="0917xxxxxxx" required></label>
           <div class="section-title">Payroll Settings</div>
           <label>Daily Rate (₱)<input name="rate" type="number" min="0" step="0.01" value="${employee.rate || ''}" placeholder="0.00" required></label>
-          <label>Status<select name="active"><option value="true" ${employee.active !== false ? 'selected' : ''}>🟢 Active</option><option value="false" ${employee.active === false ? 'selected' : ''}>🔴 Inactive (Archive)</option></select></label>
+          <label>Status<select name="active"><option value="true" ${employee.active !== false ? 'selected' : ''}>Active</option><option value="false" ${employee.active === false ? 'selected' : ''}>Inactive (Archive)</option></select></label>
           <div class="error" id="employeeFormError"></div>
           <div class="modal-actions">
             <button class="ghost" type="button" id="cancelEmployeeModal">Cancel</button>
-            <button class="primary" type="submit">${isEdit ? '💾 Update Employee' : '➕ Add Employee'}</button>
+            <button class="primary" type="submit">${isEdit ? 'Update Employee' : 'Add Employee'}</button>
           </div>
         </form>
       </section>
@@ -797,7 +797,7 @@ function auditTrailModal() {
       <section class="modal wide-modal" style="max-height:90vh;display:flex;flex-direction:column;">
         <div class="modal-head">
           <div>
-            <h2>📋 Audit Trail</h2>
+            <h2>Audit Trail</h2>
             <p>Complete history of actions in the system.</p>
           </div>
           <button class="icon-btn" id="closeAuditModal" aria-label="Close">x</button>
@@ -805,7 +805,7 @@ function auditTrailModal() {
         <div class="audit-filters">
           <select id="auditEntityFilter"><option value="">All Entities</option><option value="employee">Employee</option><option value="cash_advance">Cash Advance</option><option value="extra_payment">Extra Payment</option><option value="payroll_payment">Payroll Payment</option><option value="payroll_extra_payment">Extra Payment (old)</option></select>
           <select id="auditActionFilter"><option value="">All Actions</option><option value="create">Create</option><option value="update">Update</option><option value="delete">Delete</option><option value="archive">Archive</option><option value="restore">Restore</option><option value="permanent_delete">Permanent Delete</option></select>
-          <input id="auditSearch" placeholder="🔍 Search details..." value="${escapeHtml(auditFilterState.search)}">
+          <input id="auditSearch" placeholder="Search details..." value="${escapeHtml(auditFilterState.search)}">
           <input id="auditDateFrom" type="date" value="${auditFilterState.date_from}">
           <input id="auditDateTo" type="date" value="${auditFilterState.date_to}">
           <button class="ghost" id="auditFilterBtn">Filter</button>
@@ -833,7 +833,7 @@ async function renderAuditTable() {
   try {
     const data = await loadAuditLogs();
     if (!data.rows || data.rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><span class="empty-icon">📭</span><strong>No Audit Logs</strong><span>No records match your filters.</span></td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><span class="empty-icon">--</span><strong>No Audit Logs</strong><span>No records match your filters.</span></td></tr>';
       pagination.innerHTML = '';
       return;
     }
@@ -854,13 +854,11 @@ async function renderAuditTable() {
       } else {
         detailsHtml = escapeHtml(String(details));
       }
-      const actionIcons = { create: '➕', update: '✏️', delete: '🗑️', archive: '📦', restore: '♻️', permanent_delete: '💀' };
-      const icon = actionIcons[log.action] || '🔹';
       return `
         <tr>
           <td class="audit-date">${new Date(log.created_at).toLocaleString('en-PH')}</td>
           <td><strong>${escapeHtml(log.username || 'System')}</strong></td>
-          <td><span class="audit-action audit-action-${log.action}">${icon} ${escapeHtml(log.action.replace(/_/g, ' '))}</span></td>
+          <td><span class="audit-action audit-action-${log.action}">${escapeHtml(log.action.replace(/_/g, ' '))}</span></td>
           <td><span class="badge">${escapeHtml(log.entity.replace(/_/g, ' '))}</span></td>
           <td>${log.entity_id || '-'}</td>
           <td style="white-space:normal;min-width:200px;font-size:12px;">${detailsHtml}</td>

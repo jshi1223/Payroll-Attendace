@@ -503,10 +503,17 @@ body.dark-mode .userbox {
 }
 
 .summary-card .card-icon {
-  font-size: 24px;
-  line-height: 1;
-  margin-bottom: 8px;
-  display: block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--brand-light);
+  color: var(--brand-dark);
+  font-size: 14px;
+  font-weight: 800;
+  margin-bottom: 10px;
 }
 
 .summary-card span {
@@ -770,9 +777,17 @@ body.dark-mode .badge.partial {
 }
 
 .quick-action-card .qa-icon {
-  font-size: 32px;
-  line-height: 1;
-  margin-bottom: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--brand-light);
+  color: var(--brand-dark);
+  font-size: 18px;
+  font-weight: 800;
+  margin-bottom: 8px;
 }
 
 .quick-action-card strong {

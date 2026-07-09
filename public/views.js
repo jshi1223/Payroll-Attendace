@@ -82,14 +82,14 @@ function renderLogin(error = '') {
         </div>
         <div class="form-grid">
           <label>Username<input name="username" id="loginUsername" autocomplete="username" value="${escapeHtml(savedUsername)}" required></label>
-          <label>Password<div class="password-wrapper"><input name="password" id="loginPassword" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" onclick="togglePassword(this)" tabindex="-1">👁</button></div><div class="caps-warning" id="capsWarning">⇪ Caps Lock is ON</div></label>
+          <label>Password<div class="password-wrapper"><input name="password" id="loginPassword" type="password" autocomplete="current-password" required><button type="button" class="password-toggle" onclick="togglePassword(this)" tabindex="-1">SHOW</button></div><div class="caps-warning" id="capsWarning">Caps Lock is ON</div></label>
           <label class="checkbox-row"><input type="checkbox" id="rememberMe" ${savedUsername ? 'checked' : ''}> Remember username</label>
           <button class="primary" type="submit" id="loginBtn">Sign In</button>
           <div class="error">${error}</div>
         </div>
         <div class="login-footer">
-          <span class="badge role-admin">👑 Admin</span>
-          <span class="badge role-hr">👤 HR Staff</span>
+          <span class="badge role-admin">Admin</span>
+          <span class="badge role-hr">HR Staff</span>
         </div>
       </form>
     </section>
@@ -150,33 +150,33 @@ function renderDashboard() {
   shell(`
     <section class="summary">
       <div class="summary-card" style="border-left-color: #0f766e;">
-        <span class="card-icon">👥</span>
+        <span class="card-icon">E</span>
         <span>Active Employees</span>
         <strong>${empCount}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #b45309;">
-        <span class="card-icon">📋</span>
+        <span class="card-icon">P</span>
         <span>Present Today</span>
         <strong>${attendanceToday}</strong>
         <span class="card-sub">${state.currentDate}</span>
       </div>
       <div class="summary-card" style="border-left-color: #075985;">
-        <span class="card-icon">💰</span>
+        <span class="card-icon">S</span>
         <span>This Week's Salary</span>
         <strong>${summary ? formatMoney(summary.totalSalary) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #166534;">
-        <span class="card-icon">💵</span>
+        <span class="card-icon">P</span>
         <span>Salary Payment</span>
         <strong>${summary ? formatMoney(summary.totalPaidAmount) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #c2410c;">
-        <span class="card-icon">📊</span>
+        <span class="card-icon">B</span>
         <span>Outstanding Balance</span>
         <strong>${summary ? formatMoney(summary.totalBalance) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #92400e;">
-        <span class="card-icon">📦</span>
+        <span class="card-icon">B</span>
         <span>Bale Balance</span>
         <strong>${summary ? formatMoney(summary.totalBaleBalance) : '₱0.00'}</strong>
       </div>
@@ -187,44 +187,44 @@ function renderDashboard() {
           <h2>Quick Actions</h2>
           <p>${state.currentDate} | Week: ${payroll ? payroll.weekStart : state.week}</p>
         </div>
-        <span class="badge role-${state.user.role}">${isAdmin ? '👑 Admin' : '👤 HR'}</span>
+        <span class="badge role-${state.user.role}">${isAdmin ? 'Admin' : 'HR'}</span>
       </div>
       <div class="quick-actions">
         <div class="quick-action-card" data-quick-view="payroll">
-          <span class="qa-icon">📊</span>
+          <span class="qa-icon">$</span>
           <strong>Payroll</strong>
           <span>View and manage weekly payroll, payments, and payslips.</span>
           <button class="primary">Go to Payroll</button>
         </div>
         <div class="quick-action-card" data-quick-view="attendance">
-          <span class="qa-icon">📋</span>
+          <span class="qa-icon">A</span>
           <strong>Attendance</strong>
           <span>Record daily employee attendance logs.</span>
           <button class="ghost">Take Attendance</button>
         </div>
         <div class="quick-action-card" data-quick-view="employees">
-          <span class="qa-icon">👥</span>
+          <span class="qa-icon">E</span>
           <strong>Employees</strong>
           <span>${isAdmin ? 'Add, edit, or archive employee profiles.' : 'Add and edit employee profiles.'}</span>
           <button class="ghost">Manage Employees</button>
         </div>
         <div class="quick-action-card" data-quick-view="archive">
-          <span class="qa-icon">📦</span>
+          <span class="qa-icon">A</span>
           <strong>Archive</strong>
           <span>${isAdmin ? 'View archived employees, restore, or permanently delete.' : 'View archived employees (read-only).'}</span>
           <button class="ghost">${isAdmin ? 'Go to Archive' : 'View Archive'}</button>
         </div>
         ${isAdmin ? `
         <div class="quick-action-card" onclick="state.showAudit=true;refresh()">
-          <span class="qa-icon">📋</span>
-          <strong>Audit Trail 🔒</strong>
+          <span class="qa-icon">L</span>
+          <strong>Audit Trail</strong>
           <span>View all system actions and changes (Admin only).</span>
           <button class="ghost">Open Audit Trail</button>
         </div>` : `
         <div class="quick-action-card" style="opacity:0.6;cursor:default;">
-          <span class="qa-icon">🔒</span>
+          <span class="qa-icon">L</span>
           <strong>Audit Trail</strong>
-          <span>🔒 Admin-only feature. Request access from admin.</span>
+          <span>Admin-only feature. Request access from admin.</span>
           <button class="ghost" disabled style="cursor:not-allowed;">Admin Only</button>
         </div>`}
       </div>
@@ -269,33 +269,33 @@ function renderPayroll() {
     ${weekToolbar()}
     <section class="summary">
       <div class="summary-card" style="border-left-color:#0f766e;">
-        <span class="card-icon">👥</span>
+        <span class="card-icon">E</span>
         <span>Employee Records</span>
         <strong>${displaySummary.employees}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#2563eb;">
-        <span class="card-icon">📅</span>
+        <span class="card-icon">D</span>
         <span>Working Days</span>
         <strong>${displaySummary.workingDays}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#166534;">
-        <span class="card-icon">💵</span>
+        <span class="card-icon">P</span>
         <span>Salary Payment</span>
         <strong>${formatMoney(displaySummary.totalPaidAmount)}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#075985;">
-        <span class="card-icon">💰</span>
+        <span class="card-icon">B</span>
         <span>Current Balance (Unpaid)</span>
         <strong>${formatMoney(displaySummary.totalBalance)}</strong>
         <span class="card-sub">Outstanding salary balance after payments</span>
       </div>
       <div class="summary-card" style="border-left-color:#92400e;">
-        <span class="card-icon">📦</span>
+        <span class="card-icon">B</span>
         <span>Bale Balance</span>
         <strong>${formatMoney(displaySummary.totalBaleBalance)}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#c2410c;">
-        <span class="card-icon">📋</span>
+        <span class="card-icon">U</span>
         <span>Prev Unpaid</span>
         <strong>${formatMoney(displaySummary.totalPreviousUnpaid)}</strong>
       </div>
@@ -339,7 +339,7 @@ function renderPayroll() {
               </td>
               </tr>
             `;
-            }).join('') || `<tr><td colspan="15" class="empty-state"><span class="empty-icon">📋</span><strong>No Payroll Data</strong><span>No payroll records found for this week.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="15" class="empty-state"><span class="empty-icon">--</span><strong>No Payroll Data</strong><span>No payroll records found for this week.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -424,27 +424,27 @@ function renderAttendance() {
     </div>
     <section class="summary">
       <div class="summary-card" style="border-left-color:#0f766e;">
-        <span class="card-icon">📋</span>
+        <span class="card-icon">P</span>
         <span>Present Today</span>
         <strong>${dayRows.length}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#2563eb;">
-        <span class="card-icon">📅</span>
+        <span class="card-icon">D</span>
         <span>Date</span>
         <strong>${state.attendanceDate}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#b45309;">
-        <span class="card-icon">🔢</span>
+        <span class="card-icon">#</span>
         <span>Workday No.</span>
         <strong>${payrollWorkdayNumber(state.attendanceDate)}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#075985;">
-        <span class="card-icon">📆</span>
+        <span class="card-icon">W</span>
         <span>Payroll Week</span>
         <strong>${state.week}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#92400e;">
-        <span class="card-icon">🏁</span>
+        <span class="card-icon">E</span>
         <span>Week Ends</span>
         <strong>${addDays(state.week, 6)}</strong>
       </div>
@@ -452,7 +452,7 @@ function renderAttendance() {
     <section class="panel">
       <div class="panel-header">
         <div>
-          <h2>📋 Daily Attendance</h2>
+          <h2>Daily Attendance</h2>
           <p>Record employees who attended for the selected date.</p>
         </div>
         <span class="badge" style="background:#eff6ff;color:#075985;">${dayRows.length} Present Today</span>
@@ -461,7 +461,7 @@ function renderAttendance() {
         <label>Employee
           ${searchableSelectHTML('employee_id',
             availableEmployees.map(e => ({ value: e.id, label: `${e.emp_number} - ${e.name}` })),
-            '🔍 Type to search employee...'
+            'Type to search employee...'
           )}
         </label>
         <label>Notes<input name="notes" placeholder="Present, Late, etc."></label>
@@ -486,12 +486,12 @@ function renderAttendance() {
                 <td>${row.work_date}</td>
                 <td>${highlight(row.emp_number)}</td>
                 <td>${highlight(row.name)}</td>
-                <td><span class="badge paid">✓ Present</span></td>
+                <td><span class="badge paid">Present</span></td>
                 <td>${peso.format(row.rate_snapshot)}</td>
                 <td>${row.notes ? escapeHtml(row.notes) : '<span class="muted">—</span>'}</td>
                 <td class="actions">${deleteButton('attendance', row.id)}</td>
               </tr>
-            `).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">📋</span><strong>No Attendance Records</strong><span>No attendance recorded for this date yet.</span></td></tr>`}
+            `).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>No attendance recorded for this date yet.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -567,21 +567,21 @@ function renderEmployees() {
   shell(`
     <section class="toolbar module-toolbar toolbar-end">
       <label>Search<input id="employeeSearch" value="${state.searchEmployees}" placeholder="Emp no. or name"></label>
-      <button class="primary" id="openEmployeeModal">➕ Add Employee</button>
+      <button class="primary" id="openEmployeeModal">Add Employee</button>
     </section>
     <section class="summary">
       <div class="summary-card" style="border-left-color:#0f766e;">
-        <span class="card-icon">👥</span>
+        <span class="card-icon">E</span>
         <span>Total Active</span>
         <strong>${activeCount}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#92400e;">
-        <span class="card-icon">📦</span>
+        <span class="card-icon">A</span>
         <span>Archived</span>
         <strong>${inactiveCount}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#075985;">
-        <span class="card-icon">💰</span>
+        <span class="card-icon">R</span>
         <span>Avg. Rate</span>
         <strong>${activeCount > 0 ? formatMoney(state.employees.filter(e => e.active !== false).reduce((s, e) => s + Number(e.rate), 0) / activeCount) : '₱0.00'}</strong>
       </div>
@@ -592,8 +592,8 @@ function renderEmployees() {
           <h2>Employee List</h2>
           <p>Manage employee profiles, status, and daily rates.</p>
         </div>
-        <span class="badge" style="background:#dcfce7;color:#166534;">🟢 ${activeCount} Active</span>
-        ${inactiveCount > 0 ? `<span class="badge unpaid">📦 ${inactiveCount} Archived</span>` : ''}
+        <span class="badge" style="background:#dcfce7;color:#166534;">${activeCount} Active</span>
+        ${inactiveCount > 0 ? `<span class="badge unpaid">${inactiveCount} Archived</span>` : ''}
       </div>
       <div class="table-wrap">
         <table>
@@ -612,13 +612,13 @@ function renderEmployees() {
                 <td><strong>${highlight(row.name)}</strong></td>
                 <td>${escapeHtml(row.phone || '-')}</td>
                 <td><strong>${peso.format(row.rate)}</strong>/day</td>
-                <td><span class="badge ${row.active !== false ? 'paid' : 'unpaid'}" style="font-size:11px;">${row.active !== false ? '🟢 Active' : '🔴 Inactive'}</span></td>
+                <td><span class="badge ${row.active !== false ? 'paid' : 'unpaid'}" style="font-size:11px;">${row.active !== false ? 'Active' : 'Inactive'}</span></td>
                 <td class="actions">
-                  <button class="ghost" data-edit-employee="${row.id}">✏️ Edit</button>
+                  <button class="ghost" data-edit-employee="${row.id}">Edit</button>
                   ${deleteButton('employees', row.id)}
                 </td>
               </tr>
-            `}).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">👥</span><strong>No Employees</strong><span>Add your first employee to get started.</span></td></tr>`}
+            `}).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Employees</strong><span>Add your first employee to get started.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -707,7 +707,7 @@ function renderArchive() {
                 </td>
               </tr>
               `;
-            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">📦</span><strong>No Archived Employees</strong><span>No employees are archived. Archive inactive employees from the Employees section.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No Archived Employees</strong><span>No employees are archived. Archive inactive employees from the Employees section.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -793,7 +793,7 @@ function renderCashAdvance() {
                   ${deleteButton('cash-advances', row.id)}
                 </td>
               </tr>
-            `).join('') || `<tr><td colspan="6" class="empty-state"><span class="empty-icon">💰</span><strong>No Cash Advances</strong><span>No C/A records this week. Use the form above to add one.</span></td></tr>`}
+            `).join('') || `<tr><td colspan="6" class="empty-state"><span class="empty-icon">--</span><strong>No Cash Advances</strong><span>No C/A records this week. Use the form above to add one.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1004,15 +1004,15 @@ kvsk.cctv.itsolutions@gmail.com<br>
       </div>
       <div class="actions no-print" style="margin-top:16px; justify-content:center;">
         <button class="ghost" id="backPayroll">Back</button>
-        <button class="primary" onclick="window.print()">🖨 Print</button>
-        <button class="primary" id="downloadPdfBtn">⬇ Download PDF</button>
+        <button class="primary" onclick="window.print()">Print</button>
+        <button class="primary" id="downloadPdfBtn">Download PDF</button>
       </div>
     </section>
   `);
   document.querySelector('#backPayroll').addEventListener('click', refresh);
   document.querySelector('#downloadPdfBtn')?.addEventListener('click', async () => {
     const btn = document.querySelector('#downloadPdfBtn');
-    btn.textContent = '⏳ Generating...';
+    btn.textContent = 'Generating...';
     btn.disabled = true;
     try {
       const { jsPDF } = window.jspdf;
@@ -1027,7 +1027,7 @@ kvsk.cctv.itsolutions@gmail.com<br>
     } catch (err) {
       showToast('PDF generation failed. Try Print instead.');
     }
-    btn.textContent = '⬇ Download PDF';
+    btn.textContent = 'Download PDF';
     btn.disabled = false;
   });
 }

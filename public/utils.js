@@ -182,7 +182,7 @@ function togglePassword(btn) {
   if (!input) return;
   const isPassword = input.type === 'password';
   input.type = isPassword ? 'text' : 'password';
-  btn.textContent = isPassword ? '🙈' : '👁';
+  btn.textContent = isPassword ? 'HIDE' : 'SHOW';
 }
 
 function debounce(fn, wait) {
@@ -213,7 +213,7 @@ function showToast(message, type = 'success') {
   }
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
-  const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ';
+  const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : 'i';
   toast.innerHTML = `<span>${icon}</span> ${escapeHtml(message)}`;
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 4000);
@@ -248,7 +248,7 @@ function exportCSV(data, filename) {
 function deleteButton(resource, id) {
   if (resource !== 'cash-advances' && resource !== 'extra-payments' && state.user.role !== 'admin') return '';
   const label = resource === 'employees' ? 'Archive' : 'Delete';
-  return `<button class="danger" data-delete-resource="${resource}" data-delete-id="${id}">${state.user.role === 'admin' ? '🗑 ' : ''}${label}</button>`;
+  return `<button class="danger" data-delete-resource="${resource}" data-delete-id="${id}">${label}</button>`;
 }
 
 function bindDeletes() {

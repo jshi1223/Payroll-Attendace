@@ -116,7 +116,7 @@ function shell(content) {
             }
           </div>
           <div class="theme-toggle">
-            <button class="ghost" id="darkModeToggle">🌙 Dark Mode</button>
+            <button class="ghost" id="darkModeToggle">Dark Mode</button>
           </div>
           <div class="session-info" id="sessionInfo">Session active</div>
           <div class="session-actions">
@@ -133,7 +133,7 @@ function shell(content) {
             <p>Today: ${state.currentDate} | Week: ${state.week} to ${addDays(state.week, 6)}</p>
           </div>
           <span class="badge role-${state.user.role}">
-            ${state.user.role === 'admin' ? '👑 Admin - Full Access' : '👤 HR - Manage Records'}
+            ${state.user.role === 'admin' ? 'Admin - Full Access' : 'HR - Manage Records'}
           </span>
         </div>
         ${content}
@@ -162,7 +162,7 @@ function shell(content) {
   document.querySelector('#darkModeToggle')?.addEventListener('click', () => {
     const isDark = document.body.classList.toggle('dark-mode');
     localStorage.setItem('payrollDarkMode', isDark ? 'true' : '');
-    document.querySelector('#darkModeToggle').textContent = isDark ? '☀️ Light Mode' : '🌙 Dark Mode';
+    document.querySelector('#darkModeToggle').textContent = isDark ? 'Light Mode' : 'Dark Mode';
   });
   document.querySelector('#logoutBtn').addEventListener('click', async () => {
     state.showLogoutConfirm = true;
