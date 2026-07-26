@@ -11,7 +11,7 @@ const state = {
   view: savedView,
   week: initialStateWeek,
   payrollWeek: initialStateWeek,
-  payPeriodDays: 7,
+  payPeriodDays: savedState.payPeriodDays || 7,
   attendanceDate: currentDay,
   currentDate: currentDay,
   search: '',

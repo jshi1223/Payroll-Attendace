@@ -805,8 +805,17 @@ app.delete('/api/employees/:id/permanent', requireAuth, requireAdmin, async (req
 });
 
 app.get('/api/attendance', requireAuth, async (req, res) => {
-  const weekStart = weekStartOf(req.query.week || todayInManila());
-  const weekEnd = addDays(weekStart, 6);
+  const pd = getPeriodDays(req.query.periodDays);
+  let weekStart, weekEnd;
+  if (req.query.periodDays) {
+    /* Use payroll period alignment when periodDays is specified */
+    weekStart = periodStartOf(req.query.week || todayInManila(), pd);
+    weekEnd = addDays(weekStart, pd - 1);
+  } else {
+    /* Default: Sunday-to-Saturday for attendance view navigation */
+    weekStart = weekStartOf(req.query.week || todayInManila());
+    weekEnd = addDays(weekStart, 6);
+  }
   const search = `%${req.query.search || ''}%`;
   const result = await pool.query(
     `SELECT a.id, a.employee_id, to_char(a.work_date, 'YYYY-MM-DD') AS work_date,
@@ -1323,7 +1332,10 @@ app.put('/api/cash-advances/:id', requireAuth, async (req, res) => {
 
 app.get('/api/payroll', requireAuth, async (req, res) => {
   const periodDays = getPeriodDays(req.query.periodDays);
-  const weekStart = periodStartOf(req.query.week || todayInManila(), periodDays);
+  /* Trust the provided week — don't realign to period anchor */
+  const weekStart = req.query.week
+    ? payrollWeekStartOf(req.query.week)
+    : periodStartOf(todayInManila(), periodDays);
   const weekEnd = addDays(weekStart, periodDays - 1);
   const currentDate = req.query.today || todayInManila();
   const search = `%${req.query.search || ''}%`;

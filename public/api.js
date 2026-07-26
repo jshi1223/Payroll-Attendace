@@ -25,7 +25,7 @@ async function loadData() {
   const pd = state.payPeriodDays || 7;
   const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate, periodDays: pd });
   if (state.view === 'archive') payrollQs.set('include_inactive', 'true');
-  const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate });
+  const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate, periodDays: pd });
   const promises = [
     api(`/api/employees?search=${encodeURIComponent(state.searchEmployees)}&active=${state.view === 'archive' ? 'false' : 'true'}`),
     api(`/api/payroll?${payrollQs}`),

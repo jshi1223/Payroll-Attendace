@@ -426,7 +426,7 @@ async function partialRefresh(types) {
   const pd = state.payPeriodDays || 7;
   const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate, periodDays: pd });
   if (state.view === 'archive') payrollQs.set('include_inactive', 'true');
-  const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate });
+  const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate, periodDays: pd });
   const fetchers = {
     employees: api(`/api/employees?search=${encodeURIComponent(state.searchEmployees)}&active=${state.view === 'archive' ? 'false' : 'true'}`),
     payroll: api(`/api/payroll?${payrollQs}`),

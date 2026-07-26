@@ -12,7 +12,7 @@ function titleForView() {
 
 function weekToolbar(className = '') {
   const pd = state.payPeriodDays || 7;
-  const periodStart = periodStartOf(state.week, pd);
+  const periodStart = state.week;
   const isLocked = state.payroll?.isPeriodLocked;
   const nextLabel = (pd > 7 && isLocked) ? 'Next Period' : (pd > 7 ? 'Next Week' : 'Next →');
   const prevLabel = (pd > 7 && isLocked) ? 'Previous Period' : (pd > 7 ? 'Previous Week' : '← Previous');
@@ -41,7 +41,7 @@ function weekToolbar(className = '') {
 function bindWeekToolbar() {
   const pd = state.payPeriodDays || 7;
   document.querySelector('#weekInput')?.addEventListener('change', async event => {
-    state.week = periodStartOf(event.target.value, pd);
+    state.week = payrollWeekStartOf(event.target.value);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
@@ -66,14 +66,16 @@ function bindWeekToolbar() {
       document.querySelector('#customPeriodWrap').style.display = 'none';
       state.payPeriodDays = Number(val);
     }
-    state.week = periodStartOf(state.week, state.payPeriodDays);
+    /* Keep current week start — don't realign to period anchor */
+    state.week = payrollWeekStartOf(state.week);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#customPeriodDays')?.addEventListener('change', async event => {
     state.payPeriodDays = Math.max(1, Number(event.target.value) || 7);
-    state.week = periodStartOf(state.week, state.payPeriodDays);
+    /* Keep current week start — don't realign to period anchor */
+    state.week = payrollWeekStartOf(state.week);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
@@ -542,6 +544,7 @@ function renderAttendance() {
   document.querySelector('#attendanceDate').addEventListener('change', async event => {
     state.attendanceDate = event.target.value;
     state.week = weekStartOf(state.attendanceDate);
+    state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
@@ -558,12 +561,14 @@ function renderAttendance() {
   document.querySelector('#prevDay').addEventListener('click', async () => {
     state.attendanceDate = addDays(state.attendanceDate, -1);
     state.week = weekStartOf(state.attendanceDate);
+    state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#nextDay').addEventListener('click', async () => {
     state.attendanceDate = addDays(state.attendanceDate, 1);
     state.week = weekStartOf(state.attendanceDate);
+    state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
@@ -589,6 +594,7 @@ function renderAttendance() {
       });
       showToast('Attendance recorded.');
       state.week = weekStartOf(state.attendanceDate);
+      state.payrollWeek = state.week;
       await partialRefresh(['attendance', 'payroll']);
     } catch (error) {
       showToast(error.message, 'error');
@@ -891,9 +897,10 @@ function openBulkPayslipPrint(rows) {
   }
 
   const slips = rows.map(row => {
-    const pd = row.pay_period_days || state.payPeriodDays || 7;
+    const pd = state.payPeriodDays || row.pay_period_days || 7;
     const periodLabel = getPeriodLabel(pd);
-    const periodEnd = addDays(state.week, pd - 1);
+    const periodStart = periodStartOf(state.week, pd);
+    const periodEnd = addDays(periodStart, pd - 1);
     const attendanceDates = new Set(state.attendance.rows
       .filter(log => Number(log.employee_id) === Number(row.employee_id))
       .map(log => log.work_date));
@@ -901,7 +908,7 @@ function openBulkPayslipPrint(rows) {
       .filter(log => Number(log.employee_id) === Number(row.employee_id))
       .reduce((logs, log) => ({ ...logs, [log.advance_date]: log }), {});
     const days = Array.from({ length: pd }, (_, index) => {
-      const date = addDays(state.week, index);
+      const date = addDays(periodStart, index);
       const cash = cashByDate[date];
       const present = attendanceDates.has(date);
       const earning = present ? Number(row.rate) : 0;
@@ -939,7 +946,7 @@ function openBulkPayslipPrint(rows) {
             </div>
             <div class="date-line">
               <span>Panahon:</span>
-              <strong>${formatSlipDate(state.week)} – ${formatSlipDate(periodEnd)}</strong>
+              <strong>${formatSlipDate(periodStart)} – ${formatSlipDate(periodEnd)}</strong>
             </div>
           </div>
 
@@ -1020,7 +1027,7 @@ function openBulkPayslipPrint(rows) {
 
           <div class="slip-summary-footer">
             <div><strong>BALENSA (Utang):</strong> ${formatMoney(row.remaining_bale_balance)}</div>
-            <div><strong>Panahon:</strong> ${formatSlipDate(state.week)} - ${formatSlipDate(periodEnd)}</div>
+            <div><strong>Panahon:</strong> ${formatSlipDate(periodStart)} - ${formatSlipDate(periodEnd)}</div>
           </div>
 
           <div class="slip-signatures">
@@ -1088,9 +1095,10 @@ function openBulkPayslipPrint(rows) {
 }
 
 function renderPayslip(row, { preview = false } = {}) {
-  const pd = row.pay_period_days || state.payPeriodDays || 7;
+  const pd = state.payPeriodDays || row.pay_period_days || 7;
   const periodLabel = getPeriodLabel(pd);
-  const weekDates = Array.from({ length: pd }, (_, index) => addDays(state.week, index));
+  const periodStart = periodStartOf(state.week, pd);
+  const weekDates = Array.from({ length: pd }, (_, index) => addDays(periodStart, index));
   const attendanceSet = new Set(
     state.attendance.rows
       .filter(log => Number(log.employee_id) === Number(row.employee_id))
@@ -1141,7 +1149,7 @@ kvsk.cctv.itsolutions@gmail.com<br>
           </div>
           <div class="date-line">
             <span>Panahon:</span>
-            <strong>${formatSlipDate(state.week)} – ${formatSlipDate(addDays(state.week, pd - 1))}</strong>
+            <strong>${formatSlipDate(periodStart)} – ${formatSlipDate(addDays(periodStart, pd - 1))}</strong>
           </div>
         </div>
 
@@ -1229,8 +1237,7 @@ kvsk.cctv.itsolutions@gmail.com<br>
         </table>
 
         <div class="slip-summary-footer">
-          <div><strong>BALENSA (Utang):</strong> ${peso.format(row.remaining_bale_balance)}</div>
-          <div><strong>Panahon:</strong> ${formatSlipDate(state.week)} - ${formatSlipDate(addDays(state.week, pd - 1))}</div>
+          <div><strong>BALENSA (Utang):</strong> ${peso.format(row.remaining_bale_balance)}</div>            <div><strong>Panahon:</strong> ${formatSlipDate(periodStart)} - ${formatSlipDate(addDays(periodStart, pd - 1))}</div>
         </div>
 
         <div class="slip-signatures">
