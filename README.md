@@ -2,12 +2,27 @@
 
 A full-stack web application for managing employee attendance, weekly payroll computation, cash advances, salary payments, and payslip generation. Built for **KVSK CCTV & IT Solutions**.
 
+## Documentation
+
+Full documentation is available in the [docs/](docs/index.md) folder:
+
+| Document | Description |
+|----------|-------------|
+| [User Guide](docs/user-guide.md) | Complete user manual for daily operation |
+| [Installation Guide](docs/installation.md) | Setup and configuration instructions |
+| [Architecture](docs/architecture.md) | System design and data flow |
+| [API Reference](docs/api-reference.md) | All API endpoints documented |
+| [Database Schema](docs/database-schema.md) | Database tables and relationships |
+| [Developer Guide](docs/developer-guide.md) | Development setup and contribution guide |
+
+---
+
 ## Screenshots
 
 <div align="center">
   <table>
     <tr>
-      <td colspan="3" align="center"><strong>🔐 Login Screen</strong></td>
+      <td colspan="3" align="center"><strong>Login Screen</strong></td>
     </tr>
     <tr>
       <td colspan="3" align="center"><img src="public/screenshot-login.png" alt="Login Screen" width="400"></td>
@@ -21,7 +36,7 @@ A full-stack web application for managing employee attendance, weekly payroll co
 <br>
 
 <div align="center">
-  <h3>☀️ Light Mode</h3>
+  <h3>Light Mode</h3>
   <table>
     <tr>
       <td><strong>Dashboard</strong></td>
@@ -59,7 +74,7 @@ A full-stack web application for managing employee attendance, weekly payroll co
 <br>
 
 <div align="center">
-  <h3>🌙 Dark Mode</h3>
+  <h3>Dark Mode</h3>
   <table>
     <tr>
       <td><strong>Dashboard</strong></td>
@@ -78,8 +93,8 @@ A full-stack web application for managing employee attendance, weekly payroll co
     </tr>
     <tr>
       <td><strong>Employees</strong></td>
-      <td><strong></strong></td>
-      <td><strong></strong></td>
+      <td></td>
+      <td></td>
     </tr>
     <tr>
       <td><img src="public/screenshot-employees-dark.png" alt="Employees Dark" width="280"></td>
@@ -90,58 +105,58 @@ A full-stack web application for managing employee attendance, weekly payroll co
 
 ## Tech Stack
 
-**Backend:** Node.js + Express 5  
-**Database:** PostgreSQL 14+  
-**Frontend:** Vanilla JavaScript (SPA)  
-**Auth:** Session-based with bcryptjs  
+**Backend:** Node.js + Express 5
+**Database:** PostgreSQL 14+
+**Frontend:** Vanilla JavaScript (SPA)
+**Auth:** Session-based with bcryptjs
 **PDF:** html2canvas + jsPDF (client-side)
 
 ## Features
 
-### 👥 Employee Management
+### Employee Management
 - Add, edit, archive, restore, and permanently delete employees
 - Upload employee photos with lightbox preview
 - Assign daily rates and track employee status
 - Search/filter with pagination
 
-### 📋 Attendance Tracking
+### Attendance Tracking
 - Daily attendance logging per employee
-- Week-based navigation (Monday–Sunday)
+- Week-based navigation (Monday-Sunday)
 - Bulk attendance marking
 - Time-in/time-out tracking
 
-### 💰 Payroll Computation
+### Payroll Computation
 - Weekly Monday-to-Sunday payroll cycles
-- Automatic gross salary computation (daily rate × days worked)
+- Automatic gross salary computation (daily rate x days worked)
 - Carryover of unpaid balances and cash advance balances from prior weeks
 - CSV export of payroll data
 
-### 🏦 Cash Advances (Bale)
+### Cash Advances (Bale)
 - Track cash advances given to employees
 - Automatic carryover of bale balances week-to-week
 - Bale payment recording with balance validation
 
-### 💵 Salary & Extra Payments
+### Salary & Extra Payments
 - Record salary payments with balance validation
 - Payment logs per employee per week
 - Extra one-off payments (bonuses, adjustments)
 - One-extra-payment-per-employee-per-day limit
 
-### 📄 Payslip Generation
+### Payslip Generation
 - Detailed printable payslips with day-by-day attendance
 - Earnings, deductions, and net pay breakdown
 - PDF download
 
-### 🔐 Role-Based Access
-- **Admin** — full CRUD, delete records, audit trail access
-- **HR** — create, read, update (no delete)
+### Role-Based Access
+- **Admin** -- full CRUD, delete records, audit trail access
+- **HR** -- create, read, update (no delete)
 
-### 📊 Dashboard
+### Dashboard
 - Summary cards: active employees, present today, weekly salary, payments
 - Outstanding and bale balance overview
 - Quick-action navigation cards
 
-### 🛡️ Security
+### Security
 - Helmet middleware for HTTP headers
 - HTTP-only session cookies
 - bcrypt password hashing
@@ -149,14 +164,14 @@ A full-stack web application for managing employee attendance, weekly payroll co
 - 8-hour session expiry with live countdown timer
 - Environment variable configuration
 
-### 🎨 UI/UX
+### UI/UX
 - Dark mode toggle (persisted in localStorage)
-- Keyboard shortcuts (`1`–`5` for views, arrow keys for week nav, `Escape` to close modals)
+- Keyboard shortcuts (1-5 for views, arrow keys for week nav, Escape to close modals)
 - Toast notifications for success/error feedback
 - Loading spinner overlays during data fetches
 - Search highlighting
 
-### 📁 Audit Trail
+### Audit Trail
 - Admin-only comprehensive action log
 - Tracks create, update, delete, archive, restore, permanent delete
 - Filtering and CSV export
@@ -197,5 +212,5 @@ A full-stack web application for managing employee attendance, weekly payroll co
 
 User accounts are stored in the PostgreSQL `users` table. The login form does not prefill credentials.
 
-- **Admin** — full access (create, read, update, delete, audit trail)
-- **HR** — limited access (create, read, update only)
+- **Admin** -- full access (create, read, update, delete, audit trail)
+- **HR** -- limited access (create, read, update only)

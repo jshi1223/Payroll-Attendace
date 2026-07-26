@@ -58,7 +58,12 @@ function bindConfirmDeleteModal() {
   if (!modal) return;
 
   const close = () => {
+    const modalEmployeeId = state.pendingDelete?._modalEmployeeId;
     state.pendingDelete = null;
+    if (modalEmployeeId) {
+      const freshRow = (state.payroll?.rows || []).find(r => Number(r.employee_id) === Number(modalEmployeeId));
+      if (freshRow) state.payrollModalEmployee = freshRow;
+    }
     reRenderCurrentView();
   };
 
@@ -102,20 +107,28 @@ function bindConfirmDeleteModal() {
       } else {
         showToast(`${resourceName.charAt(0).toUpperCase() + resourceName.slice(1)} deleted.`);
       }
+      const modalEmployeeId = state.pendingDelete._modalEmployeeId;
       state.pendingDelete = null;
-      reRenderCurrentView();
 
-      /* Background refresh */
+      /* Refresh after delete */
       if (isPermanent || resource === 'employees') {
-        partialRefresh(['employees']).catch(() => {});
+        await partialRefresh(['employees']);
+        reRenderCurrentView();
       } else {
         const partialMap = {
+          'attendance': ['attendance', 'payroll'],
           'salary-payments': ['payroll', 'salaryPayments'],
           'bale-payments': ['payroll', 'balePayments'],
           'cash-advances': ['payroll', 'advances'],
           'extra-payments': ['payroll', 'extraPayments']
         };
-        partialRefresh(partialMap[resource] || ['payroll', 'salaryPayments', 'balePayments', 'advances', 'extraPayments']).catch(() => {});
+        await partialRefresh(partialMap[resource] || ['payroll', 'salaryPayments', 'balePayments', 'advances', 'extraPayments']);
+        /* Restore payroll modal if we came from one */
+        if (modalEmployeeId) {
+          const freshRow = (state.payroll?.rows || []).find(r => Number(r.employee_id) === Number(modalEmployeeId));
+          if (freshRow) state.payrollModalEmployee = freshRow;
+        }
+        reRenderCurrentView();
       }
     } catch (error) {
       showToast(error.message, 'error');
@@ -164,511 +177,240 @@ function bindLogoutConfirmModal() {
     await api('/api/logout', { method: 'POST' });
     state.user = null;
     state.showLogoutConfirm = false;
-    stopDataPoller();
     stopSessionTimer();
     renderLogin();
   });
 }
 
-/* ── Payment Modal ── */
-function paymentModal(employee) {
-  const logs = state.salaryPayments.rows.filter(row => Number(row.employee_id) === Number(employee.employee_id));
-  const legacyAmount = moneyValue(employee.legacy_paid_amount);
-  const editing = state.editingSalaryPayment && Number(state.editingSalaryPayment.employee_id) === Number(employee.employee_id)
-    ? state.editingSalaryPayment
-    : null;
+/* ── Manage Payroll ── */
+function payrollTransactionTypes(emp) {
+  return [
+    { key: 'pay', label: 'Bayad Sahod', endpoint: '/api/salary-payments', dateField: 'payment_date', maxAmt: emp.balance },
+    { key: 'ca', label: 'Bale', endpoint: '/api/cash-advances', dateField: 'advance_date', maxAmt: null },
+    { key: 'bale', label: 'Bayad Bale', endpoint: '/api/bale-payments', dateField: 'payment_date', maxAmt: emp.remaining_bale_balance },
+    { key: 'extra', label: 'Dagdag Sahod', endpoint: '/api/extra-payments', dateField: 'extra_date', maxAmt: null }
+  ];
+}
+
+function payrollEntryModal(employee) {
+  const emp = employee;
+  const pd = emp.pay_period_days || state.payPeriodDays || 7;
+
+  const salaryLogs = state.salaryPayments.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id));
+  const caLogs = state.advances.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id));
+  const baleLogs = state.balePayments.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id));
+  const extraLogs = state.extraPayments.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id));
+
+  const allLogs = [
+    ...salaryLogs.map(l => ({ ...l, type: 'Bayad Sahod', date: l.payment_date })),
+    ...caLogs.map(l => ({ ...l, type: 'Bale', date: l.advance_date })),
+    ...baleLogs.map(l => ({ ...l, type: 'Bayad Bale', date: l.payment_date })),
+    ...extraLogs.map(l => ({ ...l, type: 'Dagdag Sahod', date: l.extra_date })),
+  ].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+  const transactionTypes = payrollTransactionTypes(emp);
+  const today = todayInManila();
+  const defaultTransactionDate = today >= state.week && today <= addDays(state.week, pd - 1) ? today : state.week;
+  const transactionModal = state.payrollTransactionModal ? `
+    <div class="modal-backdrop pe-transaction-backdrop" id="payrollTransactionModal">
+      <section class="modal pe-transaction-modal" role="dialog" aria-modal="true" aria-labelledby="peTransactionTitle">
+        <div class="modal-head"><h2 id="peTransactionTitle">Magdagdag ng Transaction</h2><button class="icon-btn" id="closePayrollTransactionModal" aria-label="Close">x</button></div>
+        <form id="peTransForm" class="pe-transaction-form" novalidate>
+          <input type="hidden" name="employee_id" value="${emp.employee_id}">
+          <label>Uri<select name="type" id="peTransactionType">${transactionTypes.map(t => `<option value="${t.key}">${t.key === 'ca' ? 'Cash Advance (Bale/Utang)' : t.label}</option>`).join('')}</select></label>
+          <label>Halaga<input name="amount" type="number" min="0.01" step="0.01" required placeholder="0.00"></label>
+          <label>Petsa<input name="transaction_date" type="date" value="${defaultTransactionDate}" min="${state.week}" max="${addDays(state.week, pd - 1)}" required></label>
+          <label>Puna<input name="notes" placeholder="Optional na remarks"></label>
+          <div class="pe-transaction-limits" id="peTransactionLimits"></div>
+          <div class="error error-box" id="peTransError"></div>
+          <div class="modal-actions"><button class="ghost" type="button" id="cancelPayrollTransaction">Kanselahin</button><button class="primary" type="submit" id="peTransSubmit">I-save</button></div>
+        </form>
+      </section>
+    </div>` : '';
+
   return `
-    <div class="modal-backdrop" id="paymentModal">
-      <section class="modal">
+    <div class="modal-backdrop" id="payrollEntryModal">
+      <section class="modal wide-modal payroll-entry-modal">
         <div class="modal-head">
           <div>
-            <h2>Salary Payment</h2>
-            <p>${escapeHtml(employee.emp_number)} - ${escapeHtml(employee.name)} | ${state.week} to ${addDays(state.week, 6)}</p>
+            <h2>Pamahalaan ang Sahod</h2>
+            <p><strong>${escapeHtml(emp.name)}</strong> · ${formatShortDate(state.week)} — ${formatShortDate(addDays(state.week, pd - 1))}</p>
           </div>
-          <button class="icon-btn" id="closePaymentModal" aria-label="Close">x</button>
+          <button class="icon-btn" id="closePayrollEntryModal" aria-label="Close">x</button>
         </div>
-        <div class="payment-summary">
-          <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
-          <div><span>Extra Payment</span><strong>${formatMoney(employee.extra_payment_amount || 0)}</strong></div>
-          <div><span>Prev Unpaid (Salary)</span><strong>${formatMoney(employee.previous_unpaid_balance)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance Due</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Salary + Extras - Payment</span></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
-          <div><span>Total Paid (Salary)</span><strong>${formatMoney(employee.paid_amount)}</strong></div>
-          <div><span>C/A This Week</span><strong>${formatMoney(employee.cash_advance)}</strong></div>
-          <div><span>Prev Bale Balance</span><strong>${formatMoney(employee.previous_bale_balance)}</strong></div>
-          <div><span>Total Bale</span><strong>${formatMoney(employee.total_bale)}</strong></div>
+        <div class="pe-overview-grid">
+          <div><span>Araw ng Pasok</span><strong>${emp.days}</strong></div><div><span>Arawan</span><strong>${formatMoney(emp.rate)}</strong></div><div><span>Kabuuang Sahod</span><strong>${formatMoney(emp.salary)}</strong></div><div><span>Dagdag Sahod</span><strong>${formatMoney(emp.extra_payment_amount || 0)}</strong></div>
+          <div><span>Natitira (Dati)</span><strong>${formatMoney(emp.previous_unpaid_balance)}</strong></div><div><span>Utang (Dati)</span><strong>${formatMoney(emp.previous_bale_balance)}</strong></div><div><span>NATITIRA</span><strong class="balance-amount">${formatMoney(emp.balance)}</strong></div><div><span>BALENSA</span><strong>${formatMoney(emp.remaining_bale_balance)}</strong></div>
         </div>
-        <form class="form-grid" id="paymentForm">
-          <input type="hidden" name="id" value="${editing?.id || ''}">
-          <input type="hidden" name="employee_id" value="${employee.employee_id}">
-          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" max="${moneyValue(employee.balance) + (editing ? moneyValue(editing.amount) : 0)}" value="${editing?.amount || ''}" required placeholder="Enter payment amount"><span class="field-hint">Max: ${formatMoney(employee.balance)}</span></label>
-          <label>Date<input name="payment_date" type="date" value="${editing?.payment_date || todayInManila()}" required></label>
-          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Any remarks or notes"></label>
-          <div class="error error-box" id="paymentFormError"></div>
-          <div class="modal-actions">
-            ${editing ? '<button class="ghost" type="button" id="clearPaymentEdit">New Payment</button>' : ''}
-            <button class="ghost" type="button" id="cancelPaymentModal">Cancel</button>
-            <button class="primary" type="submit">${editing ? 'Update Payment' : 'Save Payment'}</button>
-          </div>
-        </form>
-        <div class="log-list">
-          <h3>Weekly Payment Logs</h3>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Date</th><th>Amount</th><th>Notes</th><th>Action</th></tr></thead>
-              <tbody>
-                ${legacyAmount > 0 ? `
-                  <tr style="background:#f0fdf4;">
-                    <td>${employee.paid_at ? new Date(employee.paid_at).toLocaleDateString() : '<em>Previous</em>'}</td>
-                    <td><strong>${peso.format(legacyAmount)}</strong></td>
-                    <td><span class="muted">Bulk payment</span></td>
-                    <td class="actions">
-                      ${state.user.role === 'admin' ? `<button class="danger" data-delete-legacy-payment="${employee.employee_id}">Delete</button>` : `<span class="badge paid" style="font-size:10px;">Recorded</span>`}
-                    </td>
-                  </tr>
-                ` : ''}
-                ${logs.map(log => `
-                  <tr>
-                    <td>${log.payment_date}</td>
-                    <td>${peso.format(log.amount)}</td>
-                    <td>${escapeHtml(log.notes || '-')}</td>
-                    <td class="actions">
-                      <button class="ghost" data-edit-payment="${log.id}">Edit</button>
-                      <button class="danger" data-delete-payment="${log.id}">Delete</button>
-                    </td>
-                  </tr>
-                `).join('') || (legacyAmount === 0 ? `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Salary Payments</strong><span>No payments recorded this week. Use the form above to record one.</span></td></tr>` : '')}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <button class="primary pe-add-transaction-btn" id="openPayrollTransactionModal">+ Magdagdag</button>
+        <div class="pe-history"><div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Notes</th><th>Actions</th></tr></thead><tbody>${allLogs.map(log => {
+          const resType = log.type === 'Bayad Sahod' ? 'salary-payments' : log.type === 'Bale' ? 'cash-advances' : log.type === 'Bayad Bale' ? 'bale-payments' : 'extra-payments';
+          return `<tr><td>${log.date}</td><td>${log.type === 'Bale' ? 'Cash Advance (Bale/Utang)' : log.type}</td><td><strong>${formatMoney(log.amount)}</strong></td><td>${escapeHtml(log.notes || '-')}</td><td class="actions"><button class="danger pe-delete-log" data-res="${resType}" data-id="${log.id}">Burahin</button></td></tr>`;
+        }).join('') || '<tr><td colspan="5" class="empty-state"><em>Wala pang transactions</em></td></tr>'}</tbody></table></div></div>
+        <div class="pe-totals"><div><span>Kabuuang Kita</span><strong>${formatMoney(Number(emp.salary || 0) + Number(emp.extra_payment_amount || 0))}</strong></div><div><span>Kabuuang Natanggap</span><strong>${formatMoney(emp.paid_amount)}</strong></div><div><span>Kabuuang Bayad Bale</span><strong>${formatMoney((emp.total_bale || 0) - (emp.remaining_bale_balance || 0))}</strong></div><div class="pe-net-balance"><span>Natitira Pang Balance</span><strong>${formatMoney(emp.balance)}</strong></div></div>
+        <div class="pe-footer"><button class="ghost" type="button" id="cancelPayrollEntry">Kanselahin</button><div><button class="ghost" type="button" id="pePreviewPayslip">Tingnan Payslip</button><button class="primary" type="button" id="peGeneratePayslip">Gumawa ng Payslip</button></div></div>
       </section>
+      ${transactionModal}
     </div>
   `;
 }
 
-function bindPaymentModal() {
-  const modal = document.querySelector('#paymentModal');
+function bindPayrollEntryModal() {
+  const modal = document.querySelector('#payrollEntryModal');
   if (!modal) return;
+  const emp = state.payrollModalEmployee;
+  if (!emp) return;
+  const pd = emp.pay_period_days || state.payPeriodDays || 7;
+  const transactionTypes = payrollTransactionTypes(emp);
 
   const close = () => {
-    state.paymentEmployee = null;
-    state.editingSalaryPayment = null;
+    state.payrollModalEmployee = null;
+    state.payrollTransactionModal = false;
     renderPayroll();
   };
 
-  setupModalKeyboard('#paymentModal', close);
-  document.querySelector('#closePaymentModal').addEventListener('click', close);
-  document.querySelector('#cancelPaymentModal').addEventListener('click', close);
-  document.querySelector('#clearPaymentEdit')?.addEventListener('click', () => {
-    state.editingSalaryPayment = null;
-    renderPayroll();
-  });
-  modal.addEventListener('click', event => {
-    if (event.target === modal) close();
-  });
-  document.querySelectorAll('[data-edit-payment]').forEach(button => {
-    button.addEventListener('click', () => {
-      state.editingSalaryPayment = state.salaryPayments.rows.find(row => String(row.id) === button.dataset.editPayment);
-      renderPayroll();
-    });
-  });
-  document.querySelectorAll('[data-delete-payment]').forEach(button => {
-    button.addEventListener('click', () => {
-      state.pendingDelete = {
-        resource: 'salary-payments',
-        id: button.dataset.deletePayment
-      };
-      reRenderCurrentView();
-    });
-  });
-  document.querySelector('[data-delete-legacy-payment]')?.addEventListener('click', async () => {
-    const empId = Number(document.querySelector('[data-delete-legacy-payment]').dataset.deleteLegacyPayment);
-    state.pendingDelete = {
-      resource: 'legacy-payment',
-      id: empId
+  setupModalKeyboard('#payrollEntryModal', close);
+  document.querySelector('#closePayrollEntryModal').addEventListener('click', close);
+  modal.addEventListener('click', event => { if (event.target === modal) close(); });
+
+  document.querySelector('#cancelPayrollEntry')?.addEventListener('click', close);
+  document.querySelector('#openPayrollTransactionModal')?.addEventListener('click', () => { state.payrollTransactionModal = true; renderPayroll(); });
+  const closeTransaction = () => { state.payrollTransactionModal = false; renderPayroll(); };
+  document.querySelector('#closePayrollTransactionModal')?.addEventListener('click', closeTransaction);
+  document.querySelector('#cancelPayrollTransaction')?.addEventListener('click', closeTransaction);
+  document.querySelector('#payrollTransactionModal')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeTransaction(); });
+
+  const setTransactionLimit = () => {
+    const option = transactionTypes.find(t => t.key === document.querySelector('#peTransactionType')?.value);
+    const max = option?.maxAmt;
+    const amount = document.querySelector('#peTransForm [name="amount"]');
+    const pendingAmount = Math.max(0, Number(amount?.value) || 0);
+    if (amount) amount.max = max || '';
+    const limits = document.querySelector('#peTransactionLimits');
+    const summaries = {
+      pay: [
+        ['Natitira', formatMoney(Math.max(0, Number(emp.balance || 0) - pendingAmount))]
+      ],
+      ca: [
+        ['BALENSA Ngayon', formatMoney(emp.remaining_bale_balance)],
+        ['Bagong BALENSA (Preview)', formatMoney(Number(emp.remaining_bale_balance || 0) + pendingAmount)]
+      ],
+      bale: [
+        ['Natitira sa Sahod', formatMoney(Math.max(0, Number(emp.balance || 0) - pendingAmount))],
+        ['BALENSA (utang)', formatMoney(Math.max(0, Number(emp.remaining_bale_balance || 0) - pendingAmount))]
+      ],
+      extra: [
+        ['Dagdag Sahod Ngayon', formatMoney(Number(emp.extra_payment_amount || 0))],
+        ['Bagong Dagdag Sahod', formatMoney(Number(emp.extra_payment_amount || 0) + pendingAmount)]
+      ]
     };
-    reRenderCurrentView();
-  });
-  document.querySelector('#paymentForm').addEventListener('submit', async event => {
-    event.preventDefault();
-    const errorBox = document.querySelector('#paymentFormError');
-    const payload = Object.fromEntries(new FormData(event.currentTarget));
-    const id = payload.id;
-    delete payload.id;
-    errorBox.textContent = '';
-    try {
-      await api(id ? `/api/salary-payments/${id}` : '/api/salary-payments', {
-        method: id ? 'PUT' : 'POST',
-        body: JSON.stringify({
-          ...payload,
-          employee_id: Number(state.paymentEmployee.employee_id)
-        })
-      });
-      state.editingSalaryPayment = null;
-      state._flash = { id: Number(state.paymentEmployee.employee_id), type: 'payroll' };
-      showToast(id ? 'Payment updated.' : 'Payment saved.');
-      state.paymentEmployee = null;
-      reRenderCurrentView();
-      partialRefresh(['payroll', 'salaryPayments']).catch(() => {});
-    } catch (error) {
-      errorBox.textContent = error.message;
+    if (limits) {
+      limits.innerHTML = (summaries[option?.key] || []).map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
     }
-  });
-}
-
-/* ── Bale Payment Modal ── */
-function baleDeductionModal(employee) {
-  const logs = state.balePayments.rows.filter(row => Number(row.employee_id) === Number(employee.employee_id));
-  const editing = state.editingBalePayment && Number(state.editingBalePayment.employee_id) === Number(employee.employee_id)
-    ? state.editingBalePayment
-    : null;
-  return `
-    <div class="modal-backdrop" id="baleDeductionModal">
-      <section class="modal">
-        <div class="modal-head">
-          <div>
-            <h2>Bale Payment</h2>
-            <p>${escapeHtml(employee.emp_number)} - ${escapeHtml(employee.name)} | ${state.week} to ${addDays(state.week, 6)}</p>
-          </div>
-          <button class="icon-btn" id="closeBaleDeductionModal" aria-label="Close">x</button>
-        </div>
-        <div class="payment-summary">
-          <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
-          <div><span>Extra Payment</span><strong>${formatMoney(employee.extra_payment_amount || 0)}</strong></div>
-          <div><span>Prev Unpaid (Salary)</span><strong>${formatMoney(employee.previous_unpaid_balance)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Unpaid salary this week</span></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
-          <div><span>Total Bale</span><strong>${formatMoney(employee.total_bale)}</strong></div>
-          <div><span>C/A This Week</span><strong>${formatMoney(employee.cash_advance)}</strong></div>
-          <div><span>Prev Bale Balance</span><strong>${formatMoney(employee.previous_bale_balance)}</strong></div>
-        </div>
-        <form class="form-grid" id="baleDeductionForm">
-          <input type="hidden" name="id" value="${editing?.id || ''}">
-          <input type="hidden" name="employee_id" value="${employee.employee_id}">
-          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" max="${moneyValue(employee.remaining_bale_balance) + (editing ? moneyValue(editing.amount) : 0)}" value="${editing?.amount || ''}" required placeholder="Enter payment amount"><span class="field-hint">Max: ${formatMoney(employee.remaining_bale_balance)}</span></label>
-          <label>Date<input name="payment_date" type="date" value="${editing?.payment_date || todayInManila()}" required></label>
-          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Any remarks or notes"></label>
-          <div class="error error-box" id="baleDeductionFormError"></div>
-          <div class="modal-actions">
-            ${editing ? '<button class="ghost" type="button" id="clearBaleEdit">New Bale</button>' : ''}
-            <button class="ghost" type="button" id="cancelBaleDeductionModal">Cancel</button>
-            <button class="primary" type="submit">${editing ? 'Update Bale Payment' : 'Save Bale Payment'}</button>
-          </div>
-        </form>
-        <div class="log-list">
-          <h3>Weekly Bale Payment Logs</h3>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Date</th><th>Amount</th><th>Notes</th><th>Action</th></tr></thead>
-              <tbody>
-                ${logs.map(log => `
-                  <tr>
-                    <td>${log.payment_date}</td>
-                    <td>${peso.format(log.amount)}</td>
-                    <td>${escapeHtml(log.notes || '-')}</td>
-                    <td class="actions">
-                      <button class="ghost" data-edit-bale="${log.id}">Edit</button>
-                      <button class="danger" data-bale-delete="${log.id}">Delete</button>
-                    </td>
-                  </tr>
-                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Bale Payments</strong><span>No bale payments recorded this week. Use the form above to record one.</span></td></tr>`}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-function bindBaleDeductionModal() {
-  const modal = document.querySelector('#baleDeductionModal');
-  if (!modal) return;
-
-  const close = () => {
-    state.baleDeductionEmployee = null;
-    state.editingBalePayment = null;
-    renderPayroll();
   };
+  document.querySelector('#peTransactionType')?.addEventListener('change', setTransactionLimit);
+  document.querySelector('#peTransForm [name="amount"]')?.addEventListener('input', setTransactionLimit);
+  setTransactionLimit();
 
-  setupModalKeyboard('#baleDeductionModal', close);
-  document.querySelector('#closeBaleDeductionModal').addEventListener('click', close);
-  document.querySelector('#cancelBaleDeductionModal').addEventListener('click', close);
-  document.querySelector('#clearBaleEdit')?.addEventListener('click', () => {
-    state.editingBalePayment = null;
-    renderPayroll();
-  });
-  modal.addEventListener('click', event => {
-    if (event.target === modal) close();
-  });
-  document.querySelectorAll('[data-edit-bale]').forEach(button => {
-    button.addEventListener('click', () => {
-      state.editingBalePayment = state.balePayments.rows.find(row => String(row.id) === button.dataset.editBale);
-      renderPayroll();
-    });
-  });
-  document.querySelector('#baleDeductionForm').addEventListener('submit', async event => {
+  /* Form submit (step 2) */
+  document.querySelector('#peTransForm')?.addEventListener('submit', async event => {
     event.preventDefault();
-    const errorBox = document.querySelector('#baleDeductionFormError');
-    const payload = Object.fromEntries(new FormData(event.currentTarget));
-    const id = payload.id;
-    delete payload.id;
+    const errorBox = document.querySelector('#peTransError');
+    const form = event.currentTarget;
+    const payload = Object.fromEntries(new FormData(form));
+    const transaction = transactionTypes.find(t => t.key === payload.type) || transactionTypes[0];
+    const endpoint = transaction.endpoint;
+    const amount = Number(payload.amount);
+    const maximum = transaction.maxAmt == null ? null : Number(transaction.maxAmt);
     errorBox.textContent = '';
+    if (!Number.isFinite(amount) || amount <= 0) {
+      errorBox.textContent = 'Please enter an amount greater than ₱0.00.';
+      return;
+    }
+    if (maximum != null && amount > maximum) {
+      errorBox.textContent = `${transaction.label} cannot exceed ${formatMoney(maximum)}.`;
+      return;
+    }
+    const transactionDate = payload.transaction_date;
+    delete payload.type;
+    delete payload.transaction_date;
+    payload.employee_id = Number(payload.employee_id);
+    payload[transaction.dateField] = transactionDate;
+    const submitBtn = document.querySelector('#peTransSubmit');
+    submitBtn.disabled = true;
     try {
-      await api(id ? `/api/bale-payments/${id}` : '/api/bale-payments', {
-        method: id ? 'PUT' : 'POST',
-        body: JSON.stringify({
-          ...payload,
-          employee_id: Number(state.baleDeductionEmployee.employee_id)
-        })
+      await api(endpoint, {
+        method: 'POST',
+        body: JSON.stringify(payload)
       });
-      state.editingBalePayment = null;
-      state._flash = { id: Number(state.baleDeductionEmployee.employee_id), type: 'payroll' };
-      showToast(id ? 'Bale payment updated.' : 'Bale payment saved.');
-      state.baleDeductionEmployee = null;
-      reRenderCurrentView();
-      partialRefresh(['payroll', 'balePayments']).catch(() => {});
+      state._flash = { id: payload.employee_id, type: 'payroll' };
+      showToast(`${transaction.label} saved.`);
+      await partialRefresh(['payroll', 'salaryPayments', 'advances', 'balePayments', 'extraPayments']);
+      // Re-find the employee from fresh data
+      const freshRow = state.payroll.rows.find(r => Number(r.employee_id) === Number(payload.employee_id));
+      if (freshRow) state.payrollModalEmployee = freshRow;
+      state.payrollTransactionModal = false;
+      renderPayroll();
     } catch (error) {
       errorBox.textContent = error.message;
     }
+    submitBtn.disabled = false;
   });
-  document.querySelectorAll('[data-bale-delete]').forEach(button => {
-    button.addEventListener('click', () => {
+
+  /* Delete logs (step 3) */
+  document.querySelectorAll('.pe-delete-log').forEach(btn => {
+    btn.addEventListener('click', () => {
       state.pendingDelete = {
-        resource: 'bale-payments',
-        id: button.dataset.baleDelete
+        resource: btn.dataset.res,
+        id: btn.dataset.id,
+        _modalEmployeeId: state.payrollModalEmployee?.employee_id
       };
+      state.payrollModalEmployee = null;
       reRenderCurrentView();
     });
   });
-}
 
-/* ── Cash Advance Modal ── */
-function cashAdvanceModal(employee) {
-  const logs = state.advances.rows.filter(row => Number(row.employee_id) === Number(employee.employee_id));
-  const editing = state.editingCashAdvance && Number(state.editingCashAdvance.employee_id) === Number(employee.employee_id)
-    ? state.editingCashAdvance
-    : null;
-  return `
-    <div class="modal-backdrop" id="cashModal">
-      <section class="modal">
-        <div class="modal-head">
-          <div>
-            <h2>${editing ? 'Edit C/A' : 'Add C/A'}</h2>
-            <p>${escapeHtml(employee.emp_number)} - ${escapeHtml(employee.name)} | ${state.week} to ${addDays(state.week, 6)}</p>
-          </div>
-          <button class="icon-btn" id="closeCashModal" aria-label="Close">x</button>
-        </div>
-        <div class="payment-summary">
-          <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
-          <div><span>Extra Payment</span><strong>${formatMoney(employee.extra_payment_amount || 0)}</strong></div>
-          <div><span>Prev Unpaid (Salary)</span><strong>${formatMoney(employee.previous_unpaid_balance)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong><span class="card-sub">Salary + Extras - C/A - Payment</span></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong><span class="card-sub">Total Bale - Bale Payments</span></div>
-          <div><span>Total Bale</span><strong>${formatMoney(employee.total_bale)}</strong></div>
-          <div><span>C/A This Week</span><strong>${formatMoney(employee.cash_advance)}</strong></div>
-          <div><span>Previous Bale</span><strong>${formatMoney(employee.previous_bale_balance)}</strong></div>
-        </div>
-        <form class="form-grid" id="cashPayrollForm">
-          <input type="hidden" name="id" value="${editing?.id || ''}">
-          <input type="hidden" name="employee_id" value="${employee.employee_id}">
-          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" value="${editing?.amount || ''}" required></label>
-          <label>Date<input name="advance_date" type="date" value="${editing?.advance_date || todayInManila()}" required></label>
-          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Reason or remarks"></label>
-          <div class="error error-box" id="cashFormError"></div>
-          <div class="modal-actions">
-            ${editing ? '<button class="ghost" type="button" id="clearCashEdit">New C/A</button>' : ''}
-            <button class="ghost" type="button" id="cancelCashModal">Cancel</button>
-            <button class="primary" type="submit">${editing ? 'Update C/A' : 'Add C/A'}</button>
-          </div>
-        </form>
-        <div class="log-list">
-          <h3>Weekly C/A Logs</h3>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Date</th><th>Amount</th><th>Notes</th><th>Action</th></tr></thead>
-              <tbody>
-                ${logs.map(log => `
-                  <tr>
-                    <td>${log.advance_date}</td>
-                    <td>${peso.format(log.amount)}</td>
-                    <td>${escapeHtml(log.notes || '-')}</td>
-                    <td class="actions">
-                      <button class="ghost" data-edit-cash="${log.id}">Edit</button>
-                      ${deleteButton('cash-advances', log.id)}
-                    </td>
-                  </tr>
-                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Cash Advances</strong><span>No C/A records this week. Use the form above to add one.</span></td></tr>`}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-function bindCashAdvanceModal() {
-  const modal = document.querySelector('#cashModal');
-  if (!modal) return;
-
-  const close = () => {
-    state.cashEmployee = null;
-    state.editingCashAdvance = null;
-    renderPayroll();
+  /* Generate payslip (step 4) — locks the payroll */
+  const generatePayslip = async () => {
+    const selectedEmployee = state.payrollModalEmployee;
+    const row = state.payroll?.rows?.find(r => Number(r.employee_id) === Number(selectedEmployee?.employee_id)) || selectedEmployee;
+    if (row?.employee_id) {
+      try {
+        await api(`/api/payroll/${row.employee_id}/generate`, {
+          method: 'POST',
+          body: JSON.stringify({ weekStart: state.week })
+        });
+        await partialRefresh(['payroll', 'attendance', 'salaryPayments', 'advances', 'balePayments', 'extraPayments']);
+        const generatedRow = state.payroll.rows.find(item => Number(item.employee_id) === Number(row.employee_id)) || row;
+        state.payrollModalEmployee = null;
+        state.payrollTransactionModal = false;
+        showToast('Payslip generated and payroll locked.');
+        renderPayslip(generatedRow);
+      } catch (error) {
+        state.payrollModalEmployee = selectedEmployee;
+        renderPayroll();
+        showToast(`Could not generate payslip: ${error.message}`, 'error');
+      }
+    } else {
+      showToast('No payroll data available for this employee.', 'error');
+    }
   };
 
-  setupModalKeyboard('#cashModal', close);
-  document.querySelector('#closeCashModal').addEventListener('click', close);
-  document.querySelector('#cancelCashModal').addEventListener('click', close);
-  document.querySelector('#clearCashEdit')?.addEventListener('click', () => {
-    state.editingCashAdvance = null;
-    renderPayroll();
-  });
-  modal.addEventListener('click', event => {
-    if (event.target === modal) close();
-  });
-  document.querySelectorAll('[data-edit-cash]').forEach(button => {
-    button.addEventListener('click', () => {
-      state.editingCashAdvance = state.advances.rows.find(row => String(row.id) === button.dataset.editCash);
-      renderPayroll();
-    });
-  });
-  document.querySelector('#cashPayrollForm').addEventListener('submit', async event => {
-    event.preventDefault();
-    const errorBox = document.querySelector('#cashFormError');
-    const payload = Object.fromEntries(new FormData(event.currentTarget));
-    const id = payload.id;
-    delete payload.id;
-    errorBox.textContent = '';
-    try {
-      await api(id ? `/api/cash-advances/${id}` : '/api/cash-advances', {
-        method: id ? 'PUT' : 'POST',
-        body: JSON.stringify(payload)
-      });
-      state.editingCashAdvance = null;
-      state._flash = { id: Number(state.cashEmployee.employee_id), type: 'payroll' };
-      showToast(id ? 'C/A updated successfully.' : 'C/A added successfully.');
-      state.cashEmployee = null;
-      reRenderCurrentView();
-      partialRefresh(['payroll', 'advances']).catch(() => {});
-    } catch (error) {
-      errorBox.textContent = error.message;
+  /* Preview payslip — read-only, does NOT lock */
+  const previewPayslip = () => {
+    const row = state.payroll?.rows?.find(r => Number(r.employee_id) === Number(state.payrollModalEmployee?.employee_id)) || state.payrollModalEmployee;
+    if (row?.employee_id) {
+      state._previewEmployee = { ...state.payrollModalEmployee };
+      state.payrollModalEmployee = null;
+      state.payrollTransactionModal = false;
+      renderPayslip(row, { preview: true });
+    } else {
+      showToast('No payroll data available for this employee.', 'error');
     }
-  });
-}
-
-/* ── Extra Payment Modal ── */
-function extraPaymentModal(employee) {
-  const logs = state.extraPayments.rows.filter(row => Number(row.employee_id) === Number(employee.employee_id));
-  const editing = state.editingExtraPayment && Number(state.editingExtraPayment.employee_id) === Number(employee.employee_id)
-    ? state.editingExtraPayment
-    : null;
-  return `
-    <div class="modal-backdrop" id="extraPaymentModal">
-      <section class="modal">
-        <div class="modal-head">
-          <div>
-            <h2>${editing ? 'Edit Extra Payment' : 'Add Extra Payment'}</h2>
-            <p>${escapeHtml(employee.emp_number)} - ${escapeHtml(employee.name)} | ${state.week} to ${addDays(state.week, 6)}</p>
-          </div>
-          <button class="icon-btn" id="closeExtraPaymentModal" aria-label="Close">x</button>
-        </div>
-        <div class="payment-summary">
-          <div><span>Salary This Week</span><strong>${formatMoney(employee.salary)}</strong></div>
-          <div><span>Salary Payment</span><strong>${formatMoney(employee.salary_paid_amount)}</strong></div>
-          <div><span>Total Extra</span><strong>${formatMoney(employee.extra_payment_amount)}</strong></div>
-          <div class="balance-card balance-due-card"><span class="balance-label">Salary Balance</span><strong class="balance-amount">${formatMoney(employee.balance)}</strong></div>
-          <div class="balance-card bale-due-card"><span class="balance-label">Bale Balance</span><strong class="bale-amount">${formatMoney(employee.remaining_bale_balance)}</strong></div>
-        </div>
-        <form class="form-grid" id="extraPaymentForm">
-          <input type="hidden" name="id" value="${editing?.id || ''}">
-          <input type="hidden" name="employee_id" value="${employee.employee_id}">
-          <label>Amount<input name="amount" type="number" min="0.01" step="0.01" value="${editing?.amount || ''}" required></label>
-          <label>Date<input name="extra_date" type="date" value="${editing?.extra_date || todayInManila()}" required></label>
-          <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}" placeholder="Reason or remarks"></label>
-          <div class="error error-box" id="extraPaymentFormError"></div>
-          <div class="modal-actions">
-            ${editing ? '<button class="ghost" type="button" id="clearExtraEdit">New Extra</button>' : ''}
-            <button class="ghost" type="button" id="cancelExtraPaymentModal">Cancel</button>
-            <button class="primary" type="submit">${editing ? 'Update Extra' : 'Add Extra Payment'}</button>
-          </div>
-        </form>
-        <div class="log-list">
-          <h3>Weekly Extra Payment Logs</h3>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Date</th><th>Amount</th><th>Notes</th><th>Action</th></tr></thead>
-              <tbody>
-                ${logs.map(log => `
-                  <tr>
-                    <td>${log.extra_date}</td>
-                    <td>${peso.format(log.amount)}</td>
-                    <td>${escapeHtml(log.notes || '-')}</td>
-                    <td class="actions">
-                      <button class="ghost" data-edit-extra="${log.id}">Edit</button>
-                      ${deleteButton('extra-payments', log.id)}
-                    </td>
-                  </tr>
-                `).join('') || `<tr><td colspan="4" class="empty-state" style="padding:24px;"><span class="empty-icon">--</span><strong>No Extra Payments</strong><span>No extra payments recorded this week. Use the form above to add one.</span></td></tr>`}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-function bindExtraPaymentModal() {
-  const modal = document.querySelector('#extraPaymentModal');
-  if (!modal) return;
-
-  const close = () => {
-    state.extraPaymentEmployee = null;
-    state.editingExtraPayment = null;
-    renderPayroll();
   };
 
-  setupModalKeyboard('#extraPaymentModal', close);
-  document.querySelector('#closeExtraPaymentModal').addEventListener('click', close);
-  document.querySelector('#cancelExtraPaymentModal').addEventListener('click', close);
-  document.querySelector('#clearExtraEdit')?.addEventListener('click', () => {
-    state.editingExtraPayment = null;
-    renderPayroll();
-  });
-  document.querySelectorAll('[data-edit-extra]').forEach(button => {
-    button.addEventListener('click', () => {
-      state.editingExtraPayment = state.extraPayments.rows.find(row => String(row.id) === button.dataset.editExtra);
-      renderPayroll();
-    });
-  });
-  modal.addEventListener('click', event => {
-    if (event.target === modal) close();
-  });
-  document.querySelector('#extraPaymentForm').addEventListener('submit', async event => {
-    event.preventDefault();
-    const errorBox = document.querySelector('#extraPaymentFormError');
-    const payload = Object.fromEntries(new FormData(event.currentTarget));
-    const id = payload.id;
-    delete payload.id;
-    errorBox.textContent = '';
-    try {
-      await api(id ? `/api/extra-payments/${id}` : '/api/extra-payments', {
-        method: id ? 'PUT' : 'POST',
-        body: JSON.stringify(payload)
-      });
-      state.editingExtraPayment = null;
-      state._flash = { id: Number(state.extraPaymentEmployee.employee_id), type: 'payroll' };
-      showToast(id ? 'Extra payment updated.' : 'Extra payment added.');
-      state.extraPaymentEmployee = null;
-      reRenderCurrentView();
-      partialRefresh(['payroll', 'extraPayments']).catch(() => {});
-    } catch (error) {
-      errorBox.textContent = error.message;
-    }
-  });
+  document.querySelector('#pePreviewPayslip')?.addEventListener('click', previewPayslip);
+  document.querySelector('#peGeneratePayslip')?.addEventListener('click', generatePayslip);
 }
 
 /* ── Employee Modal ── */
@@ -704,9 +446,22 @@ function employeeModal(employee = {}) {
           <div class="section-title">Basic Information</div>
           ${isEdit ? `<label>Emp Number<div class="readonly-field">${employee.emp_number}</div></label>` : ''}
           <label>Full Name<input name="name" value="${escapeHtml(employee.name || '')}" placeholder="Enter full name" required></label>
-          <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="09171234567" pattern="[0-9]{11}" minlength="11" maxlength="11" inputmode="numeric" id="phoneInput" required><span class="field-hint">Must be exactly 11 digits. Numbers only.</span></label>
+          <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="09171234567" pattern="[0-9]{11}" minlength="11" maxlength="11" inputmode="numeric" id="phoneInput" required><span class="field-hint">Dapat 11 digits. Numero lang.</span></label>
+          <div class="section-title">Government IDs</div>
+          <label>SSS Number<input name="sss_number" type="text" value="${escapeHtml(employee.sss_number || '')}" placeholder="XX-XXXXXXX-X" maxlength="12" class="gov-id-input" data-format="sss" inputmode="numeric"><span class="field-hint">Format: 12-3456789-0 (10 digits)</span></label>
+          <label>PhilHealth Number<input name="philhealth_number" type="text" value="${escapeHtml(employee.philhealth_number || '')}" placeholder="XX-XXXXXXXXX-X" maxlength="14" class="gov-id-input" data-format="philhealth" inputmode="numeric"><span class="field-hint">Format: 12-345678901-2 (12 digits)</span></label>
+          <label>Pag-IBIG Number<input name="pagibig_number" type="text" value="${escapeHtml(employee.pagibig_number || '')}" placeholder="XXXX-XXXX-XXXX" maxlength="14" class="gov-id-input" data-format="pagibig" inputmode="numeric"><span class="field-hint">Format: 1234-5678-9012 (12 digits)</span></label>
+          <label>TIN Number<input name="tin_number" type="text" value="${escapeHtml(employee.tin_number || '')}" placeholder="XXX-XXX-XXX-XXX" maxlength="15" class="gov-id-input" data-format="tin" inputmode="numeric"><span class="field-hint">Format: 123-456-789-012 (12 digits)</span></label>
           <div class="section-title">Payroll Settings</div>
           <label>Daily Rate (₱)<input name="rate" type="number" min="0" step="0.01" value="${employee.rate || ''}" placeholder="0.00" required></label>
+          <label>Pay Period
+            <select name="pay_period_days">
+              <option value="7" ${(employee.pay_period_days || 7) === 7 ? 'selected' : ''}>Weekly (7 days)</option>
+              <option value="14" ${employee.pay_period_days === 14 ? 'selected' : ''}>Semi-monthly (14 days)</option>
+              <option value="21" ${employee.pay_period_days === 21 ? 'selected' : ''}>3 Weeks (21 days)</option>
+              <option value="30" ${employee.pay_period_days === 30 ? 'selected' : ''}>Monthly (30 days)</option>
+            </select>
+          </label>
           <label>Status<select name="active"><option value="true" ${employee.active !== false ? 'selected' : ''}>Active</option><option value="false" ${employee.active === false ? 'selected' : ''}>Inactive (Archive)</option></select></label>
           <div class="error error-box" id="employeeFormError"></div>
           <div class="modal-actions">
@@ -767,6 +522,38 @@ function bindEmployeeModal() {
     phoneInputEl.value = phoneInputEl.value.replace(/\D/g, '');
   });
 
+  /* Auto-format Government ID inputs */
+  document.querySelectorAll('.gov-id-input').forEach(input => {
+    input.addEventListener('input', function() {
+      const format = this.dataset.format;
+      let digits = this.value.replace(/\D/g, '');
+      let formatted = '';
+      if (format === 'sss') {
+        digits = digits.slice(0, 10);
+        formatted = digits.slice(0, 2);
+        if (digits.length > 2) formatted += '-' + digits.slice(2, 9);
+        if (digits.length > 9) formatted += '-' + digits.slice(9, 10);
+      } else if (format === 'philhealth') {
+        digits = digits.slice(0, 12);
+        formatted = digits.slice(0, 2);
+        if (digits.length > 2) formatted += '-' + digits.slice(2, 11);
+        if (digits.length > 11) formatted += '-' + digits.slice(11, 12);
+      } else if (format === 'pagibig') {
+        digits = digits.slice(0, 12);
+        formatted = digits.slice(0, 4);
+        if (digits.length > 4) formatted += '-' + digits.slice(4, 8);
+        if (digits.length > 8) formatted += '-' + digits.slice(8, 12);
+      } else if (format === 'tin') {
+        digits = digits.slice(0, 12);
+        formatted = digits.slice(0, 3);
+        if (digits.length > 3) formatted += '-' + digits.slice(3, 6);
+        if (digits.length > 6) formatted += '-' + digits.slice(6, 9);
+        if (digits.length > 9) formatted += '-' + digits.slice(9, 12);
+      }
+      this.value = formatted;
+    });
+  });
+
   setupModalKeyboard('#employeeModal', close);
   document.querySelector('#closeEmployeeModal').addEventListener('click', close);
   document.querySelector('#cancelEmployeeModal').addEventListener('click', close);
@@ -797,41 +584,41 @@ function bindEmployeeModal() {
     submitButton.disabled = true;
     const formData = new FormData(event.currentTarget);
     const photoFile = photoInput?.files?.[0];
+    const employeeId = formData.get('id');
     formData.delete('photo');
     const payload = Object.fromEntries(formData);
-    const id = payload.id;
     delete payload.id;
     delete payload.emp_number;
     payload.active = payload.active === 'true';
     try {
-      const result = await api(id ? `/api/employees/${id}` : '/api/employees', {
-        method: id ? 'PUT' : 'POST',
+      const result = await api(employeeId ? `/api/employees/${employeeId}` : '/api/employees', {
+        method: employeeId ? 'PUT' : 'POST',
         body: JSON.stringify(payload)
       });
-      const employeeId = id || result.id;
-      if (photoFile && employeeId) {
+      const employeeIdResult = employeeId || result.id;
+      if (photoFile && employeeIdResult) {
         const photoForm = new FormData();
         photoForm.append('photo', photoFile);
-        const photoResult = await api(`/api/employees/${employeeId}/photo`, {
+        const photoResult = await api(`/api/employees/${employeeIdResult}/photo`, {
           method: 'POST',
           body: photoForm
         });
         /* Sync photo_url to local state */
-        const empInState = state.employees.find(e => String(e.id) === String(employeeId));
+        const empInState = state.employees.find(e => String(e.id) === String(employeeIdResult));
         if (empInState) empInState.photo_url = photoResult.photo_url;
-      } else if (removePhoto && employeeId) {
-        await api(`/api/employees/${employeeId}/photo`, { method: 'DELETE' });
+      } else if (removePhoto && employeeIdResult) {
+        await api(`/api/employees/${employeeIdResult}/photo`, { method: 'DELETE' });
         /* Sync photo removal to local state */
-        const empInState = state.employees.find(e => String(e.id) === String(employeeId));
+        const empInState = state.employees.find(e => String(e.id) === String(employeeIdResult));
         if (empInState) empInState.photo_url = null;
       }
       state.editingEmployee = null;
-      state._flash = { id: Number(employeeId), type: 'employees' };
-      showToast(id ? 'Employee updated successfully.' : 'Employee added successfully.');
+      state._flash = { id: Number(employeeIdResult), type: 'employees' };
+      showToast(employeeId ? 'Employee updated successfully.' : 'Employee added successfully.');
 
       /* Instant update: add/edit directly in local state, no refresh needed */
-      if (id) {
-        const idx = state.employees.findIndex(e => String(e.id) === String(id));
+      if (employeeId) {
+        const idx = state.employees.findIndex(e => String(e.id) === String(employeeId));
         if (idx !== -1) state.employees[idx] = result;
       } else {
         state.employees.push(result);
@@ -1000,4 +787,146 @@ function bindAuditTrailModal() {
   });
 
   renderAuditTable();
+}
+
+/* ── Change Password Modal ── */
+function changePasswordModal() {
+  return `
+    <div class="modal-backdrop" id="changePasswordModal">
+      <section class="modal confirm-modal" style="max-width:440px;">
+        <div class="modal-head">
+          <div>
+            <h2>Change Password</h2>
+            <p>Enter your current password and set a new one.</p>
+          </div>
+          <button class="icon-btn" id="closeChangePassword" aria-label="Close">x</button>
+        </div>
+        <form id="changePasswordForm" style="padding:0 24px 20px;display:flex;flex-direction:column;gap:14px;">
+          <label>Current Password
+            <div class="password-wrapper">
+              <input name="current_password" type="password" required placeholder="Enter current password" autocomplete="current-password">
+              <button class="password-toggle" type="button" data-password-toggle aria-label="Show password" aria-pressed="false">${passwordToggleIcon()}</button>
+            </div>
+          </label>
+          <label>New Password
+            <div class="password-wrapper">
+              <input name="new_password" type="password" required minlength="6" placeholder="Min 6 characters" autocomplete="new-password">
+              <button class="password-toggle" type="button" data-password-toggle aria-label="Show password" aria-pressed="false">${passwordToggleIcon()}</button>
+            </div>
+          </label>
+          <label>Confirm New Password
+            <div class="password-wrapper">
+              <input name="confirm_password" type="password" required minlength="6" placeholder="Re-type new password" autocomplete="new-password">
+              <button class="password-toggle" type="button" data-password-toggle aria-label="Show password" aria-pressed="false">${passwordToggleIcon()}</button>
+            </div>
+          </label>
+          <div class="error error-box" id="changePasswordError"></div>
+          <div class="modal-actions">
+            <button class="ghost" type="button" id="cancelChangePassword">Cancel</button>
+            <button class="primary" type="submit" id="submitChangePassword">Change Password</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+function bindChangePasswordModal() {
+  const modal = document.querySelector('#changePasswordModal');
+  if (!modal) return;
+
+  const close = () => {
+    state.showChangePassword = false;
+    reRenderCurrentView();
+  };
+
+  setupModalKeyboard('#changePasswordModal', close);
+  document.querySelector('#closeChangePassword').addEventListener('click', close);
+  document.querySelector('#cancelChangePassword').addEventListener('click', close);
+  modal.addEventListener('click', event => { if (event.target === modal) close(); });
+  bindPasswordToggles(modal);
+
+  document.querySelector('#changePasswordForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const errorBox = document.querySelector('#changePasswordError');
+    const submitBtn = document.querySelector('#submitChangePassword');
+    const form = new FormData(event.currentTarget);
+    const currentPassword = form.get('current_password');
+    const newPassword = form.get('new_password');
+    const confirmPassword = form.get('confirm_password');
+
+    errorBox.textContent = '';
+
+    if (newPassword !== confirmPassword) {
+      errorBox.textContent = 'New passwords do not match.';
+      return;
+    }
+    if (newPassword.length < 6) {
+      errorBox.textContent = 'New password must be at least 6 characters.';
+      return;
+    }
+    if (currentPassword === newPassword) {
+      errorBox.textContent = 'New password must be different from current password.';
+      return;
+    }
+
+    submitBtn.disabled = true;
+    try {
+      await api('/api/password', {
+        method: 'PUT',
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword })
+      });
+      showToast('Password changed successfully.');
+      state.showChangePassword = false;
+      reRenderCurrentView();
+    } catch (error) {
+      errorBox.textContent = error.message;
+    }
+    submitBtn.disabled = false;
+  });
+}
+
+/* ── Close Confirmation Modal (Electron X button) ── */
+function closeConfirmModal() {
+  return `
+    <div class="modal-backdrop" id="closeConfirmModal">
+      <section class="modal confirm-modal">
+        <div class="modal-head">
+          <div>
+            <h2>Exit Application?</h2>
+            <p>Choose an option before closing.</p>
+          </div>
+        </div>
+        <div class="modal-actions" style="justify-content:center;gap:12px;">
+          <button class="ghost" type="button" id="stayLoggedIn">Stay Logged In</button>
+          <button class="danger" type="button" id="logoutAndClose">Logout & Close</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindCloseConfirmModal() {
+  const modal = document.querySelector('#closeConfirmModal');
+  if (!modal) return;
+
+  document.querySelector('#stayLoggedIn')?.addEventListener('click', () => {
+    state.showCloseConfirm = false;
+    if (window.electronAPI) {
+      window.electronAPI.closeResponse('stay');
+    }
+    reRenderCurrentView();
+  });
+
+  document.querySelector('#logoutAndClose')?.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST' }); } catch {}
+    state.user = null;
+    state.showCloseConfirm = false;
+    stopSessionTimer();
+    if (window.electronAPI) {
+      window.electronAPI.closeResponse('logout-and-close');
+    } else {
+      renderLogin();
+    }
+  });
 }

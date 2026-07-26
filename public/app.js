@@ -1,34 +1,3 @@
-/* ── Data Poller ── */
-let dataPollLock = false;
-let dataPoller = null;
-
-function startDataPoller() {
-  if (dataPoller) return;
-  dataPoller = setInterval(async () => {
-    if (!state.user || isModalOpen() || dataPollLock) return;
-    dataPollLock = true;
-    try {
-      await withLoading(loadData);
-      const currentView = state.view;
-      if (currentView === 'dashboard') renderDashboard();
-      else if (currentView === 'payroll') renderPayroll();
-      else if (currentView === 'attendance') renderAttendance();
-      else if (currentView === 'employees') renderEmployees();
-      else if (currentView === 'cashAdvance') renderCashAdvance();
-      else if (currentView === 'archive') renderArchive();
-    } finally {
-      dataPollLock = false;
-    }
-  }, 30000);
-}
-
-function stopDataPoller() {
-  if (dataPoller) {
-    clearInterval(dataPoller);
-    dataPoller = null;
-  }
-}
-
 /* ── Date Watcher ── */
 let dateWatcher = null;
 
@@ -203,10 +172,16 @@ function shell(content) {
     { id: 'archive', label: 'Archive', icon: '📦' }
   ];
   const collapsed = state.sidebarCollapsed;
+  const searchValue = state.view === 'payroll' ? state.searchPayroll
+    : state.view === 'attendance' ? state.searchAttendance
+    : (state.view === 'employees' || state.view === 'archive') ? state.searchEmployees
+    : '';
+  const activeSearch = String(searchValue || '').trim().length > 0;
   const userInitials = state.user.username.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() || 'U';
   app.innerHTML = `
     <section class="layout${collapsed ? ' sidebar-collapsed' : ''}">
-      <aside class="sidebar${collapsed ? ' collapsed' : ''}">
+      <div class="sidebar-overlay" id="sidebarOverlay"></div>
+      <aside class="sidebar${collapsed ? ' collapsed' : ''} mobile-hidden">
         <button class="sidebar-toggle" id="sidebarToggle" title="${collapsed ? 'Expand sidebar' : 'Collapse sidebar'}">
           <span class="toggle-label">${collapsed ? 'Expand' : 'Collapse'}</span>
           <span class="toggle-icon">◀</span>
@@ -243,13 +218,14 @@ function shell(content) {
           </div>
           <div class="sidebar-actions">
             <button class="theme-toggle-btn" id="darkModeToggle">${document.body.classList.contains('dark-mode') ? '☀' : '🌙'} <span>${document.body.classList.contains('dark-mode') ? 'Light Mode' : 'Dark Mode'}</span></button>
+            <button id="changePasswordBtn">🔑 <span>Change Password</span></button>
             <button id="switchUserBtn">🔄 <span>Switch User</span></button>
             <button id="logoutBtn">🚪 <span>Logout</span></button>
           </div>
           <div class="session-info" id="sessionInfo">Session active</div>
         </div>
       </aside>
-      <section class="content">
+      <section class="content${activeSearch ? ' search-active' : ''}">
         <div class="topbar">
           <div class="page-title">
             <span class="page-kicker">${state.view.toUpperCase()}</span>
@@ -260,6 +236,7 @@ function shell(content) {
             ${state.user.role === 'admin' ? 'Admin' : 'HR'}
           </span>
           <div class="mobile-actions">
+            <button class="mobile-action-btn menu-btn" id="mobileMenuBtn" title="Menu">☰</button>
             <button class="mobile-action-btn" id="mobileDarkToggle" title="Toggle dark mode">${document.body.classList.contains('dark-mode') ? '☀' : '🌙'}</button>
             <button class="mobile-action-btn" id="mobileSwitchUser" title="Switch user">🔄</button>
             <button class="mobile-action-btn" id="mobileLogoutBtn" title="Logout">🚪</button>
@@ -267,6 +244,8 @@ function shell(content) {
         </div>
         ${content}
         ${state.showLogoutConfirm ? logoutConfirmModal() : ''}
+        ${state.showChangePassword ? changePasswordModal() : ''}
+        ${state.showCloseConfirm ? closeConfirmModal() : ''}
         ${state.pendingDelete ? confirmDeleteModal() : ''}
         ${state.showAudit ? auditTrailModal() : ''}
       </section>
@@ -287,7 +266,7 @@ function shell(content) {
       state.editingCashAdvance = null;
       if (state.view === 'attendance') {
         state.attendanceDate = todayInManila();
-        state.week = payrollWeekStartOf(state.attendanceDate);
+        state.week = weekStartOf(state.attendanceDate);
       } else if (state.view === 'payroll') {
         state.week = state.payrollWeek;
       }
@@ -320,8 +299,14 @@ function shell(content) {
     state.showLogoutConfirm = true;
     shell(content);
   });
+  document.querySelector('#changePasswordBtn')?.addEventListener('click', () => {
+    state.showChangePassword = true;
+    shell(content);
+  });
   bindLogoutConfirmModal();
   bindConfirmDeleteModal();
+  bindChangePasswordModal();
+  bindCloseConfirmModal();
   bindUserSwitcher();
   startSessionTimer();
   if (state.showAudit) bindAuditTrailModal();
@@ -341,13 +326,48 @@ function shell(content) {
     await api('/api/logout', { method: 'POST' });
     state.user = null;
     state.showLogoutConfirm = false;
-    stopDataPoller();
     stopSessionTimer();
     renderLogin();
   });
   document.querySelector('#mobileLogoutBtn')?.addEventListener('click', async () => {
     state.showLogoutConfirm = true;
     shell(content);
+  });
+
+  /* Mobile sidebar: hamburger menu toggle */
+  document.querySelector('#mobileMenuBtn')?.addEventListener('click', () => {
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.querySelector('#sidebarOverlay');
+    if (sidebar) {
+      sidebar.classList.toggle('mobile-open');
+      if (sidebar.classList.contains('mobile-open')) {
+        sidebar.classList.remove('mobile-hidden');
+      } else {
+        sidebar.classList.add('mobile-hidden');
+      }
+    }
+    if (overlay) overlay.classList.toggle('active');
+  });
+  document.querySelector('#sidebarOverlay')?.addEventListener('click', () => {
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.querySelector('#sidebarOverlay');
+    if (sidebar) {
+      sidebar.classList.remove('mobile-open');
+      sidebar.classList.add('mobile-hidden');
+    }
+    if (overlay) overlay.classList.remove('active');
+  });
+  /* Close sidebar when a nav button is clicked on mobile */
+  document.querySelectorAll('.sidebar-nav button[data-view]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sidebar = document.querySelector('.sidebar');
+      const overlay = document.querySelector('#sidebarOverlay');
+      if (window.innerWidth < 1024 && sidebar) {
+        sidebar.classList.remove('mobile-open');
+        sidebar.classList.add('mobile-hidden');
+      }
+      if (overlay) overlay.classList.remove('active');
+    });
   });
 }
 
@@ -380,7 +400,6 @@ function bindUserSwitcher() {
     await api('/api/logout', { method: 'POST' });
     state.user = null;
     state.showLogoutConfirm = false;
-    stopDataPoller();
     stopSessionTimer();
     renderLogin();
   });
@@ -403,19 +422,19 @@ async function refresh() {
 /* ── Targeted Partial Refresh (only reload what changed) ── */
 async function partialRefresh(types) {
   saveUiState();
-  const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate });
+  state.currentDate = todayInManila();
+  const pd = state.payPeriodDays || 7;
+  const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate, periodDays: pd });
   if (state.view === 'archive') payrollQs.set('include_inactive', 'true');
   const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate });
-  state.currentDate = todayInManila();
-
   const fetchers = {
     employees: api(`/api/employees?search=${encodeURIComponent(state.searchEmployees)}&active=${state.view === 'archive' ? 'false' : 'true'}`),
     payroll: api(`/api/payroll?${payrollQs}`),
     attendance: api(`/api/attendance?${attendanceQs}`),
-    advances: api(`/api/cash-advances?week=${state.payrollWeek}`),
-    extraPayments: api(`/api/extra-payments?week=${state.payrollWeek}`),
-    balePayments: api(`/api/bale-payments?week=${state.payrollWeek}`),
-    salaryPayments: api(`/api/salary-payments?week=${state.payrollWeek}`)
+    advances: api(`/api/cash-advances?week=${state.payrollWeek}&periodDays=${pd}`),
+    extraPayments: api(`/api/extra-payments?week=${state.payrollWeek}&periodDays=${pd}`),
+    balePayments: api(`/api/bale-payments?week=${state.payrollWeek}&periodDays=${pd}`),
+    salaryPayments: api(`/api/salary-payments?week=${state.payrollWeek}&periodDays=${pd}`)
   };
 
   const promises = types.map(t => fetchers[t]);
@@ -433,21 +452,9 @@ async function partialRefresh(types) {
 /* ── Re-render current view ── */
 function reRenderCurrentView() {
   const payrollRows = state.payroll?.rows || [];
-  if (state.paymentEmployee) {
-    const fresh = payrollRows.find(r => Number(r.employee_id) === Number(state.paymentEmployee.employee_id));
-    if (fresh) state.paymentEmployee = fresh;
-  }
-  if (state.baleDeductionEmployee) {
-    const fresh = payrollRows.find(r => Number(r.employee_id) === Number(state.baleDeductionEmployee.employee_id));
-    if (fresh) state.baleDeductionEmployee = fresh;
-  }
-  if (state.cashEmployee) {
-    const fresh = payrollRows.find(r => Number(r.employee_id) === Number(state.cashEmployee.employee_id));
-    if (fresh) state.cashEmployee = fresh;
-  }
-  if (state.extraPaymentEmployee) {
-    const fresh = payrollRows.find(r => Number(r.employee_id) === Number(state.extraPaymentEmployee.employee_id));
-    if (fresh) state.extraPaymentEmployee = fresh;
+  if (state.payrollModalEmployee) {
+    const fresh = payrollRows.find(r => Number(r.employee_id) === Number(state.payrollModalEmployee.employee_id));
+    if (fresh) state.payrollModalEmployee = fresh;
   }
   if (state.view === 'dashboard') renderDashboard();
   if (state.view === 'payroll') renderPayroll();
@@ -472,7 +479,7 @@ document.addEventListener('keydown', event => {
       state.editingCashAdvance = null;
       if (targetView === 'attendance') {
         state.attendanceDate = todayInManila();
-        state.week = payrollWeekStartOf(state.attendanceDate);
+        state.week = weekStartOf(state.attendanceDate);
       } else if (targetView === 'payroll') {
         state.week = state.payrollWeek;
       }
@@ -485,7 +492,9 @@ document.addEventListener('keydown', event => {
   if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !isModalOpen() && !event.ctrlKey && !event.metaKey) {
     if (state.view === 'payroll' || state.view === 'dashboard') {
       event.preventDefault();
-      state.week = addDays(state.week, event.key === 'ArrowLeft' ? -7 : 7);
+      const pd = state.payPeriodDays || 7;
+      const step = (pd > 7 && state.payroll?.isPeriodLocked) ? pd : 7;
+      state.week = addDays(state.week, event.key === 'ArrowLeft' ? -step : step);
       state.payrollWeek = state.week;
       saveUiState();
       refresh();
@@ -506,11 +515,20 @@ async function boot() {
   if (localStorage.getItem('payrollDarkMode') === 'true') {
     document.body.classList.add('dark-mode');
   }
+  if (window.electronAPI) {
+    window.electronAPI.onCloseRequest(() => {
+      if (state.user) {
+        state.showCloseConfirm = true;
+        reRenderCurrentView();
+      } else {
+        window.electronAPI.closeResponse('logout-and-close');
+      }
+    });
+  }
   await loadMe();
   if (!state.user) return renderLogin();
   await refresh();
   startDateWatcher();
-  startDataPoller();
 }
 
 boot().catch(error => {

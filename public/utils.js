@@ -54,6 +54,30 @@ function addDays(input, days) {
   return formatDateOnly(date);
 }
 
+function daysBetween(dateA, dateB) {
+  const a = parseDateOnly(dateA);
+  const b = parseDateOnly(dateB);
+  return Math.round((b - a) / 86400000);
+}
+
+const PERIOD_ANCHOR = '2020-01-06';
+
+function periodStartOf(dateInput, periodDays = 7) {
+  const monday = payrollWeekStartOf(dateInput);
+  const diff = daysBetween(PERIOD_ANCHOR, monday);
+  const periodIndex = Math.floor(diff / periodDays);
+  return addDays(PERIOD_ANCHOR, periodIndex * periodDays);
+}
+
+function periodEndOf(dateInput, periodDays = 7) {
+  return addDays(periodStartOf(dateInput, periodDays), periodDays - 1);
+}
+
+function getPeriodLabel(periodDays) {
+  const labels = { 7: 'Weekly', 14: 'Semi-Monthly', 21: '3 Weeks', 30: 'Monthly' };
+  return labels[periodDays] || `${periodDays}-day`;
+}
+
 function formatShortDate(dateInput) {
   const date = parseDateOnly(dateInput);
   const day = date.getUTCDate();
@@ -249,6 +273,27 @@ function deleteButton(resource, id) {
   if (resource !== 'cash-advances' && resource !== 'extra-payments' && state.user.role !== 'admin') return '';
   const label = resource === 'employees' ? 'Archive' : 'Delete';
   return `<button class="danger" data-delete-resource="${resource}" data-delete-id="${id}">${label}</button>`;
+}
+
+function passwordToggleIcon(isVisible = false) {
+  return isVisible
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 4.2A10.8 10.8 0 0 1 12 4c5.5 0 9.3 5.1 10 8-.3 1.2-1.1 2.8-2.5 4.1M6.6 6.6C4.5 8 2.7 10.4 2 12c.7 2.9 4.5 8 10 8 1.3 0 2.5-.3 3.6-.8"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-8 10-8 10 8 10 8-3.6 8-10 8S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+}
+
+function bindPasswordToggles(container = document) {
+  container.querySelectorAll('[data-password-toggle]').forEach(button => {
+    button.addEventListener('click', () => {
+      const input = button.closest('.password-wrapper')?.querySelector('input');
+      if (!input) return;
+      const isHidden = input.type === 'password';
+      input.type = isHidden ? 'text' : 'password';
+      button.innerHTML = passwordToggleIcon(isHidden);
+      button.setAttribute('aria-label', isHidden ? 'Hide password' : 'Show password');
+      button.setAttribute('aria-pressed', String(isHidden));
+      input.focus();
+    });
+  });
 }
 
 function bindDeletes() {

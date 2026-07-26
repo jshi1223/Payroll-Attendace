@@ -1,6 +1,7 @@
 async function api(url, options = {}) {
   const isFormData = options.body instanceof FormData;
   const response = await fetch(url, {
+    credentials: 'same-origin',
     headers: isFormData ? { ...(options.headers || {}) } : { 'Content-Type': 'application/json', ...(options.headers || {}) },
     ...options
   });
@@ -21,17 +22,18 @@ async function loadMe() {
 async function loadData() {
   if (!state.user) return;
   state.currentDate = todayInManila();
-  const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate });
+  const pd = state.payPeriodDays || 7;
+  const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate, periodDays: pd });
   if (state.view === 'archive') payrollQs.set('include_inactive', 'true');
   const attendanceQs = new URLSearchParams({ week: state.week, search: state.searchAttendance, today: state.currentDate });
   const promises = [
     api(`/api/employees?search=${encodeURIComponent(state.searchEmployees)}&active=${state.view === 'archive' ? 'false' : 'true'}`),
     api(`/api/payroll?${payrollQs}`),
     api(`/api/attendance?${attendanceQs}`),
-    api(`/api/cash-advances?week=${state.payrollWeek}`),
-    api(`/api/extra-payments?week=${state.payrollWeek}`),
-    api(`/api/bale-payments?week=${state.payrollWeek}`),
-    api(`/api/salary-payments?week=${state.payrollWeek}`)
+    api(`/api/cash-advances?week=${state.payrollWeek}&periodDays=${pd}`),
+    api(`/api/extra-payments?week=${state.payrollWeek}&periodDays=${pd}`),
+    api(`/api/bale-payments?week=${state.payrollWeek}&periodDays=${pd}`),
+    api(`/api/salary-payments?week=${state.payrollWeek}&periodDays=${pd}`)
   ];
   promises.push(Promise.resolve({ rows: [] }));
 

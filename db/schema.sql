@@ -3,7 +3,8 @@ CREATE TABLE IF NOT EXISTS users (
   username VARCHAR(80) UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'hr')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE SEQUENCE IF NOT EXISTS employee_number_seq START 1;
@@ -14,7 +15,12 @@ CREATE TABLE IF NOT EXISTS employees (
   name VARCHAR(160) NOT NULL,
   phone VARCHAR(20) NOT NULL,
   rate NUMERIC(12, 2) NOT NULL CHECK (rate >= 0),
+  pay_period_days INT NOT NULL DEFAULT 7 CHECK (pay_period_days >= 1),
   active BOOLEAN NOT NULL DEFAULT TRUE,
+  sss_number VARCHAR(12) DEFAULT '',
+  philhealth_number VARCHAR(14) DEFAULT '',
+  pagibig_number VARCHAR(14) DEFAULT '',
+  tin_number VARCHAR(15) DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -47,7 +53,7 @@ CREATE TABLE IF NOT EXISTS payroll_statuses (
   id SERIAL PRIMARY KEY,
   employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
   week_start DATE NOT NULL,
-  status VARCHAR(20) NOT NULL DEFAULT 'unpaid' CHECK (status IN ('paid', 'unpaid')),
+  status VARCHAR(20) NOT NULL DEFAULT 'unpaid' CHECK (status IN ('paid', 'unpaid', 'generated')),
   paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0),
   extra_payment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (extra_payment_amount >= 0),
   extra_payment_notes TEXT DEFAULT '',

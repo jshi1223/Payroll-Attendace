@@ -11,6 +11,7 @@ const state = {
   view: savedView,
   week: initialStateWeek,
   payrollWeek: initialStateWeek,
+  payPeriodDays: 7,
   attendanceDate: currentDay,
   currentDate: currentDay,
   search: '',
@@ -27,14 +28,13 @@ const state = {
   auditLogs: [],
   editingEmployee: null,
   editingCashAdvance: null,
-  editingExtraPayment: null,
-  editingSalaryPayment: null,
-  editingBalePayment: null,
-  cashEmployee: null,
-  paymentEmployee: null,
-  baleDeductionEmployee: null,
-  extraPaymentEmployee: null,
+  payrollModalEmployee: null,
+  payrollModalTab: 'pay',
+  payrollModalStep: 1,
+  payrollTransactionModal: false,
   showLogoutConfirm: false,
+  showChangePassword: false,
+  showCloseConfirm: false,
   showAudit: false,
   pendingDelete: null,
   archivedEmployees: [],
@@ -56,11 +56,12 @@ function saveUiState() {
     view: state.view,
     week: state.view === 'payroll' ? state.week : state.payrollWeek,
     search: state.searchPayroll,
+    payPeriodDays: state.payPeriodDays,
     sidebarCollapsed: state.sidebarCollapsed
   }));
 }
 
 function isModalOpen() {
-  return state.editingEmployee || state.cashEmployee || state.paymentEmployee ||
-    state.extraPaymentEmployee || state.pendingDelete || state.showAudit || state.showLogoutConfirm;
+  return state.editingEmployee || state.payrollModalEmployee || state.payrollTransactionModal ||
+    state.pendingDelete || state.showAudit || state.showLogoutConfirm || state.showChangePassword || state.showCloseConfirm;
 }
