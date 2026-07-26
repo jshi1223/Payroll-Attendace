@@ -230,7 +230,7 @@ function shell(content) {
           <div class="page-title">
             <span class="page-kicker">${state.view.toUpperCase()}</span>
             <h1>${titleForView()}</h1>
-            <p>Today: ${state.currentDate} | Week: ${state.week} to ${addDays(state.week, 6)}</p>
+            <p>Today: ${state.currentDate} | Week: ${state.week} to ${addDays(state.week, (state.payPeriodDays || 7) - 1)}</p>
           </div>
           <span class="badge role-${state.user.role}">
             ${state.user.role === 'admin' ? 'Admin' : 'HR'}

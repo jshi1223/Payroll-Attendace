@@ -2072,6 +2072,21 @@ body.dark-mode .modal-backdrop {
   color: var(--brand);
 }
 
+.slip-section-header td {
+  background: #e2e8f0;
+  font-weight: 700;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #374151;
+  padding: 5px 8px;
+  border-bottom: 2px solid #374151;
+}
+
+.slip-summary {
+  margin-bottom: 0;
+}
+
 .num {
   text-align: right;
   font-variant-numeric: tabular-nums;

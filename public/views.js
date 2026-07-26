@@ -66,29 +66,35 @@ function bindWeekToolbar() {
       document.querySelector('#customPeriodWrap').style.display = 'none';
       state.payPeriodDays = Number(val);
     }
-    /* Keep current week start — don't realign to period anchor */
+    /* If current period is locked, advance to next period */
     state.week = payrollWeekStartOf(state.week);
+    if (state.payroll?.isPeriodLocked) {
+      state.week = addDays(state.week, 7);
+    }
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#customPeriodDays')?.addEventListener('change', async event => {
     state.payPeriodDays = Math.max(1, Number(event.target.value) || 7);
-    /* Keep current week start — don't realign to period anchor */
+    /* If current period is locked, advance to next period */
     state.week = payrollWeekStartOf(state.week);
+    if (state.payroll?.isPeriodLocked) {
+      state.week = addDays(state.week, 7);
+    }
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#prevPeriod')?.addEventListener('click', async () => {
-    const step = (pd > 7 && state.payroll?.isPeriodLocked) ? pd : 7;
+    const step = state.payroll?.isPeriodLocked ? pd : 7;
     state.week = addDays(state.week, -step);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#nextPeriod')?.addEventListener('click', async () => {
-    const step = (pd > 7 && state.payroll?.isPeriodLocked) ? pd : 7;
+    const step = state.payroll?.isPeriodLocked ? pd : 7;
     state.week = addDays(state.week, step);
     state.payrollWeek = state.week;
     saveUiState();
@@ -378,7 +384,7 @@ function renderPayroll() {
                 <td>${formatMoney(row.paid_amount)}</td>
                 <td class="col-balance"><strong class="balance-amount">${formatMoney(row.balance)}</strong></td>
                 <td class="col-bale"><strong class="bale-amount">${formatMoney(row.remaining_bale_balance)}</strong></td>
-              <td><span class="badge ${row.payroll_status === 'generated' ? 'generated' : row.payment_status} status-badge">${row.payroll_status === 'generated' ? 'Generated' : row.payment_status === 'paid' ? 'Paid' : row.payment_status === 'partial' ? 'Partial' : 'Unpaid'}</span></td>
+              <td><span class="badge ${row.payroll_status === 'generated' ? 'generated' : row.payment_status} status-badge">${row.payroll_status === 'generated' ? (row.payment_status === 'paid' ? 'Paid/Generated' : row.payment_status === 'partial' ? 'Partial/Generated' : 'Unpaid/Generated') : row.payment_status === 'paid' ? 'Paid' : row.payment_status === 'partial' ? 'Partial' : 'Unpaid'}</span></td>
               <td class="actions">${row.payroll_status === 'generated'
                 ? `<span class="badge badge-locked">Locked</span><button class="ghost" data-unlock-payroll="${row.employee_id}">Unlock</button>`
                 : `<button class="ghost" data-manage-employee="${row.employee_id}">Manage</button>`}</td>
@@ -899,7 +905,7 @@ function openBulkPayslipPrint(rows) {
   const slips = rows.map(row => {
     const pd = state.payPeriodDays || row.pay_period_days || 7;
     const periodLabel = getPeriodLabel(pd);
-    const periodStart = periodStartOf(state.week, pd);
+    const periodStart = state.week;
     const periodEnd = addDays(periodStart, pd - 1);
     const attendanceDates = new Set(state.attendance.rows
       .filter(log => Number(log.employee_id) === Number(row.employee_id))
@@ -952,8 +958,13 @@ function openBulkPayslipPrint(rows) {
 
           <div class="slip-line">
             <div><strong>Empleyado:</strong> ${escapeHtml(row.name)}</div>
+            <div><strong>No.:</strong> ${escapeHtml(row.emp_number || '')}</div>
             <div><strong>Arawan:</strong> ${peso.format(row.rate)}/araw</div>
+          </div>
+          <div class="slip-line" style="border-top:0;">
+            <div><strong>Araw ng Pasok:</strong> ${row.days || pd} araw</div>
             <div><strong>Katayuan:</strong> ${row.payroll_status === 'generated' ? 'Naka-lock' : row.payment_status === 'paid' ? 'Bayad' : row.payment_status === 'partial' ? 'Partial' : 'Hindi Bayad'}</div>
+            <div></div>
           </div>
 
           <table class="slip-table">
@@ -977,70 +988,92 @@ function openBulkPayslipPrint(rows) {
             </tbody>
           </table>
 
-          <table class="slip-table" style="border-top:0;">
+          <table class="slip-table slip-summary" style="border-top:0;">
             <tbody>
-              ${totalBale > 0 ? `
+              <tr class="slip-section-header"><td colspan="2">KABUUANG KITA</td></tr>
               <tr>
-                <td style="width:28%;" class="center">Cash Advance (Bale)</td>
-                <td style="width:20%;" class="num">${formatMoney(totalBale)}</td>
-                <td style="width:32%;">Bale Ngayon</td>
-                <td style="width:20%;" class="num"></td>
+                <td style="width:60%;">Sahod (${peso.format(row.rate)} × ${row.days || pd} araw)</td>
+                <td class="num" style="width:40%; color:#166534;">+${formatMoney(totalEarnings)}</td>
+              </tr>
+              ${extraPay > 0 ? `
+              <tr>
+                <td>Dagdag Sahod${extraPayNotes ? ' — ' + escapeHtml(extraPayNotes) : ''}</td>
+                <td class="num" style="color:#166534;">+${formatMoney(extraPay)}</td>
               </tr>` : ''}
               ${prevUnpaid > 0 ? `
               <tr>
-                <td class="center">Natitira (Dati)</td>
-                <td class="num">${formatMoney(prevUnpaid)}</td>
-                <td>Galing sa nakaraan</td>
-                <td class="num">${formatMoney(prevUnpaid)}</td>
-              </tr>` : ''}
-              ${extraPay > 0 ? `
-              <tr>
-                <td class="center">Dagdag Sahod</td>
-                <td class="num">${formatMoney(extraPay)}</td>
-                <td>${escapeHtml(extraPayNotes || 'Bonus/Dagdag')}</td>
-                <td class="num">+${formatMoney(extraPay)}</td>
-              </tr>` : ''}
-              ${balePaid > 0 ? `
-              <tr>
-                <td class="center">Bayad Bale</td>
-                <td class="num" style="color:#166534;">-${formatMoney(balePaid)}</td>
-                <td>Bayad sa utang ngayon</td>
-                <td class="num" style="color:#166534;">-${formatMoney(balePaid)}</td>
-              </tr>` : ''}
-              ${salaryPaid > 0 ? `
-              <tr>
-                <td class="center">Sahod na Natanggap</td>
-                <td class="num" style="color:#166534;">-${formatMoney(salaryPaid)}</td>
-                <td>Natanggap na sahod ngayon</td>
-                <td class="num" style="color:#166534;">-${formatMoney(salaryPaid)}</td>
+                <td>Natitira mula sa Nakaraan (Carry Over)</td>
+                <td class="num" style="color:#166534;">+${formatMoney(prevUnpaid)}</td>
               </tr>` : ''}
               <tr class="slip-total-row">
-                <td colspan="2" class="center"><strong>NATITIRA PANG SAHOD</strong></td>
-                <td></td>
-                <td class="num"><strong>${formatMoney(balance)}</strong></td>
+                <td><strong>Kabuuang Kita</strong></td>
+                <td class="num"><strong>${formatMoney(totalEarnings + extraPay + prevUnpaid)}</strong></td>
               </tr>
+              ${balePaid > 0 ? `
               <tr>
-                <td colspan="4">Halaga sa Salita: <strong>${amountInWords(balance)}</strong></td>
-              </tr>
+                <td>Bayad Bale (Utang)</td>
+                <td class="num" style="color:#dc2626;">-${formatMoney(balePaid)}</td>
+              </tr>` : ''}
             </tbody>
           </table>
 
-          <div class="slip-summary-footer">
-            <div><strong>BALENSA (Utang):</strong> ${formatMoney(row.remaining_bale_balance)}</div>
-            <div><strong>Panahon:</strong> ${formatSlipDate(periodStart)} - ${formatSlipDate(periodEnd)}</div>
-          </div>
+          <table class="slip-table slip-summary" style="border-top:0;">
+            <tbody>
+              <tr class="slip-total-row">
+                <td style="width:60%;"><strong>SAHOD NA TATANGGAPIN</strong></td>
+                <td class="num" style="width:40%;"><strong>${formatMoney(Math.max(totalEarnings + extraPay + prevUnpaid - balePaid, 0))}</strong></td>
+              </tr>
+              ${salaryPaid > 0 ? `
+              <tr>
+                <td>Bayad Sahod</td>
+                <td class="num" style="color:#dc2626;">-${formatMoney(salaryPaid)}</td>
+              </tr>
+              <tr class="slip-total-row">
+                <td><strong>BALANSA</strong></td>
+                <td class="num"><strong>${formatMoney(Math.max(totalEarnings + extraPay + prevUnpaid - balePaid - salaryPaid, 0))}</strong></td>
+              </tr>` : ''}
+            </tbody>
+          </table>
 
-          <div class="slip-signatures">
-            <div>
-              <strong>Inihanda ni:</strong>
-              <div class="signature-name">KVSK</div>
-              <span>May-ari</span>
-            </div>
-            <div></div>
-          </div>
+          ${(row.total_bale || 0) > 0 || (row.remaining_bale_balance || 0) > 0 ? `
+          <table class="slip-table slip-summary" style="border-top:0;">
+            <tbody>
+              <tr class="slip-section-header"><td colspan="2">BALENSA NG BALE (Cash Advance / Utang)</td></tr>
+              <tr>
+                <td style="width:60%;">Utang mula sa Nakaraan</td>
+                <td class="num" style="width:40%;">${formatMoney(row.previous_bale_balance || 0)}</td>
+              </tr>
+              <tr>
+                <td>Bale ngayong Period</td>
+                <td class="num">+${formatMoney(row.cash_advance || 0)}</td>
+              </tr>
+              <tr class="slip-total-row">
+                <td><strong>Kabuuang Utang (Bale)</strong></td>
+                <td class="num"><strong>${formatMoney(row.total_bale || 0)}</strong></td>
+              </tr>
+              ${balePaid > 0 ? `
+              <tr>
+                <td>Bayad Bale ngayong Period</td>
+                <td class="num" style="color:#166534;">-${formatMoney(balePaid)}</td>
+              </tr>` : ''}
+              <tr class="slip-total-row">
+                <td><strong>Natitirang Utang (Bale)</strong></td>
+                <td class="num"><strong style="color:#dc2626;">${formatMoney(row.remaining_bale_balance || 0)}</strong></td>
+              </tr>
+            </tbody>
+          </table>` : ''}
 
-          <div class="acceptance">
-            <div>PAGKILALA NG EMPLEYADO</div>
+        <div class="slip-signatures">
+          <div>
+            <strong>Inihanda ni:</strong>
+            <div class="signature-name">KVSK</div>
+            <span>May-ari</span>
+          </div>
+          <div></div>
+        </div>
+
+        <div class="acceptance">
+          <div>PAGKILALA NG EMPLEYADO</div>
             <div class="signature-grid">
               <span>Pumirma:<br><em>(Lagda sa Itaas ng Pangalan)</em></span>
               <span><br><em>(Posisyon)</em></span>
@@ -1057,35 +1090,49 @@ function openBulkPayslipPrint(rows) {
     return;
   }
   printWindow.document.write(`<!doctype html><html><head><title>Payslip ${state.week}</title><style>
-    * { box-sizing: border-box; } body { margin: 0; color: #172033; font: 12px Arial, sans-serif; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { color: #1a1d23; font: 12px 'Inter', Arial, sans-serif; background: #fff; }
     .bulk-payslip { min-height: 260mm; page-break-after: always; }
     .bulk-payslip:last-child { page-break-after: auto; }
-    .payroll-slip { width: 190mm; min-height: 135mm; margin: 0 auto; padding: 6mm 8mm; }
-    .slip-header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 10px; border-bottom: 2px solid #c62828; margin-bottom: 14px; }
-    .slip-logo { display: flex; align-items: center; gap: 10px; }
-    .logo-mark { width: 36px; height: 36px; background: #c62828; color: #fff; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 800; }
-    .slip-logo strong { display: block; color: #c62828; font-size: 18px; }
-    .slip-logo span { color: #64748b; font-size: 10px; }
-    h2 { margin: 0; font-size: 15px; color: #172033; }
-    .company-box { display: flex; justify-content: space-between; align-items: flex-start; padding: 10px 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 10px; font-size: 11px; line-height: 1.6; color: #374151; }
-    .date-line { text-align: right; white-space: nowrap; }
-    .date-line span { display: block; font-size: 10px; color: #64748b; }
-    .slip-line { display: flex; flex-wrap: wrap; gap: 10px 24px; padding: 8px 0; font-size: 12px; margin-bottom: 10px; }
-    .slip-table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
-    .slip-table th, .slip-table td { border: 1px solid #cbd5e1; padding: 5px 7px; text-align: left; font-size: 11px; }
-    .slip-table th { background: #f1f5f9; text-transform: uppercase; font-size: 10px; }
-    .slip-table td.num { text-align: right; font-family: 'Courier New', monospace; }
+    .payroll-slip { width: 190mm; min-height: 135mm; margin: 0 auto; padding: 28px 34px; color: #1a1d23; background: #fff; font-size: 12px; position: relative; }
+    .payroll-slip::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 6px; background: linear-gradient(90deg, #c62828 0%, #8e1a1a 100%); border-radius: 6px 6px 0 0; }
+    .slip-header { display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 18px; margin-bottom: 10px; margin-top: 8px; }
+    .slip-header h2 { margin: 0; text-align: center; font-size: 14px; letter-spacing: 1px; color: #c62828; font-weight: 800; }
+    .slip-logo { display: flex; align-items: center; gap: 10px; color: #1a1d23; }
+    .logo-mark { width: 44px; height: 44px; display: grid; place-items: center; border: 2px solid #c62828; font-size: 28px; font-weight: 900; color: #c62828; }
+    .slip-logo strong { display: block; font-size: 26px; line-height: 0.9; color: #1a1d23; }
+    .slip-logo span { display: block; font-size: 8px; font-weight: 700; text-transform: uppercase; color: #6b7280; letter-spacing: 0.3px; }
+    .company-box, .slip-line, .slip-signatures, .acceptance { border: 1.5px solid #374151; }
+    .company-box { display: grid; grid-template-columns: 1.1fr 0.9fr; min-height: 54px; background: #f9fafb; }
+    .company-box > div, .slip-line > div, .slip-signatures > div { padding: 5px 8px; }
+    .company-box > div:first-child { font-size: 11px; line-height: 1.5; }
+    .company-box > div:first-child strong { font-size: 13px; color: #c62828; }
+    .date-line { display: grid; grid-template-columns: 70px 1fr; align-items: center; border-left: 1px solid #374151; }
+    .date-line strong { display: block; border-bottom: 1px solid #374151; text-align: center; font-weight: 400; padding: 2px 0; }
+    .slip-line { display: grid; grid-template-columns: 1.4fr 1fr 0.8fr; border-top: 0; background: #f9fafb; }
+    .slip-line > div + div { border-left: 1px solid #374151; }
+    .slip-line strong { color: #1a1d23; }
+    .slip-table { min-width: 0; width: 100%; border: 1.5px solid #374151; border-top: 0; border-collapse: collapse; font-size: 11px; margin-bottom: 0; }
+    .slip-table th, .slip-table td { height: 20px; padding: 3px 6px; border: 1px solid #374151; text-align: left; }
+    .slip-table th { background: #f1f5f9; color: #1e293b; text-align: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
+    .slip-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
     .slip-table td.center { text-align: center; }
-    .slip-total-row td { font-weight: 700; background: #f8fafc; }
-    .slip-summary-footer { display: flex; justify-content: space-between; padding: 8px 0; font-size: 11px; border-top: 1px dashed #cbd5e1; margin-top: 10px; }
-    .slip-signatures { display: flex; gap: 40px; margin-top: 16px; padding-top: 10px; border-top: 1px solid #e2e8f0; }
-    .slip-signatures > div { flex: 1; font-size: 11px; }
+    .slip-total-row td { border-top: 2px solid #374151; border-bottom: 2px solid #374151; font-weight: 700; background: #fef2f2; }
+    .slip-total-row td.num strong { font-size: 12px; color: #c62828; }
+    .slip-section-header td { background: #e2e8f0; font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #374151; padding: 5px 8px; border-bottom: 2px solid #374151; }
+    .slip-summary { margin-bottom: 0; }
+    .slip-summary-footer { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; padding: 6px 10px; border: 1.5px solid #374151; border-top: 0; font-size: 11px; background: #f9fafb; }
+    .slip-signatures { display: grid; grid-template-columns: 0.9fr 2.1fr; min-height: 64px; border-top: 0; background: #f9fafb; }
+    .slip-signatures > div { font-size: 11px; }
+    .slip-signatures > div + div { border-left: 1px solid #374151; }
     .slip-signatures strong { display: block; margin-bottom: 4px; }
-    .signature-name { width: 140px; border-bottom: 1px solid #172033; margin: 8px 0 4px; height: 24px; }
-    .acceptance { margin-top: 16px; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 11px; }
-    .acceptance > div:first-child { font-weight: 700; text-transform: uppercase; font-size: 11px; margin-bottom: 6px; }
-    .signature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; font-size: 10px; }
-    .signature-grid em { color: #64748b; }
+    .signature-name { width: 150px; margin: 18px auto 0; border-bottom: 1px solid #374151; text-align: center; font-family: 'Brush Script MT', cursive; font-size: 15px; }
+    .acceptance { border-top: 0; text-align: center; font-size: 10px; border: 1.5px solid #374151; border-top: 0; }
+    .acceptance > div:first-child { padding: 4px; border-bottom: 1px solid #374151; background: #f1f5f9; font-weight: 700; font-size: 11px; }
+    .signature-grid { display: grid; grid-template-columns: 1.2fr 1fr 0.8fr; gap: 20px; padding: 18px 8px 2px; }
+    .signature-grid span { border-top: 1px solid #374151; }
+    .signature-grid em { font-style: normal; font-size: 10px; color: #6b7280; }
     @page { size: A4; margin: 0; }
     @media print { .bulk-payslip { page-break-after: always; } }
   </style></head><body>${slips}</body></html>`);
@@ -1097,7 +1144,7 @@ function openBulkPayslipPrint(rows) {
 function renderPayslip(row, { preview = false } = {}) {
   const pd = state.payPeriodDays || row.pay_period_days || 7;
   const periodLabel = getPeriodLabel(pd);
-  const periodStart = periodStartOf(state.week, pd);
+  const periodStart = state.week;
   const weekDates = Array.from({ length: pd }, (_, index) => addDays(periodStart, index));
   const attendanceSet = new Set(
     state.attendance.rows
@@ -1155,8 +1202,13 @@ kvsk.cctv.itsolutions@gmail.com<br>
 
         <div class="slip-line">
           <div><strong>Empleyado:</strong> ${escapeHtml(row.name)}</div>
+          <div><strong>No.:</strong> ${escapeHtml(row.emp_number || '')}</div>
           <div><strong>Arawan:</strong> ${peso.format(row.rate)}/araw</div>
-          <div>            <strong>Katayuan:</strong> ${row.payroll_status === 'generated' ? 'Naka-lock' : row.payment_status === 'paid' ? 'Bayad' : row.payment_status === 'partial' ? 'Partial' : 'Hindi Bayad'}</div>
+        </div>
+        <div class="slip-line" style="border-top:0;">
+          <div><strong>Araw ng Pasok:</strong> ${row.days || dayData.filter(d => d.present).length} araw</div>
+          <div><strong>Katayuan:</strong> ${row.payroll_status === 'generated' ? 'Naka-lock' : row.payment_status === 'paid' ? 'Bayad' : row.payment_status === 'partial' ? 'Partial' : 'Hindi Bayad'}</div>
+          <div></div>
         </div>
 
         <table class="slip-table">
@@ -1188,57 +1240,80 @@ kvsk.cctv.itsolutions@gmail.com<br>
           </tbody>
         </table>
 
-        <table class="slip-table" style="border-top:0;">
+        <table class="slip-table slip-summary" style="border-top:0;">
           <tbody>
-            ${totalBale > 0 ? `
+            <tr class="slip-section-header"><td colspan="2">KABUUANG KITA</td></tr>
             <tr>
-              <td style="width:28%;" class="center">Cash Advance (Bale)</td>
-              <td style="width:20%;" class="num">${peso.format(totalBale)}</td>
-              <td style="width:32%;">Bale Ngayon</td>
-              <td style="width:20%;" class="num"></td>
+              <td style="width:60%;">Sahod (${peso.format(row.rate)} × ${row.days || dayData.filter(d => d.present).length} araw)</td>
+              <td class="num" style="width:40%; color:#166534;">+${peso.format(totalEarnings)}</td>
+            </tr>
+            ${extraPay > 0 ? `
+            <tr>
+              <td>Dagdag Sahod${extraPayNotes ? ' — ' + escapeHtml(extraPayNotes) : ''}</td>
+              <td class="num" style="color:#166534;">+${peso.format(extraPay)}</td>
             </tr>` : ''}
             ${prevUnpaid > 0 ? `
             <tr>
-              <td class="center">Natitira (Dati)</td>
-              <td class="num">${peso.format(prevUnpaid)}</td>
-              <td>Galing sa nakaraan</td>
-              <td class="num">${peso.format(prevUnpaid)}</td>
-            </tr>` : ''}
-            ${extraPay > 0 ? `
-            <tr>
-              <td class="center">Dagdag Sahod</td>
-              <td class="num">${peso.format(extraPay)}</td>
-              <td>${escapeHtml(extraPayNotes || 'Bonus/Dagdag')}</td>
-              <td class="num">+${peso.format(extraPay)}</td>
-            </tr>` : ''}
-            ${balePaid > 0 ? `
-            <tr>
-              <td class="center">Bayad Bale</td>
-              <td class="num" style="color:#166534;">-${peso.format(balePaid)}</td>
-              <td>Bayad sa utang ngayon</td>
-              <td class="num" style="color:#166534;">-${peso.format(balePaid)}</td>
-            </tr>` : ''}
-            ${salaryPaid > 0 ? `
-            <tr>
-              <td class="center">Sahod na Natanggap</td>
-              <td class="num" style="color:#166534;">-${peso.format(salaryPaid)}</td>
-              <td>Natanggap na sahod ngayon</td>
-              <td class="num" style="color:#166534;">-${peso.format(salaryPaid)}</td>
+              <td>Natitira mula sa Nakaraan (Carry Over)</td>
+              <td class="num" style="color:#166534;">+${peso.format(prevUnpaid)}</td>
             </tr>` : ''}
             <tr class="slip-total-row">
-              <td colspan="2" class="center"><strong>NATITIRA PANG SAHOD</strong></td>
-              <td></td>
-              <td class="num"><strong>${peso.format(balance)}</strong></td>
+              <td><strong>Kabuuang Kita</strong></td>
+              <td class="num"><strong>${peso.format(totalEarnings + extraPay + prevUnpaid)}</strong></td>
             </tr>
+            ${balePaid > 0 ? `
             <tr>
-              <td colspan="4">Halaga sa Salita: <strong>${amountInWords(balance)}</strong></td>
-            </tr>
+              <td>Bayad Bale (Utang)</td>
+              <td class="num" style="color:#dc2626;">-${peso.format(balePaid)}</td>
+            </tr>` : ''}
           </tbody>
         </table>
 
-        <div class="slip-summary-footer">
-          <div><strong>BALENSA (Utang):</strong> ${peso.format(row.remaining_bale_balance)}</div>            <div><strong>Panahon:</strong> ${formatSlipDate(periodStart)} - ${formatSlipDate(addDays(periodStart, pd - 1))}</div>
-        </div>
+        <table class="slip-table slip-summary" style="border-top:0;">
+          <tbody>
+            <tr class="slip-total-row">
+              <td style="width:60%;"><strong>SAHOD NA TATANGGAPIN</strong></td>
+              <td class="num" style="width:40%;"><strong>${peso.format(Math.max(totalEarnings + extraPay + prevUnpaid - balePaid, 0))}</strong></td>
+            </tr>
+            ${salaryPaid > 0 ? `
+            <tr>
+              <td>Bayad Sahod</td>
+              <td class="num" style="color:#dc2626;">-${peso.format(salaryPaid)}</td>
+            </tr>
+            <tr class="slip-total-row">
+              <td><strong>BALANSA</strong></td>
+              <td class="num"><strong>${peso.format(Math.max(totalEarnings + extraPay + prevUnpaid - balePaid - salaryPaid, 0))}</strong></td>
+            </tr>` : ''}
+          </tbody>
+        </table>
+
+        ${(row.total_bale || 0) > 0 || (row.remaining_bale_balance || 0) > 0 ? `
+        <table class="slip-table slip-summary" style="border-top:0;">
+          <tbody>
+            <tr class="slip-section-header"><td colspan="2">BALENSA NG BALE (Cash Advance / Utang)</td></tr>
+            <tr>
+              <td style="width:60%;">Utang mula sa Nakaraan</td>
+              <td class="num" style="width:40%;">${peso.format(row.previous_bale_balance || 0)}</td>
+            </tr>
+            <tr>
+              <td>Bale ngayong Period</td>
+              <td class="num">+${peso.format(row.cash_advance || 0)}</td>
+            </tr>
+            <tr class="slip-total-row">
+              <td><strong>Kabuuang Utang (Bale)</strong></td>
+              <td class="num"><strong>${peso.format(row.total_bale || 0)}</strong></td>
+            </tr>
+            ${balePaid > 0 ? `
+            <tr>
+              <td>Bayad Bale ngayong Period</td>
+              <td class="num" style="color:#166534;">-${peso.format(balePaid)}</td>
+            </tr>` : ''}
+            <tr class="slip-total-row">
+              <td><strong>Natitirang Utang (Bale)</strong></td>
+              <td class="num"><strong style="color:#dc2626;">${peso.format(row.remaining_bale_balance || 0)}</strong></td>
+            </tr>
+          </tbody>
+        </table>` : ''}
 
         <div class="slip-signatures">
           <div>

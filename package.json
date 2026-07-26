@@ -7,7 +7,40 @@
   "license": "MIT",
   "scripts": {
     "start": "node server.js",
-    "electron": "electron ."
+    "electron": "electron .",
+    "build": "electron-builder",
+    "build:portable": "electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.kvsk.payroll",
+    "productName": "KVSK Payroll",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*",
+      "!dist",
+      "!node_modules/electron-builder",
+      "!node_modules/electron"
+    ],
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "icon": null
+    },
+    "extraResources": [
+      {
+        "from": "public/uploads",
+        "to": "public/uploads",
+        "filter": ["**/*"]
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
@@ -21,6 +54,7 @@
     "pg": "^8.16.3"
   },
   "devDependencies": {
-    "electron": "^35.0.0"
+    "electron": "^35.0.0",
+    "electron-builder": "^26.15.3"
   }
 }

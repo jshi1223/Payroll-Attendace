@@ -231,7 +231,7 @@ function calculatePayrollWeekState({ previousBaleBalance = 0, previousUnpaidBala
   const salaryExcessForExtra = Math.max(salaryPaidAmount - paymentToPreviousUnpaid - currentSalaryPaidAmount, 0);
   const effectiveExtraPay = Math.max(extraPayment - salaryExcessForExtra, 0);
 
-  const balance = Math.max(previousUnpaidBalance - paymentToPreviousUnpaid, 0) + currentUnpaidBalance + effectiveExtraPay;
+  const balance = Math.max(previousUnpaidBalance - paymentToPreviousUnpaid, 0) + currentUnpaidBalance;
   const paymentLimit = Math.max(0, previousUnpaidBalance + Math.max(salary, 0) + extraPayment) + (deductBale && salary === 0 ? totalBale : 0);
 
   return {
@@ -938,8 +938,7 @@ app.delete('/api/cash-advances/:id', requireAuth, requireAdmin, async (req, res)
   const existing = await pool.query('SELECT * FROM cash_advances WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'C/A record not found.' });
   const rec = existing.rows[0];
-  const weekOf = payrollWeekStartOf(rec.advance_date);
-  if (await isWeekLocked(rec.employee_id, weekOf)) {
+  if (await isDateLockedForEmployee(rec.employee_id, rec.advance_date)) {
     return res.status(403).json({ error: 'Cannot delete: payroll week is locked.' });
   }
   await pool.query('DELETE FROM cash_advances WHERE id = $1', [req.params.id]);
@@ -1032,8 +1031,7 @@ app.delete('/api/extra-payments/:id', requireAuth, requireAdmin, async (req, res
   const existing = await pool.query('SELECT * FROM extra_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Extra payment not found.' });
   const rec = existing.rows[0];
-  const weekOf = payrollWeekStartOf(rec.extra_date);
-  if (await isWeekLocked(rec.employee_id, weekOf)) {
+  if (await isDateLockedForEmployee(rec.employee_id, rec.extra_date)) {
     return res.status(403).json({ error: 'Cannot delete: payroll week is locked.' });
   }
   await pool.query('DELETE FROM extra_payments WHERE id = $1', [req.params.id]);
@@ -1128,8 +1126,7 @@ app.delete('/api/salary-payments/:id', requireAuth, requireAdmin, async (req, re
   const existing = await pool.query('SELECT * FROM salary_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Salary payment not found.' });
   const rec = existing.rows[0];
-  const weekOf = payrollWeekStartOf(rec.payment_date);
-  if (await isWeekLocked(rec.employee_id, weekOf)) {
+  if (await isDateLockedForEmployee(rec.employee_id, rec.payment_date)) {
     return res.status(403).json({ error: 'Cannot delete: payroll week is locked.' });
   }
   await pool.query('DELETE FROM salary_payments WHERE id = $1', [req.params.id]);
@@ -1224,8 +1221,7 @@ app.delete('/api/bale-payments/:id', requireAuth, requireAdmin, async (req, res)
   const existing = await pool.query('SELECT * FROM bale_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Bale payment not found.' });
   const rec = existing.rows[0];
-  const weekOf = payrollWeekStartOf(rec.payment_date);
-  if (await isWeekLocked(rec.employee_id, weekOf)) {
+  if (await isDateLockedForEmployee(rec.employee_id, rec.payment_date)) {
     return res.status(403).json({ error: 'Cannot delete: payroll week is locked.' });
   }
   await pool.query('DELETE FROM bale_payments WHERE id = $1', [req.params.id]);
@@ -1511,8 +1507,8 @@ app.post('/api/payroll/:employeeId/generate', requireAuth, async (req, res) => {
     [employeeId, weekStart, weekEnd]
   );
   const d = hasData.rows[0];
-  if (!d.has_attendance && !d.has_salary && !d.has_ca && !d.has_bale && !d.has_extra) {
-    return res.status(400).json({ error: 'Cannot generate payslip: no attendance or transactions found for this period. Add at least one transaction first.' });
+  if (!d.has_salary && !d.has_bale && !d.has_extra) {
+    return res.status(400).json({ error: 'Cannot generate payslip: walang bayad na transaction para sa period na ito. Magbayad muna bago mag-generate ng payslip.' });
   }
   const result = await pool.query(
     `INSERT INTO payroll_statuses (employee_id, week_start, status, updated_by, updated_at)
