@@ -1,3 +1,106 @@
+/* ── Reusable Mini Calendar ── */
+function miniCalendarGridHTML(dateStr, highlightDates, todayStr) {
+  const [y, m] = dateStr.split('-').map(Number);
+  const firstDay = new Date(y, m - 1, 1).getDay();
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const hl = highlightDates instanceof Set ? highlightDates : null;
+  let cells = '';
+  for (let i = 0; i < firstDay; i++) cells += '<span class="att-mc-empty"></span>';
+  for (let d = 1; d <= daysInMonth; d++) {
+    const ds = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const hasAtt = hl && hl.has(ds);
+    const isToday = ds === todayStr;
+    const isSel = ds === dateStr;
+    const cls = hl
+      ? (hasAtt ? 'mc-present' : 'mc-absent')
+      : 'mc-neutral';
+    cells += `<span class="att-mc-day ${cls}${isToday ? ' mc-today' : ''}${isSel ? ' mc-selected' : ''}" data-mc-date="${ds}">${d}</span>`;
+  }
+  return cells;
+}
+
+function miniDatePickerHTML(id, label, dateStr, opts = {}) {
+  const { highlightDates, hideLabel, inputName, calendarUrl } = opts;
+  const display = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  const monthTitle = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const nameAttr = inputName ? ` name="${inputName}"` : '';
+  const hlUrl = calendarUrl ? ` data-mc-hl-url="${calendarUrl}"` : '';
+  return `
+    <div class="att-date-picker-wrap" data-mc-id="${id}"${hlUrl}>
+      <input type="date" id="${id}" value="${dateStr}" class="att-hidden-date"${nameAttr}>
+      <button type="button" class="att-date-trigger" data-mc-trigger="${id}">
+        ${hideLabel ? '' : `<span class="att-date-label">${label}</span>`}
+        <span class="att-date-value">${display}</span>
+      </button>
+      <div class="att-mini-calendar" data-mc-panel="${id}">
+        <div class="att-mc-header">
+          <button class="att-mc-nav" data-mc-prev="${id}">‹</button>
+          <span class="att-mc-title" data-mc-title="${id}">${monthTitle}</span>
+          <button class="att-mc-nav" data-mc-next="${id}">›</button>
+        </div>
+        <div class="att-mc-weekdays">
+          ${['Su','Mo','Tu','We','Th','Fr','Sa'].map(d => `<span>${d}</span>`).join('')}
+        </div>
+        <div class="att-mc-days" data-mc-grid="${id}">
+          ${miniCalendarGridHTML(dateStr, highlightDates, todayInManila())}
+        </div>
+      </div>
+    </div>`;
+}
+
+function bindMiniCalendar(id, onSelect) {
+  const wrap = document.querySelector(`[data-mc-id="${id}"]`);
+  if (!wrap) return;
+  const trigger = wrap.querySelector(`[data-mc-trigger="${id}"]`);
+  const grid = wrap.querySelector(`[data-mc-grid="${id}"]`);
+  const titleEl = wrap.querySelector(`[data-mc-title="${id}"]`);
+  const input = wrap.querySelector('input');
+  const valueEl = wrap.querySelector('.att-date-value');
+  const hlUrl = wrap.dataset.mcHlUrl || null;
+  trigger?.addEventListener('click', e => { e.stopPropagation(); wrap.classList.toggle('open'); });
+  const doSelect = async (dateStr) => {
+    input.value = dateStr;
+    if (valueEl) valueEl.textContent = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+    wrap.classList.remove('open');
+    await onSelect(dateStr);
+  };
+  grid?.querySelectorAll('.att-mc-day').forEach(el => {
+    el.addEventListener('click', () => doSelect(el.dataset.mcDate));
+  });
+  const navigate = async (offset) => {
+    const [y, m] = input.value.split('-').map(Number);
+    const dt = new Date(y, m - 1 + offset, 1);
+    const next = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-01`;
+    input.value = next;
+    titleEl.textContent = new Date(next + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    let hl = null;
+    if (hlUrl) {
+      hl = await fetchCalendarDates(hlUrl, monthKeyFromDate(next));
+    }
+    grid.innerHTML = miniCalendarGridHTML(next, hl, todayInManila());
+    grid.querySelectorAll('.att-mc-day').forEach(el2 => {
+      el2.addEventListener('click', () => doSelect(el2.dataset.mcDate));
+    });
+  };
+  wrap.querySelector(`[data-mc-prev="${id}"]`)?.addEventListener('click', e => { e.stopPropagation(); navigate(-1); });
+  wrap.querySelector(`[data-mc-next="${id}"]`)?.addEventListener('click', e => { e.stopPropagation(); navigate(1); });
+  document.addEventListener('click', e => { if (wrap && !wrap.contains(e.target)) wrap.classList.remove('open'); });
+}
+
+async function fetchCalendarDates(url, monthKey) {
+  try {
+    const data = await api(`${url}?month=${monthKey}`);
+    return new Set(data.dates || []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function monthKeyFromDate(dateStr) {
+  const [y, m] = dateStr.split('-').map(Number);
+  return `${y}-${String(m).padStart(2, '0')}`;
+}
+
 /* ── Helpers ── */
 function titleForView() {
   const pd = state.payPeriodDays || 7;
@@ -10,7 +113,7 @@ function titleForView() {
   }[state.view];
 }
 
-function weekToolbar(className = '') {
+function weekToolbar(className = '', opts = {}) {
   const pd = state.payPeriodDays || 7;
   const periodStart = state.week;
   const isLocked = state.payroll?.isPeriodLocked;
@@ -18,19 +121,13 @@ function weekToolbar(className = '') {
   const prevLabel = (pd > 7 && isLocked) ? 'Previous Period' : (pd > 7 ? 'Previous Week' : '← Previous');
   return `
     <div class="toolbar module-toolbar no-print${className ? ' ' + className : ''}">
-      <label>Week Start<input type="date" id="weekInput" value="${periodStart}"></label>
+      ${miniDatePickerHTML('weekInput', 'Week Start', periodStart, { highlightDates: opts.highlightDates, calendarUrl: '/api/attendance/calendar' })}
       <label>Pay Period
         <select id="payPeriodSelect">
           <option value="7" ${pd === 7 ? 'selected' : ''}>Weekly (7 days)</option>
           <option value="14" ${pd === 14 ? 'selected' : ''}>Semi-monthly (14 days)</option>
-          <option value="21" ${pd === 21 ? 'selected' : ''}>3 Weeks (21 days)</option>
-          <option value="30" ${pd === 30 ? 'selected' : ''}>Monthly (30 days)</option>
-          <option value="custom" ${![7,14,21,30].includes(pd) ? 'selected' : ''}>Custom...</option>
         </select>
       </label>
-      <div id="customPeriodWrap" style="display:${[7,14,21,30].includes(pd) ? 'none' : 'inline-block'};">
-        <label>Days<input type="number" id="customPeriodDays" min="1" value="${pd}" style="width:70px;"></label>
-      </div>
       <label>Search<input id="searchInput" value="${state.searchPayroll}" placeholder="Type employee name or ID..."></label>
       <button class="ghost" id="prevPeriod">← ${prevLabel}</button>
       <button class="ghost" id="nextPeriod">${nextLabel} →</button>
@@ -40,8 +137,8 @@ function weekToolbar(className = '') {
 
 function bindWeekToolbar() {
   const pd = state.payPeriodDays || 7;
-  document.querySelector('#weekInput')?.addEventListener('change', async event => {
-    state.week = payrollWeekStartOf(event.target.value);
+  bindMiniCalendar('weekInput', async (dateStr) => {
+    state.week = payrollWeekStartOf(dateStr);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
@@ -58,44 +155,24 @@ function bindWeekToolbar() {
   }, 250));
   document.querySelector('#payPeriodSelect')?.addEventListener('change', async event => {
     const val = event.target.value;
-    if (val === 'custom') {
-      document.querySelector('#customPeriodWrap').style.display = 'inline-block';
-      const customInput = document.querySelector('#customPeriodDays');
-      state.payPeriodDays = Math.max(1, Number(customInput?.value) || 7);
-    } else {
-      document.querySelector('#customPeriodWrap').style.display = 'none';
-      state.payPeriodDays = Number(val);
-    }
-    /* If current period is locked, advance to next period */
+    state.payPeriodDays = Number(val);
+    const newPd = Number(val);
     state.week = payrollWeekStartOf(state.week);
     if (state.payroll?.isPeriodLocked) {
-      state.week = addDays(state.week, 7);
-    }
-    state.payrollWeek = state.week;
-    saveUiState();
-    await refresh();
-  });
-  document.querySelector('#customPeriodDays')?.addEventListener('change', async event => {
-    state.payPeriodDays = Math.max(1, Number(event.target.value) || 7);
-    /* If current period is locked, advance to next period */
-    state.week = payrollWeekStartOf(state.week);
-    if (state.payroll?.isPeriodLocked) {
-      state.week = addDays(state.week, 7);
+      state.week = addDays(state.week, newPd);
     }
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#prevPeriod')?.addEventListener('click', async () => {
-    const step = state.payroll?.isPeriodLocked ? pd : 7;
-    state.week = addDays(state.week, -step);
+    state.week = addDays(state.week, -pd);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#nextPeriod')?.addEventListener('click', async () => {
-    const step = state.payroll?.isPeriodLocked ? pd : 7;
-    state.week = addDays(state.week, step);
+    state.week = addDays(state.week, pd);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
@@ -203,33 +280,33 @@ function renderDashboard() {
     <section class="summary">
       <div class="summary-card" style="border-left-color: #0f766e;">
         <span class="card-icon">E</span>
-        <span>Aktibong Empleyado</span>
+        <span>Active Employees</span>
         <strong>${empCount}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #b45309;">
         <span class="card-icon">P</span>
-        <span>Pumasok Ngayon</span>
+        <span>Present Today</span>
         <strong>${attendanceToday}</strong>
         <span class="card-sub">${state.currentDate}</span>
       </div>
       <div class="summary-card" style="border-left-color: #075985;">
         <span class="card-icon">S</span>
-        <span>Sahod Ngayong Linggo</span>
+        <span>This Week's Salary</span>
         <strong>${summary ? formatMoney(summary.totalSalary) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #166534;">
         <span class="card-icon">P</span>
-        <span>Natanggap na Sahod</span>
+        <span>Total Paid</span>
         <strong>${summary ? formatMoney(summary.totalPaidAmount) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #c2410c;">
         <span class="card-icon">B</span>
-        <span>Natitira pang Balance</span>
+        <span>Remaining Balance</span>
         <strong>${summary ? formatMoney(summary.totalBalance) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color: #92400e;">
         <span class="card-icon">B</span>
-        <span>BALENSA (utang)</span>
+        <span>Advance Balance</span>
         <strong>${summary ? formatMoney(summary.totalBaleBalance) : '₱0.00'}</strong>
       </div>
     </section>
@@ -295,7 +372,7 @@ function renderDashboard() {
 }
 
 /* ── Payroll ── */
-function renderPayroll() {
+async function renderPayroll() {
   const allRows = state.searchPayroll
     ? state.payroll.rows.filter(r => {
         const s = state.searchPayroll.toLowerCase();
@@ -316,8 +393,13 @@ function renderPayroll() {
   const totalCount = state.payroll.rows.length;
   const canBulkPrint = totalCount > 0 && generatedCount === totalCount;
   const pg = paginateRows(allRows, state.pages.payroll || 1);
+  const payrollCalDates = await fetchCalendarDates('/api/attendance/calendar', monthKeyFromDate(state.week));
+  let transCalDates = new Set();
+  if (state.payrollModalEmployee) {
+    transCalDates = await fetchCalendarDates('/api/transactions/calendar', monthKeyFromDate(state.week));
+  }
   shell(`
-    ${weekToolbar()}
+    ${weekToolbar('', { highlightDates: payrollCalDates })}
     <section class="summary">
       <div class="summary-card" style="border-left-color:#0f766e;">
         <span class="card-icon">E</span>
@@ -365,7 +447,7 @@ function renderPayroll() {
       </div>
       <div class="table-wrap">
         <table class="payroll-table">
-          <thead><tr><th title="Unique employee identification number">Numero</th><th title="Full name of employee">Pangalan</th><th title="Daily rate in Philippine Pesos">Arawan</th><th title="Number of days worked this week">Araw</th><th title="Gross salary for this week (Days × Rate)">Sahod</th><th title="Unpaid salary balance carried over from previous weeks">Natitira</th><th title="Bale/cash advance balance carried over from previous weeks">Utang Dati</th><th title="Cash advance (bale) taken this week">Bale</th><th title="Extra payments or bonuses added this week">Dagdag</th><th title="Total bale/cash advance balance including previous">Kab. Utang</th><th title="Amount of salary paid this week">Natanggap</th><th class="col-balance-header" title="Remaining unpaid salary balance after payments">NATITIRA</th><th class="col-bale-header" title="Remaining bale/cash advance balance to repay">BALENSA</th><th title="Payment status: Paid, Partial, or Unpaid">Katayuan</th><th title="Actions available for this employee">Aksyon</th></tr></thead>
+          <thead><tr><th title="Unique employee identification number">ID No.</th><th title="Full name of employee">Name</th><th title="Daily rate in Philippine Pesos">Daily Rate</th><th title="Number of days worked this week">Days</th><th title="Gross salary for this week (Days × Rate)">Salary</th><th title="Unpaid salary balance carried over from previous weeks">Prev. Balance</th><th title="Bale/cash advance balance carried over from previous weeks">Prev. Advance</th><th title="Cash advance (bale) taken this week">Advance</th><th title="Extra payments or bonuses added this week">Extra Pay</th><th title="Total bale/cash advance balance including previous">Total Advance</th><th title="Amount of salary paid this week">Paid</th><th class="col-balance-header" title="Remaining unpaid salary balance after payments">BALANCE</th><th class="col-bale-header" title="Remaining bale/cash advance balance to repay">ADV. BAL.</th><th title="Payment status: Paid, Partial, or Unpaid">Status</th><th title="Actions available for this employee">Action</th></tr></thead>
           <tbody>
             ${pg.rows.map(row => {
               const flash = state._flash && state._flash.type === 'payroll' && Number(state._flash.id) === Number(row.employee_id);
@@ -386,8 +468,10 @@ function renderPayroll() {
                 <td class="col-bale"><strong class="bale-amount">${formatMoney(row.remaining_bale_balance)}</strong></td>
               <td><span class="badge ${row.payroll_status === 'generated' ? 'generated' : row.payment_status} status-badge">${row.payroll_status === 'generated' ? (row.payment_status === 'paid' ? 'Paid/Generated' : row.payment_status === 'partial' ? 'Partial/Generated' : 'Unpaid/Generated') : row.payment_status === 'paid' ? 'Paid' : row.payment_status === 'partial' ? 'Partial' : 'Unpaid'}</span></td>
               <td class="actions">${row.payroll_status === 'generated'
-                ? `<span class="badge badge-locked">Locked</span><button class="ghost" data-unlock-payroll="${row.employee_id}">Unlock</button>`
-                : `<button class="ghost" data-manage-employee="${row.employee_id}">Manage</button>`}</td>
+                ? (row.locked_period_start && Number(row.pay_period_days) === state.payPeriodDays
+                  ? `<span class="badge badge-locked">Locked</span><button class="ghost" data-unlock-payroll="${row.employee_id}" data-unlock-week="${row.locked_period_start}">Unlock</button>`
+                  : `<span class="badge badge-locked">Locked</span>`)
+                : `<button class="primary manage-btn" data-manage-employee="${row.employee_id}">Manage</button>`}</td>
               </tr>
             `;
             }).join('') || `<tr><td colspan="15" class="empty-state"><span class="empty-icon">--</span><strong>No Payroll Data</strong><span>No records found for this week. Try changing the week or add attendance records first.</span></td></tr>`}
@@ -396,7 +480,7 @@ function renderPayroll() {
       </div>
       ${paginationHTML(pg, 'payroll')}
     </section>
-    ${state.payrollModalEmployee ? payrollEntryModal(state.payrollModalEmployee) : ''}
+    ${state.payrollModalEmployee ? payrollEntryModal(state.payrollModalEmployee, transCalDates) : ''}
   `);
   document.querySelector('#exportCSVBtn')?.addEventListener('click', () => {
     const exportData = allRows.map(row => ({
@@ -437,10 +521,10 @@ function renderPayroll() {
       try {
         await api(`/api/payroll/${button.dataset.unlockPayroll}/unlock`, {
           method: 'POST',
-          body: JSON.stringify({ weekStart: state.week })
+          body: JSON.stringify({ weekStart: button.dataset.unlockWeek })
         });
         showToast('Payroll unlocked. You can manage transactions again.');
-        await partialRefresh(['payroll', 'attendance', 'salaryPayments', 'advances', 'balePayments', 'extraPayments']);
+        await refresh();
       } catch (error) {
         showToast(error.message, 'error');
       }
@@ -451,14 +535,22 @@ function renderPayroll() {
 }
 
 /* ── Attendance ── */
-function renderAttendance() {
+async function renderAttendance() {
   const dayRows = state.attendance.rows.filter(row => row.work_date === state.attendanceDate);
   const pg = paginateRows(dayRows, state.pages.attendance || 1);
   const presentEmployeeIds = new Set(dayRows.map(row => Number(row.employee_id)));
   const availableEmployees = state.employees.filter(employee => !presentEmployeeIds.has(Number(employee.id)));
+  const [y, m] = state.attendanceDate.split('-').map(Number);
+  const monthKey = `${y}-${String(m).padStart(2,'0')}`;
+  try {
+    const calData = await api(`/api/attendance/calendar?month=${monthKey}`);
+    state.calendarDates = calData.dates || [];
+  } catch (e) {
+    state.calendarDates = [];
+  }
   shell(`
     <div class="toolbar module-toolbar no-print toolbar-end">
-      <label>Date<input type="date" id="attendanceDate" value="${state.attendanceDate}"></label>
+      ${miniDatePickerHTML('attendanceDate', 'Date:', state.attendanceDate, { highlightDates: new Set(state.calendarDates), calendarUrl: '/api/attendance/calendar' })}
       <label>Search<input id="searchInput" value="${state.searchAttendance}" placeholder="Type employee name or ID..."></label>
       <button class="ghost" id="prevDay">Previous Day</button>
       <button class="ghost" id="nextDay">Next Day</button>
@@ -505,7 +597,6 @@ function renderAttendance() {
             'Type to search employee...'
           )}
         </label>
-        <label>Notes<input name="notes" placeholder="e.g. Present, Late 30min, OT 2hrs"></label>
         <button class="primary" ${availableEmployees.length ? '' : 'disabled'}>Add Attendance</button>
       </form>
       <div class="table-wrap">
@@ -518,7 +609,6 @@ function renderAttendance() {
               <th title="Attendance status — always Present if recorded">Status</th>
               <th title="Daily rate at time of attendance">Rate</th>
               <th title="Payroll period start and end for this employee">Payroll Period</th>
-              <th title="Optional notes about attendance (e.g., Late, OT)">Notes</th>
               <th title="Delete this attendance record">Actions</th>
             </tr>
           </thead>
@@ -536,10 +626,9 @@ function renderAttendance() {
                 <td><span class="badge paid">Present</span></td>
                 <td>${peso.format(row.rate_snapshot)}</td>
                 <td><span class="period-range">${formatShortDate(pStart)} – ${formatShortDate(pEnd)}</span>${isLocked ? ' <span class="badge badge-locked" title="Payroll generated for this period">Locked</span>' : ''}</td>
-                <td>${row.notes ? escapeHtml(row.notes) : '<span class="muted">—</span>'}</td>
                 <td class="actions">${isLocked ? '<span class="muted" title="Cannot delete — payroll is locked" style="font-size:12px;">🔒 Locked</span>' : deleteButton('attendance', row.id)}</td>
               </tr>`;
-            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>Select an employee from the dropdown above and click "Add Attendance" to record their attendance for this date.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>Select an employee from the dropdown above and click "Add Attendance" to record their attendance for this date.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -547,9 +636,16 @@ function renderAttendance() {
     </section>
   `);
   bindPagination('attendance', refresh);
+  bindMiniCalendar('attendanceDate', async (dateStr) => {
+    state.attendanceDate = dateStr;
+    state.week = payrollWeekStartOf(state.attendanceDate);
+    state.payrollWeek = state.week;
+    saveUiState();
+    await refresh();
+  });
   document.querySelector('#attendanceDate').addEventListener('change', async event => {
     state.attendanceDate = event.target.value;
-    state.week = weekStartOf(state.attendanceDate);
+    state.week = payrollWeekStartOf(state.attendanceDate);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
@@ -566,14 +662,14 @@ function renderAttendance() {
   }, 250));
   document.querySelector('#prevDay').addEventListener('click', async () => {
     state.attendanceDate = addDays(state.attendanceDate, -1);
-    state.week = weekStartOf(state.attendanceDate);
+    state.week = payrollWeekStartOf(state.attendanceDate);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
   });
   document.querySelector('#nextDay').addEventListener('click', async () => {
     state.attendanceDate = addDays(state.attendanceDate, 1);
-    state.week = weekStartOf(state.attendanceDate);
+    state.week = payrollWeekStartOf(state.attendanceDate);
     state.payrollWeek = state.week;
     saveUiState();
     await refresh();
@@ -594,12 +690,11 @@ function renderAttendance() {
         method: 'POST',
         body: JSON.stringify({
           employee_id: payload.employee_id,
-          work_date: state.attendanceDate,
-          notes: payload.notes || 'Present'
+          work_date: state.attendanceDate
         })
       });
       showToast('Attendance recorded.');
-      state.week = weekStartOf(state.attendanceDate);
+      state.week = payrollWeekStartOf(state.attendanceDate);
       state.payrollWeek = state.week;
       await partialRefresh(['attendance', 'payroll']);
     } catch (error) {
@@ -823,11 +918,15 @@ function renderArchive() {
 }
 
 /* ── Cash Advance standalone view ── */
-function renderCashAdvance() {
+async function renderCashAdvance() {
   const editing = state.editingCashAdvance;
   const pg = paginateRows(state.advances.rows, state.pages.cashAdvance || 1);
+  const [attCalDates, cashCalDates] = await Promise.all([
+    fetchCalendarDates('/api/attendance/calendar', monthKeyFromDate(state.week)),
+    fetchCalendarDates('/api/cash-advances/calendar', monthKeyFromDate(state.week))
+  ]);
   shell(`
-    ${weekToolbar('toolbar-end')}
+    ${weekToolbar('toolbar-end', { highlightDates: attCalDates })}
     <section class="panel">
       <form class="inline-form" id="cashForm">
         <input type="hidden" name="id" value="${editing?.id || ''}">
@@ -837,7 +936,7 @@ function renderCashAdvance() {
           </select>
         </label>
         <label>Amount<input name="amount" type="number" min="0.01" step="0.01" value="${editing?.amount || ''}" required></label>
-        <label>Date<input name="advance_date" type="date" value="${editing?.advance_date || todayInManila()}" required></label>
+        <label>Date${miniDatePickerHTML('advanceDate', '', editing?.advance_date || todayInManila(), { inputName: 'advance_date', highlightDates: cashCalDates, calendarUrl: '/api/cash-advances/calendar' })}</label>
         <label>Notes<input name="notes" value="${escapeHtml(editing?.notes || '')}"></label>
         ${editing ? '<button class="ghost" type="button" id="cancelCashEdit">Cancel Edit</button>' : ''}
         <button class="primary">${editing ? 'Update C/A' : 'Add C/A'}</button>
@@ -863,6 +962,7 @@ function renderCashAdvance() {
   `);
   bindPagination('cashAdvance', refresh);
   bindWeekToolbar();
+  bindMiniCalendar('advanceDate', () => {});
   document.querySelector('#cancelCashEdit')?.addEventListener('click', () => {
     state.editingCashAdvance = null;
     renderCashAdvance();
@@ -1066,7 +1166,7 @@ function openBulkPayslipPrint(rows) {
         <div class="slip-signatures">
           <div>
             <strong>Inihanda ni:</strong>
-            <div class="signature-name">KVSK</div>
+            <div class="signature-name">Karl Vincent S. Katigbak</div>
             <span>May-ari</span>
           </div>
           <div></div>
@@ -1318,7 +1418,7 @@ kvsk.cctv.itsolutions@gmail.com<br>
         <div class="slip-signatures">
           <div>
             <strong>Inihanda ni:</strong>
-            <div class="signature-name">KVSK</div>
+            <div class="signature-name">Karl Vincent S. Katigbak</div>
             <span>May-ari</span>
           </div>
           <div></div>
@@ -1335,7 +1435,7 @@ kvsk.cctv.itsolutions@gmail.com<br>
       </div>
       <div class="actions no-print" style="margin-top:16px; justify-content:center;">
         <button class="ghost" id="backPayroll">Back</button>
-        ${preview ? '' : '<button class="primary" onclick="window.print()">Print</button><button class="primary" id="downloadPdfBtn">Download PDF</button>'}
+        ${preview ? '' : `<button class="primary" onclick="window.electronAPI ? window.electronAPI.printPage() : window.print()">Print</button><button class="primary" id="downloadPdfBtn">Download PDF</button>`}
       </div>
     </section>
   `);

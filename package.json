@@ -1,6 +1,6 @@
 {
   "name": "kvsk-payroll",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "KVSK Payroll & Attendance System - Desktop",
   "main": "main.js",
   "author": "KVSK",
@@ -31,6 +31,10 @@
       "icon": null
     },
     "extraResources": [
+      {
+        "from": ".env",
+        "to": ".env"
+      },
       {
         "from": "public/uploads",
         "to": "public/uploads",

@@ -99,6 +99,11 @@ function requireAdmin(req, res, next) {
 }
 
 function parseDateOnly(dateInput) {
+  if (dateInput instanceof Date) return new Date(Date.UTC(dateInput.getFullYear(), dateInput.getMonth(), dateInput.getDate()));
+  if (typeof dateInput === 'string' && dateInput.includes('T')) {
+    const d = new Date(dateInput);
+    return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  }
   const value = typeof dateInput === 'string' ? dateInput.slice(0, 10) : todayInManila();
   const [year, month, day] = value.split('-').map(Number);
   return new Date(Date.UTC(year, month - 1, day));
@@ -209,7 +214,7 @@ function calculatePayrollWeekState({ previousBaleBalance = 0, previousUnpaidBala
   const currentSalaryPaidAmount = Math.min(Math.max(salaryPaidAmount - paymentToPreviousUnpaid, 0), salary);
   const totalBale = previousBaleBalance + cashAdvance;
 
-  let baleDeduction, remainingBaleBalance, takeHome;
+  let baleDeduction, remainingBaleBalance, takeHome, currentUnpaidBalance;
   if (deductBale && salary === 0) {
     // When walang pasok (no salary), payment goes directly to reduce bale
     const afterPreviousUnpaid = Math.max(salaryPaidAmount - paymentToPreviousUnpaid, 0);
@@ -253,6 +258,14 @@ async function assertPaymentWithinBalance(employee_id, paymentDate, newAmount, t
   const weekStart = periodStartOf(paymentDate, empPeriodDays);
   const weekEnd = addDays(weekStart, empPeriodDays - 1);
 
+  const salaryParams = [employee_id, weekStart, weekEnd];
+  const salaryExclude = (type === 'salary' && excludeId) ? ` AND id != $4` : '';
+  if (salaryExclude) salaryParams.push(Number(excludeId));
+
+  const baleParams = [employee_id, weekStart, weekEnd];
+  const baleExclude = (type === 'bale' && excludeId) ? ` AND id != $4` : '';
+  if (baleExclude) baleParams.push(Number(excludeId));
+
   const [totals, carryovers, payStatus, salaryPays, balePays, extraPays] = await Promise.all([
     pool.query(`
       WITH attendance AS (
@@ -274,14 +287,12 @@ async function assertPaymentWithinBalance(employee_id, paymentDate, newAmount, t
       [employee_id, weekStart]),
     pool.query(`SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS total
       FROM salary_payments
-      WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3
-        ${type === 'salary' && excludeId ? `AND id != ${Number(excludeId)}` : ''}`,
-      [employee_id, weekStart, weekEnd]),
+      WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3${salaryExclude}`,
+      salaryParams),
     pool.query(`SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS total
       FROM bale_payments
-      WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3
-        ${type === 'bale' && excludeId ? `AND id != ${Number(excludeId)}` : ''}`,
-      [employee_id, weekStart, weekEnd]),
+      WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3${baleExclude}`,
+      baleParams),
     pool.query(`SELECT COALESCE(SUM(amount), 0)::numeric(12,2) AS total
       FROM extra_payments
       WHERE employee_id = $1 AND extra_date BETWEEN $2 AND $3`,
@@ -824,16 +835,100 @@ app.get('/api/attendance', requireAuth, async (req, res) => {
        CASE WHEN ps.status = 'generated' THEN true ELSE false END AS locked
      FROM attendance_logs a
      JOIN employees e ON e.id = a.employee_id
-     LEFT JOIN payroll_statuses ps ON ps.employee_id = a.employee_id
-       AND ps.status = 'generated'
-       AND a.work_date >= ps.week_start
-       AND a.work_date < ps.week_start + (e.pay_period_days || ' days')::interval
+      LEFT JOIN LATERAL (
+        SELECT status FROM payroll_statuses ps2
+        WHERE ps2.employee_id = a.employee_id
+          AND ps2.status = 'generated'
+          AND a.work_date >= ps2.week_start
+          AND a.work_date < ps2.week_start + (e.pay_period_days || ' days')::interval
+        ORDER BY ps2.week_start DESC
+        LIMIT 1
+      ) ps ON true
      WHERE a.work_date BETWEEN $1 AND $2
        AND (e.emp_number ILIKE $3 OR e.name ILIKE $3)
      ORDER BY a.work_date DESC, e.name ASC`,
-    [weekStart, weekEnd, search]
+     [weekStart, weekEnd, search]
   );
   res.json({ weekStart, weekEnd, rows: result.rows });
+});
+
+app.get('/api/attendance/calendar', requireAuth, async (req, res) => {
+  const month = req.query.month;
+  if (!month) return res.json({ dates: [] });
+  const monthStart = month + '-01';
+  const parts = month.split('-');
+  const yr = parseInt(parts[0], 10);
+  const mo = parseInt(parts[1], 10);
+  const lastDay = new Date(Date.UTC(yr, mo, 0)).getUTCDate();
+  const monthEnd = month + '-' + String(lastDay).padStart(2, '0');
+  const result = await pool.query(
+    `SELECT DISTINCT to_char(work_date, 'YYYY-MM-DD') AS work_date FROM attendance_logs WHERE work_date BETWEEN $1 AND $2`,
+    [monthStart, monthEnd]
+  );
+  res.json({ dates: result.rows.map(r => r.work_date) });
+});
+
+app.get('/api/payroll/calendar', requireAuth, async (req, res) => {
+  const month = req.query.month;
+  if (!month) return res.json({ dates: [] });
+  const monthStart = month + '-01';
+  const parts = month.split('-');
+  const yr = parseInt(parts[0], 10);
+  const mo = parseInt(parts[1], 10);
+  const lastDay = new Date(Date.UTC(yr, mo, 0)).getUTCDate();
+  const monthEnd = month + '-' + String(lastDay).padStart(2, '0');
+  const result = await pool.query(
+    `SELECT DISTINCT to_char(week_start, 'YYYY-MM-DD') AS date FROM payroll_statuses WHERE week_start BETWEEN $1 AND $2`,
+    [monthStart, monthEnd]
+  );
+  res.json({ dates: result.rows.map(r => r.date) });
+});
+
+app.get('/api/cash-advances/calendar', requireAuth, async (req, res) => {
+  const month = req.query.month;
+  if (!month) return res.json({ dates: [] });
+  const monthStart = month + '-01';
+  const parts = month.split('-');
+  const yr = parseInt(parts[0], 10);
+  const mo = parseInt(parts[1], 10);
+  const lastDay = new Date(Date.UTC(yr, mo, 0)).getUTCDate();
+  const monthEnd = month + '-' + String(lastDay).padStart(2, '0');
+  const result = await pool.query(
+    `SELECT DISTINCT to_char(advance_date, 'YYYY-MM-DD') AS date FROM cash_advances WHERE advance_date BETWEEN $1 AND $2`,
+    [monthStart, monthEnd]
+  );
+  res.json({ dates: result.rows.map(r => r.date) });
+});
+
+app.get('/api/transactions/calendar', requireAuth, async (req, res) => {
+  const month = req.query.month;
+  const employeeId = req.query.employee_id;
+  if (!month) return res.json({ dates: [] });
+  const monthStart = month + '-01';
+  const parts = month.split('-');
+  const yr = parseInt(parts[0], 10);
+  const mo = parseInt(parts[1], 10);
+  const lastDay = new Date(Date.UTC(yr, mo, 0)).getUTCDate();
+  const monthEnd = month + '-' + String(lastDay).padStart(2, '0');
+  const params = [monthStart, monthEnd];
+  const empFilter = employeeId ? ` AND employee_id = $3` : '';
+  if (employeeId) params.push(Number(employeeId));
+  const result = await pool.query(
+    `SELECT date FROM (
+      SELECT employee_id, payment_date AS date FROM salary_payments WHERE payment_date BETWEEN $1 AND $2${empFilter}
+      UNION ALL
+      SELECT employee_id, advance_date AS date FROM cash_advances WHERE advance_date BETWEEN $1 AND $2${empFilter}
+      UNION ALL
+      SELECT employee_id, payment_date AS date FROM bale_payments WHERE payment_date BETWEEN $1 AND $2${empFilter}
+      UNION ALL
+      SELECT employee_id, extra_date AS date FROM extra_payments WHERE extra_date BETWEEN $1 AND $2${empFilter}
+     ) sub GROUP BY date`,
+    params
+  );
+  res.json({ dates: result.rows.map(r => {
+    const d = r.date;
+    return d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10);
+  })});
 });
 
 app.post('/api/attendance', requireAuth, async (req, res) => {
@@ -860,11 +955,11 @@ app.post('/api/attendance', requireAuth, async (req, res) => {
 
 app.post('/api/attendance/bulk', requireAuth, async (req, res) => {
   const { weekStart, employeeIds = [], present = [] } = req.body;
-  const start = weekStartOf(weekStart || todayInManila());
+  const start = payrollWeekStartOf(weekStart || todayInManila());
   const end = addDays(start, 6);
   const presentSet = new Set(present.map(item => `${item.employee_id}:${item.work_date}`));
   for (const employeeId of employeeIds) {
-    if (await isWeekLocked(employeeId, start)) {
+    if (await isDateLockedForEmployee(employeeId, start)) {
       return res.status(403).json({ error: `Cannot modify attendance: payroll period is locked for employee ${employeeId}. Unlock the payslip first.` });
     }
   }
@@ -1096,7 +1191,7 @@ app.post('/api/salary-payments', requireAuth, async (req, res) => {
 });
 
 app.put('/api/salary-payments/:id', requireAuth, async (req, res) => {
-  const { employee_id, amount, payment_date, notes = '' } = req.body;
+  const { employee_id, amount, payment_date = todayInManila(), notes = '' } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than zero.' });
@@ -1191,7 +1286,7 @@ app.post('/api/bale-payments', requireAuth, async (req, res) => {
 });
 
 app.put('/api/bale-payments/:id', requireAuth, async (req, res) => {
-  const { employee_id, amount, payment_date, notes = '' } = req.body;
+  const { employee_id, amount, payment_date = todayInManila(), notes = '' } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than zero.' });
@@ -1248,10 +1343,15 @@ app.get('/api/cash-advances', requireAuth, async (req, res) => {
        CASE WHEN ps.status = 'generated' THEN true ELSE false END AS locked
      FROM cash_advances c
      JOIN employees e ON e.id = c.employee_id
-     LEFT JOIN payroll_statuses ps ON ps.employee_id = c.employee_id
-       AND ps.status = 'generated'
-       AND c.advance_date >= ps.week_start
-       AND c.advance_date < ps.week_start + (e.pay_period_days || ' days')::interval
+      LEFT JOIN LATERAL (
+        SELECT status FROM payroll_statuses ps2
+        WHERE ps2.employee_id = c.employee_id
+          AND ps2.status = 'generated'
+          AND c.advance_date >= ps2.week_start
+          AND c.advance_date < ps2.week_start + (e.pay_period_days || ' days')::interval
+        ORDER BY ps2.week_start DESC
+        LIMIT 1
+      ) ps ON true
      WHERE c.advance_date BETWEEN $1 AND $2
        ${employeeFilter}
      ORDER BY c.advance_date DESC, e.name ASC`,
@@ -1385,16 +1485,22 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
        COALESCE(ps.paid_amount, 0)::numeric(12,2) AS legacy_paid_amount,
        COALESCE(bp.bale_paid, 0)::numeric(12,2) AS bale_paid_amount,
        ps.paid_at,
-       ps.status AS payroll_status
+       ps.status AS payroll_status,
+       ps.week_start::text AS locked_period_start
      FROM employees e
      LEFT JOIN attendance a ON a.employee_id = e.id
      LEFT JOIN advances ad ON ad.employee_id = e.id
      LEFT JOIN extras ex ON ex.employee_id = e.id
      LEFT JOIN bale_payments_cte bp ON bp.employee_id = e.id
      LEFT JOIN salary_pay_cte sp ON sp.employee_id = e.id
-     LEFT JOIN payroll_statuses ps ON ps.employee_id = e.id
-       AND ps.week_start <= $1
-       AND $1 < ps.week_start + (e.pay_period_days || ' days')::interval
+      LEFT JOIN LATERAL (
+        SELECT * FROM payroll_statuses ps2
+        WHERE ps2.employee_id = e.id
+          AND ps2.week_start <= $1
+          AND $1 < ps2.week_start + (e.pay_period_days || ' days')::interval
+        ORDER BY ps2.week_start DESC
+        LIMIT 1
+      ) ps ON true
      WHERE (e.emp_number ILIKE $3 OR e.name ILIKE $3)
        ${includeInactive ? '' : 'AND e.active = true'}
      ORDER BY e.name ASC`,
@@ -1495,9 +1601,12 @@ app.post('/api/payroll/:employeeId/generate', requireAuth, async (req, res) => {
   const employeeId = Number(req.params.employeeId);
   const employee = await pool.query('SELECT pay_period_days FROM employees WHERE id = $1', [employeeId]);
   if (!employee.rowCount) return res.status(404).json({ error: 'Employee not found.' });
-  const periodDays = getPeriodDays(employee.rows[0].pay_period_days);
+  const periodDays = getPeriodDays(req.body.payPeriodDays || employee.rows[0].pay_period_days);
   const weekStart = periodStartOf(req.body.weekStart || todayInManila(), periodDays);
   const weekEnd = addDays(weekStart, periodDays - 1);
+  if (periodDays !== getPeriodDays(employee.rows[0].pay_period_days)) {
+    await pool.query('UPDATE employees SET pay_period_days = $1 WHERE id = $2', [periodDays, employeeId]);
+  }
   const hasData = await pool.query(
     `SELECT EXISTS(SELECT 1 FROM attendance_logs WHERE employee_id = $1 AND work_date BETWEEN $2 AND $3) AS has_attendance,
             EXISTS(SELECT 1 FROM salary_payments WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3) AS has_salary,
@@ -1544,12 +1653,13 @@ app.put('/api/payroll/payment', requireAuth, async (req, res) => {
   if (paid_amount === undefined || paid_amount === '' || Number(paid_amount) < 0) {
     return res.status(400).json({ error: 'Valid paid amount is required.' });
   }
-  if (await isWeekLocked(employee_id, periodStartOf(weekStart || todayInManila()))) {
+  const empResult = await pool.query('SELECT pay_period_days FROM employees WHERE id = $1', [employee_id]);
+  if (!empResult.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  const empPeriodDays = getPeriodDays(empResult.rows[0]?.pay_period_days);
+  if (await isWeekLocked(employee_id, periodStartOf(weekStart || todayInManila(), empPeriodDays))) {
     return res.status(403).json({ error: 'Cannot update payment: payroll period is locked. Unlock the payslip first.' });
   }
 
-  const empResult = await pool.query('SELECT pay_period_days FROM employees WHERE id = $1', [employee_id]);
-  const empPeriodDays = getPeriodDays(empResult.rows[0]?.pay_period_days);
   const start = periodStartOf(weekStart || todayInManila(), empPeriodDays);
   const end = addDays(start, empPeriodDays - 1);
   const [totals, carryovers, baleResult] = await Promise.all([
@@ -1626,7 +1736,10 @@ app.delete('/api/payroll/payment', requireAuth, requireAdmin, async (req, res) =
   if (!employee_id || !weekStart) {
     return res.status(400).json({ error: 'Employee ID and week start are required.' });
   }
-  const start = payrollWeekStartOf(weekStart);
+  const empResult = await pool.query('SELECT pay_period_days FROM employees WHERE id = $1', [employee_id]);
+  if (!empResult.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+  const empPeriodDays = getPeriodDays(empResult.rows[0]?.pay_period_days);
+  const start = periodStartOf(weekStart, empPeriodDays);
   if (await isWeekLocked(employee_id, start)) {
     return res.status(403).json({ error: 'Cannot delete payment: payroll period is locked. Unlock the payslip first.' });
   }

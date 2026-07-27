@@ -1395,10 +1395,11 @@ table td {
 
 th,
 td {
-  padding: 12px 16px;
+  padding: 22px 24px;
   border-bottom: 1px solid var(--line-light);
   text-align: left;
   vertical-align: middle;
+  min-height: 60px;
 }
 
 th {
@@ -1406,10 +1407,13 @@ th {
   top: 0;
   z-index: 1;
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
   background: var(--soft);
   border-bottom: 2px solid var(--line);
   padding: 12px 14px;
@@ -4326,20 +4330,35 @@ body.dark-mode .bottom-nav-item.active {
 .payroll-table th,
 .payroll-table td {
   min-width: 100px;
-  padding: 10px 14px;
+  padding: 22px 24px;
   white-space: nowrap;
+  min-height: 60px;
 }
 
 .payroll-table th {
-  font-size: 12px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .payroll-table td {
-  font-size: 13px;
+  font-size: 24px;
+  font-weight: 700;
 }
 
 .payroll-table td strong {
-  font-size: 13px;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.manage-btn {
+  padding: 14px 28px !important;
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  border-radius: var(--radius-md) !important;
 }
 
 .payroll-records-panel .panel-header h2 {
@@ -4368,20 +4387,31 @@ body.dark-mode .bottom-nav-item.active {
 .attendance-table th,
 .attendance-table td {
   min-width: 80px;
-  padding: 8px 12px;
+  padding: 20px 22px;
   white-space: nowrap;
 }
 
 .attendance-table th {
-  font-size: 12px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .attendance-table td {
-  font-size: 13px;
+  font-size: 24px;
+  font-weight: 700;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .attendance-table td strong {
-  font-size: 13px;
+  font-size: 24px;
+  font-weight: 700;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 /* ── Employee Table (large) ── */
@@ -4393,21 +4423,342 @@ body.dark-mode .bottom-nav-item.active {
 .employee-table th,
 .employee-table td {
   min-width: 80px;
-  padding: 8px 12px;
+  padding: 20px 22px;
   white-space: nowrap;
 }
 
 .employee-table th {
-  font-size: 16px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.3px;
 }
 
 .employee-table td {
-  font-size: 18px;
+  font-size: 24px;
+  font-weight: 700;
 }
 
 .employee-table td strong {
-  font-size: 18px;
+  font-size: 24px;
+  font-weight: 700;
 }
+
+/* ── Attendance Mini Calendar ── */
+.att-date-picker-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+label > .att-date-picker-wrap {
+  vertical-align: middle;
+}
+
+.att-hidden-date {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  height: 0;
+}
+
+.att-date-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  font-family: var(--font);
+}
+
+.att-date-trigger:hover {
+  border-color: var(--brand-light);
+  box-shadow: 0 0 0 2px var(--brand-glow);
+}
+
+.att-date-label {
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+}
+
+.att-date-value {
+  font-weight: 600;
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.att-mini-calendar {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 100;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 14px;
+  box-shadow: var(--shadow-lg);
+  min-width: 300px;
+}
+
+.att-date-picker-wrap.open .att-mini-calendar {
+  display: block;
+}
+
+.att-mc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.att-mc-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.att-mc-nav {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  width: 28px;
+  height: 28px;
+  font-size: 18px;
+  font-weight: 700;
+  cursor: pointer;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+
+.att-mc-nav:hover {
+  background: var(--soft);
+}
+
+.att-mc-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  text-align: center;
+  margin-bottom: 6px;
+}
+
+.att-mc-weekdays span {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  padding: 4px 0;
+}
+
+.att-mc-days {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+}
+
+.att-mc-day {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.15s;
+}
+
+.att-mc-day:hover {
+  background: var(--soft-hover);
+}
+
+.att-mc-day.mc-present {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.att-mc-day.mc-present::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #16a34a;
+}
+
+.att-mc-day.mc-absent {
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.att-mc-day.mc-absent::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #dc2626;
+}
+
+.att-mc-day.mc-neutral {
+  background: var(--soft);
+  color: var(--ink);
+}
+
+.att-mc-day.mc-neutral::after {
+  display: none;
+}
+
+.att-mc-day.mc-today {
+  font-weight: 800;
+  outline: 2px solid var(--brand);
+}
+
+.att-mc-day.mc-selected {
+  background: var(--brand);
+  color: #fff;
+}
+
+.att-mc-day.mc-selected::after {
+  background: #fff;
+}
+
+.att-mc-empty {
+  width: 34px;
+  height: 34px;
+}
+
+/* ── Employee Attendance Calendar ── */
+.employee-calendar-section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow-xs);
+}
+
+.emp-cal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.emp-cal-header h3 {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--ink);
+  margin: 0;
+}
+
+.emp-cal-range {
+  font-size: 14px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.emp-cal-grid {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.emp-cal-day {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  min-width: 70px;
+  transition: transform 0.15s ease;
+}
+
+.emp-cal-day:hover {
+  transform: translateY(-2px);
+}
+
+.emp-cal-day.cal-present {
+  background: #dcfce7;
+  border: 2px solid #16a34a;
+}
+
+.emp-cal-day.cal-absent {
+  background: #fef2f2;
+  border: 2px solid #dc2626;
+}
+
+.emp-cal-dow {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.cal-present .emp-cal-dow { color: #16a34a; }
+.cal-absent .emp-cal-dow { color: #dc2626; }
+
+.emp-cal-date {
+  font-size: 26px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.cal-present .emp-cal-date { color: #166534; }
+.cal-absent .emp-cal-date { color: #991b1b; }
+
+.emp-cal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.emp-cal-day.cal-present .emp-cal-dot { background: #16a34a; }
+.emp-cal-day.cal-absent .emp-cal-dot { background: #dc2626; }
+
+.emp-cal-legend {
+  display: flex;
+  gap: 20px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-light);
+}
+
+.emp-cal-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.emp-cal-legend-item .emp-cal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.emp-cal-legend-item .cal-present { background: #16a34a; }
+.emp-cal-legend-item .cal-absent { background: #dc2626; }
 
 .pe-overview-grid span,
 .pe-totals span,

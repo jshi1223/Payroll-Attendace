@@ -192,9 +192,9 @@ function payrollTransactionTypes(emp) {
   ];
 }
 
-function payrollEntryModal(employee) {
+function payrollEntryModal(employee, transCalDates) {
   const emp = employee;
-  const pd = emp.pay_period_days || state.payPeriodDays || 7;
+  const pd = state.payPeriodDays || emp.pay_period_days || 7;
 
   const salaryLogs = state.salaryPayments.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id));
   const caLogs = state.advances.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id));
@@ -219,7 +219,7 @@ function payrollEntryModal(employee) {
           <input type="hidden" name="employee_id" value="${emp.employee_id}">
           <label>Uri<select name="type" id="peTransactionType">${transactionTypes.map(t => `<option value="${t.key}">${t.key === 'ca' ? 'Cash Advance (Bale/Utang)' : t.label}</option>`).join('')}</select></label>
           <label>Halaga<input name="amount" type="number" min="0.01" step="0.01" required placeholder="0.00"></label>
-          <label>Petsa<input name="transaction_date" type="date" value="${defaultTransactionDate}" min="${state.week}" max="${addDays(state.week, pd - 1)}" required></label>
+          <label>Petsa${miniDatePickerHTML('peTransDate', '', defaultTransactionDate, { inputName: 'transaction_date', highlightDates: transCalDates, calendarUrl: '/api/transactions/calendar' })}</label>
           <label>Puna<input name="notes" placeholder="Optional na remarks"></label>
           <div class="pe-transaction-limits" id="peTransactionLimits"></div>
           <div class="error error-box" id="peTransError"></div>
@@ -260,7 +260,7 @@ function bindPayrollEntryModal() {
   if (!modal) return;
   const emp = state.payrollModalEmployee;
   if (!emp) return;
-  const pd = emp.pay_period_days || state.payPeriodDays || 7;
+  const pd = state.payPeriodDays || emp.pay_period_days || 7;
   const transactionTypes = payrollTransactionTypes(emp);
 
   const close = () => {
@@ -279,6 +279,7 @@ function bindPayrollEntryModal() {
   document.querySelector('#closePayrollTransactionModal')?.addEventListener('click', closeTransaction);
   document.querySelector('#cancelPayrollTransaction')?.addEventListener('click', closeTransaction);
   document.querySelector('#payrollTransactionModal')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeTransaction(); });
+  bindMiniCalendar('peTransDate', () => {});
 
   const setTransactionLimit = () => {
     const option = transactionTypes.find(t => t.key === document.querySelector('#peTransactionType')?.value);
@@ -378,9 +379,15 @@ function bindPayrollEntryModal() {
       try {
         await api(`/api/payroll/${row.employee_id}/generate`, {
           method: 'POST',
-          body: JSON.stringify({ weekStart: state.week })
+          body: JSON.stringify({ weekStart: state.week, payPeriodDays: state.payPeriodDays })
         });
-        await partialRefresh(['payroll', 'attendance', 'salaryPayments', 'advances', 'balePayments', 'extraPayments']);
+        const pd = state.payPeriodDays || 7;
+        const payrollQs = new URLSearchParams({ week: state.payrollWeek, today: state.currentDate, periodDays: pd });
+        if (state.view === 'archive') payrollQs.set('include_inactive', 'true');
+        const [freshPayroll] = await Promise.all([
+          api(`/api/payroll?${payrollQs}`),
+        ]);
+        state.payroll = freshPayroll;
         const generatedRow = state.payroll.rows.find(item => Number(item.employee_id) === Number(row.employee_id)) || row;
         state.payrollModalEmployee = null;
         state.payrollTransactionModal = false;
@@ -650,8 +657,8 @@ function auditTrailModal() {
           <select id="auditEntityFilter"><option value="">All Entities</option><option value="employee">Employee</option><option value="cash_advance">Cash Advance</option><option value="extra_payment">Extra Payment</option><option value="payroll_payment">Payroll Payment</option><option value="payroll_extra_payment">Extra Payment (old)</option></select>
           <select id="auditActionFilter"><option value="">All Actions</option><option value="create">Create</option><option value="update">Update</option><option value="delete">Delete</option><option value="archive">Archive</option><option value="restore">Restore</option><option value="permanent_delete">Permanent Delete</option></select>
           <input id="auditSearch" placeholder="Search details..." value="${escapeHtml(auditFilterState.search)}">
-          <input id="auditDateFrom" type="date" value="${auditFilterState.date_from}">
-          <input id="auditDateTo" type="date" value="${auditFilterState.date_to}">
+          ${miniDatePickerHTML('auditDateFrom', 'From', auditFilterState.date_from || todayInManila(), { hideLabel: true })}
+          ${miniDatePickerHTML('auditDateTo', 'To', auditFilterState.date_to || todayInManila(), { hideLabel: true })}
           <button class="ghost" id="auditFilterBtn">Filter</button>
           <button class="ghost" id="auditResetBtn">Reset</button>
           <button class="ghost" id="auditExportBtn">Export CSV</button>
@@ -748,6 +755,8 @@ function bindAuditTrailModal() {
 
   if (auditFilterState.entity) document.querySelector('#auditEntityFilter').value = auditFilterState.entity;
   if (auditFilterState.action) document.querySelector('#auditActionFilter').value = auditFilterState.action;
+  bindMiniCalendar('auditDateFrom', () => {});
+  bindMiniCalendar('auditDateTo', () => {});
 
   document.querySelector('#auditFilterBtn').addEventListener('click', async () => {
     auditFilterState = {
@@ -765,8 +774,19 @@ function bindAuditTrailModal() {
     document.querySelector('#auditEntityFilter').value = '';
     document.querySelector('#auditActionFilter').value = '';
     document.querySelector('#auditSearch').value = '';
-    document.querySelector('#auditDateFrom').value = '';
-    document.querySelector('#auditDateTo').value = '';
+    ['auditDateFrom', 'auditDateTo'].forEach(id => {
+      const wrap = document.querySelector(`[data-mc-id="${id}"]`);
+      if (wrap) {
+        const input = wrap.querySelector('input');
+        const valEl = wrap.querySelector('.att-date-value');
+        const titleEl = wrap.querySelector(`[data-mc-title="${id}"]`);
+        const grid = wrap.querySelector(`[data-mc-grid="${id}"]`);
+        if (input) input.value = '';
+        if (valEl) valEl.textContent = todayInManila();
+        if (titleEl) titleEl.textContent = new Date(todayInManila() + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+        if (grid) grid.innerHTML = miniCalendarGridHTML(todayInManila(), null, todayInManila());
+      }
+    });
     await renderAuditTable();
   });
   document.querySelector('#auditExportBtn').addEventListener('click', async () => {

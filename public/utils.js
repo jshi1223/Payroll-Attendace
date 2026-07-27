@@ -10,6 +10,11 @@ function formatMoney(value) {
 }
 
 function parseDateOnly(input) {
+  if (input instanceof Date) return new Date(Date.UTC(input.getFullYear(), input.getMonth(), input.getDate()));
+  if (typeof input === 'string' && input.includes('T')) {
+    const d = new Date(input);
+    return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  }
   const value = typeof input === 'string' ? input.slice(0, 10) : todayInManila();
   const [year, month, day] = value.split('-').map(Number);
   return new Date(Date.UTC(year, month - 1, day));

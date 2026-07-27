@@ -38,6 +38,7 @@ const state = {
   showAudit: false,
   pendingDelete: null,
   archivedEmployees: [],
+  calendarDates: [],
   pages: { payroll: 1, attendance: 1, employees: 1, archive: 1 },
   _flash: null,
   sidebarCollapsed: savedState.sidebarCollapsed || false

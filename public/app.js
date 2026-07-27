@@ -259,6 +259,7 @@ function shell(content) {
       </nav>
     </section>
   `;
+  state._flash = null;
   document.querySelectorAll('[data-view]').forEach(button => {
     button.addEventListener('click', async () => {
       state.view = button.dataset.view;
@@ -266,7 +267,7 @@ function shell(content) {
       state.editingCashAdvance = null;
       if (state.view === 'attendance') {
         state.attendanceDate = todayInManila();
-        state.week = weekStartOf(state.attendanceDate);
+        state.week = payrollWeekStartOf(state.attendanceDate);
       } else if (state.view === 'payroll') {
         state.week = state.payrollWeek;
       }
@@ -462,7 +463,6 @@ function reRenderCurrentView() {
   if (state.view === 'employees') renderEmployees();
   if (state.view === 'cashAdvance') renderCashAdvance();
   if (state.view === 'archive') renderArchive();
-  state._flash = null;
 }
 
 /* ── Global Keyboard Shortcuts ── */
@@ -479,7 +479,7 @@ document.addEventListener('keydown', event => {
       state.editingCashAdvance = null;
       if (targetView === 'attendance') {
         state.attendanceDate = todayInManila();
-        state.week = weekStartOf(state.attendanceDate);
+        state.week = payrollWeekStartOf(state.attendanceDate);
       } else if (targetView === 'payroll') {
         state.week = state.payrollWeek;
       }
@@ -493,7 +493,7 @@ document.addEventListener('keydown', event => {
     if (state.view === 'payroll' || state.view === 'dashboard') {
       event.preventDefault();
       const pd = state.payPeriodDays || 7;
-      const step = (pd > 7 && state.payroll?.isPeriodLocked) ? pd : 7;
+      const step = pd;
       state.week = addDays(state.week, event.key === 'ArrowLeft' ? -step : step);
       state.payrollWeek = state.week;
       saveUiState();
