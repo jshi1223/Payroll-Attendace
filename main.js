@@ -92,6 +92,10 @@ function createWindow() {
     autoHideMenuBar: true
   });
 
+  mainWindow.webContents.setWindowOpenHandler(() => {
+    return { action: 'allow' };
+  });
+
   mainWindow.loadURL(`data:text/html,${encodeURIComponent(LOADING_HTML)}`);
   mainWindow.webContents.setZoomFactor(0.75);
 
@@ -114,6 +118,20 @@ ipcMain.on('window-close-response', (event, action) => {
 ipcMain.on('print-page', (event) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.print({ silent: false, printBackground: true });
+  }
+});
+
+ipcMain.on('print-html', (event, html) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const printWin = new BrowserWindow({ show: false, webPreferences: { offscreen: true } });
+    printWin.loadURL(`data:text/html,${encodeURIComponent(html)}`);
+    printWin.webContents.on('did-finish-load', () => {
+      setTimeout(() => {
+        printWin.webContents.print({ silent: false, printBackground: true }, () => {
+          printWin.close();
+        });
+      }, 500);
+    });
   }
 });
 

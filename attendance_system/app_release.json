@@ -1,0 +1,14 @@
+{
+  "api_base_url": "https://attendancesystem-wi7az.sevalla.app",
+  "flutter_base_version": "1.0.0",
+  "latest_version": "1.0.0",
+  "min_supported_version": "1.0.0",
+  "force_update": false,
+  "apk_url": "",
+  "release_notes": "Initial release.",
+  "firebase_api_key": "AIzaSyBd2lBlpsVeo-uodqHIHsGIGyQnN-HPHHc",
+  "firebase_app_id": "1:1081441548888:android:24a2b7cb75b978aaefa82d",
+  "firebase_messaging_sender_id": "1081441548888",
+  "firebase_project_id": "attendance-7c06d",
+  "firebase_storage_bucket": "attendance-7c06d.firebasestorage.app"
+}

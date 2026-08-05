@@ -36,9 +36,11 @@
         "to": ".env"
       },
       {
-        "from": "public/uploads",
-        "to": "public/uploads",
-        "filter": ["**/*"]
+        "from": "attendance_system/public/uploads",
+        "to": "attendance_system/public/uploads",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "nsis": {
@@ -55,7 +57,8 @@
     "express-session": "^1.18.2",
     "helmet": "^8.2.0",
     "multer": "^2.2.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "puppeteer-core": "^25.4.0"
   },
   "devDependencies": {
     "electron": "^35.0.0",

@@ -7,9 +7,12 @@ const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
+const net = require('net');
 
 if (!process.env.DATABASE_URL) {
   console.error('FATAL: DATABASE_URL environment variable is required.');
@@ -20,6 +23,7 @@ if (!process.env.SESSION_SECRET) {
   process.exit(1);
 }
 
+
 const app = express();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL
@@ -27,11 +31,15 @@ const pool = new Pool({
 
 const PORT = process.env.PORT || 3001;
 
-const uploadsDir = path.join(__dirname, 'public', 'uploads');
+const uploadsDir = path.join(__dirname, 'attendance_system', 'public', 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
+/* Shared face/photo directory (same folder the attendance system uses) */
+const attendanceFaceDir = process.env.ATTENDANCE_FACE_DIR || path.join(__dirname, 'attendance_system', 'backend', 'face_images');
+if (!fs.existsSync(attendanceFaceDir)) fs.mkdirSync(attendanceFaceDir, { recursive: true });
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
+  destination: (req, file, cb) => cb(null, attendanceFaceDir),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname) || '.jpg';
     cb(null, `emp_${req.params.id}_${Date.now()}${ext}`);
@@ -46,7 +54,21 @@ const upload = multer({
 });
 
 app.use('/uploads', express.static(uploadsDir));
-app.use(helmet({ contentSecurityPolicy: false }));
+
+/* Attendance system face images (served to admin panel for approval review) */
+app.use('/attendance-faces', express.static(attendanceFaceDir));
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "https://cdnjs.cloudflare.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      imgSrc: ["'self'", "data:", "blob:"],
+      connectSrc: ["'self'"]
+    }
+  }
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
@@ -61,6 +83,7 @@ app.use(session({
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
     maxAge: 1000 * 60 * 60 * 8
   }
 }));
@@ -70,7 +93,37 @@ const loginLimiter = rateLimit({
   message: { error: 'Too many login attempts. Please try again later.' }
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+function generateCsrfToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function parseCookies(header) {
+  const cookies = {};
+  if (!header) return cookies;
+  header.split(';').forEach(c => {
+    const [key, ...val] = c.split('=');
+    if (key) cookies[key.trim()] = decodeURIComponent(val.join('='));
+  });
+  return cookies;
+}
+
+function csrfProtection(req, res, next) {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return next();
+  }
+  if (!req.session?.user) return next();
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieToken = cookies.csrf_token;
+  const headerToken = req.headers['x-csrf-token'];
+  if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+    return res.status(403).json({ error: 'Invalid CSRF token.' });
+  }
+  next();
+}
+
+app.use(csrfProtection);
+
+app.use(express.static(path.join(__dirname, 'attendance_system', 'public')));
 
 function requireAuth(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: 'Login required.' });
@@ -95,6 +148,13 @@ async function isDateLockedForEmployee(employeeId, date) {
 
 function requireAdmin(req, res, next) {
   if (req.session.user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+  next();
+}
+
+function validateIdParam(req, res, next) {
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ error: 'Invalid ID parameter.' });
+  }
   next();
 }
 
@@ -203,7 +263,7 @@ function validateGovIds(body) {
   for (const [field, validator] of Object.entries(GOV_ID_VALIDATORS)) {
     const value = (body[field] || '').trim();
     if (value && !validator.regex.test(value)) {
-      return { valid: false, message: `${validator.label} ay hindi tama. ${validator.hint}` };
+      return { valid: false, message: `${validator.label} format is invalid. ${validator.hint}` };
     }
   }
   return { valid: true };
@@ -216,7 +276,7 @@ function calculatePayrollWeekState({ previousBaleBalance = 0, previousUnpaidBala
 
   let baleDeduction, remainingBaleBalance, takeHome, currentUnpaidBalance;
   if (deductBale && salary === 0) {
-    // When walang pasok (no salary), payment goes directly to reduce bale
+    // When no work (no salary), payment goes directly to reduce bale
     const afterPreviousUnpaid = Math.max(salaryPaidAmount - paymentToPreviousUnpaid, 0);
     baleDeduction = Math.min(totalBale, afterPreviousUnpaid);
     remainingBaleBalance = Math.max(totalBale - baleDeduction - balePaymentAmount, 0);
@@ -317,14 +377,15 @@ async function assertPaymentWithinBalance(employee_id, paymentDate, newAmount, t
   });
 
   if (type === 'bale') {
-    /* For bale payments, check against remaining bale balance (debt) */
     if (Number(newAmount) > weekState.remainingBaleBalance) {
-      throw new Error('Hindi sapat ang bale balance para sa payment na ito.');
+      throw new Error('Insufficient advance balance for this payment.');
+    }
+    if (Number(newAmount) > weekState.balance) {
+      throw new Error('Insufficient salary balance for advance payment.');
     }
   } else {
-    /* For salary payments, check against salary balance (now includes extra pay) */
     if (Number(newAmount) > weekState.balance) {
-      throw new Error('Hindi sapat ang balance para sa payment na ito.');
+      throw new Error('Insufficient balance for this payment.');
     }
   }
 }
@@ -425,6 +486,120 @@ async function getPayrollCarryoversBefore(employeeId, weekStart, periodDays = 7)
   }, { baleBalance: 0, unpaidBalance: 0 });
 }
 
+async function getPayrollCarryoversBulk(employeeIds, weekStart, periodDays = 7) {
+  if (!employeeIds.length) return new Map();
+  const pd = getPeriodDays(periodDays);
+  const result = await pool.query(
+    `WITH
+     salary_weeks AS (
+       SELECT employee_id,
+         (DATE '2020-01-06' + FLOOR(((work_date + (CASE WHEN EXTRACT(DOW FROM work_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM work_date) END)::int)::date - DATE '2020-01-06')::float / ($2)::int)::int * ($2)::int)::date AS period_start,
+         SUM(rate_snapshot)::numeric(12,2) AS salary
+       FROM attendance_logs
+       WHERE employee_id = ANY($3) AND work_date < $1
+       GROUP BY 1, 2
+     ),
+     advance_weeks AS (
+       SELECT employee_id,
+         (DATE '2020-01-06' + FLOOR(((advance_date + (CASE WHEN EXTRACT(DOW FROM advance_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM advance_date) END)::int)::date - DATE '2020-01-06')::float / ($2)::int)::int * ($2)::int)::date AS period_start,
+         SUM(amount)::numeric(12,2) AS advance
+       FROM cash_advances
+       WHERE employee_id = ANY($3) AND advance_date < $1
+       GROUP BY 1, 2
+     ),
+     extra_weeks AS (
+       SELECT employee_id,
+         (DATE '2020-01-06' + FLOOR(((extra_date + (CASE WHEN EXTRACT(DOW FROM extra_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM extra_date) END)::int)::date - DATE '2020-01-06')::float / ($2)::int)::int * ($2)::int)::date AS period_start,
+         SUM(amount)::numeric(12,2) AS extra
+       FROM extra_payments
+       WHERE employee_id = ANY($3) AND extra_date < $1
+       GROUP BY 1, 2
+     ),
+     payment_weeks AS (
+       SELECT employee_id,
+         week_start AS period_start,
+         SUM(paid_amount)::numeric(12,2) AS payment,
+         bool_or(bale_deducted) AS bale_deducted
+       FROM payroll_statuses
+       WHERE employee_id = ANY($3) AND week_start < $1
+       GROUP BY employee_id, week_start
+     ),
+     bale_payment_weeks AS (
+       SELECT employee_id,
+         (DATE '2020-01-06' + FLOOR(((payment_date + (CASE WHEN EXTRACT(DOW FROM payment_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM payment_date) END)::int)::date - DATE '2020-01-06')::float / ($2)::int)::int * ($2)::int)::date AS period_start,
+         SUM(amount)::numeric(12,2) AS bale_paid
+       FROM bale_payments
+       WHERE employee_id = ANY($3) AND payment_date < $1
+       GROUP BY 1, 2
+     ),
+     salary_pay_weeks AS (
+       SELECT employee_id,
+         (DATE '2020-01-06' + FLOOR(((payment_date + (CASE WHEN EXTRACT(DOW FROM payment_date) = 0 THEN -6 ELSE 1 - EXTRACT(DOW FROM payment_date) END)::int)::date - DATE '2020-01-06')::float / ($2)::int)::int * ($2)::int)::date AS period_start,
+         SUM(amount)::numeric(12,2) AS salary_pay
+       FROM salary_payments
+       WHERE employee_id = ANY($3) AND payment_date < $1
+       GROUP BY 1, 2
+     ),
+     all_period_data AS (
+       SELECT employee_id, period_start FROM salary_weeks
+       UNION SELECT employee_id, period_start FROM advance_weeks
+       UNION SELECT employee_id, period_start FROM extra_weeks
+       UNION SELECT employee_id, period_start FROM payment_weeks
+       UNION SELECT employee_id, period_start FROM bale_payment_weeks
+       UNION SELECT employee_id, period_start FROM salary_pay_weeks
+     )
+     SELECT apd.employee_id, apd.period_start,
+       COALESCE(s.salary, 0)::numeric(12,2) AS salary,
+       COALESCE(a.advance, 0)::numeric(12,2) AS advance,
+       COALESCE(ex.extra, 0)::numeric(12,2) AS extra,
+       (COALESCE(p.payment, 0) + COALESCE(sp.salary_pay, 0))::numeric(12,2) AS payment,
+       COALESCE(p.bale_deducted, false) AS bale_deducted,
+       COALESCE(bp.bale_paid, 0)::numeric(12,2) AS bale_paid
+     FROM all_period_data apd
+     LEFT JOIN salary_weeks s ON s.employee_id = apd.employee_id AND s.period_start = apd.period_start
+     LEFT JOIN advance_weeks a ON a.employee_id = apd.employee_id AND a.period_start = apd.period_start
+     LEFT JOIN extra_weeks ex ON ex.employee_id = apd.employee_id AND ex.period_start = apd.period_start
+     LEFT JOIN payment_weeks p ON p.employee_id = apd.employee_id AND p.period_start = apd.period_start
+     LEFT JOIN bale_payment_weeks bp ON bp.employee_id = apd.employee_id AND bp.period_start = apd.period_start
+     LEFT JOIN salary_pay_weeks sp ON sp.employee_id = apd.employee_id AND sp.period_start = apd.period_start
+     ORDER BY apd.employee_id, apd.period_start ASC`,
+    [weekStart, pd, employeeIds]
+  );
+
+  const carryoverMap = new Map();
+  for (const empId of employeeIds) {
+    carryoverMap.set(empId, { baleBalance: 0, unpaidBalance: 0 });
+  }
+
+  const grouped = {};
+  for (const row of result.rows) {
+    if (!grouped[row.employee_id]) grouped[row.employee_id] = [];
+    grouped[row.employee_id].push(row);
+  }
+
+  for (const [empId, rows] of Object.entries(grouped)) {
+    const state = rows.reduce((s, row) => {
+      const weekState = calculatePayrollWeekState({
+        previousBaleBalance: s.baleBalance,
+        previousUnpaidBalance: s.unpaidBalance,
+        salary: money(row.salary),
+        cashAdvance: money(row.advance),
+        salaryPaidAmount: money(row.payment),
+        deductBale: row.bale_deducted,
+        balePaymentAmount: money(row.bale_paid),
+        extraPayment: money(row.extra)
+      });
+      return {
+        baleBalance: weekState.remainingBaleBalance,
+        unpaidBalance: weekState.balance
+      };
+    }, { baleBalance: 0, unpaidBalance: 0 });
+    carryoverMap.set(Number(empId), state);
+  }
+
+  return carryoverMap;
+}
+
 function workingDaysInPeriod(periodStart, periodDays = 7, currentDate = todayInManila()) {
   const today = currentDate.slice(0, 10);
   const periodEnd = addDays(periodStart, periodDays - 1);
@@ -442,8 +617,18 @@ async function initDatabase() {
   await pool.query(schema);
   /* Migration for databases created before users.updated_at was introduced. */
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`);
   await pool.query('ALTER TABLE attendance_logs ALTER COLUMN time_in DROP NOT NULL');
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS photo_url VARCHAR(500)`);
+  await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS first_name VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_name VARCHAR(80) NOT NULL DEFAULT ''`);
+  /* Migrate existing name data into first_name/last_name */
+  await pool.query(`
+    UPDATE employees SET
+      first_name = CASE WHEN position(' ' IN TRIM(name)) > 0 THEN substring(TRIM(name) FROM 1 FOR position(' ' IN TRIM(name)) - 1) ELSE TRIM(name) END,
+      last_name = CASE WHEN position(' ' IN TRIM(name)) > 0 THEN substring(TRIM(name) FROM position(' ' IN TRIM(name)) + 1) ELSE '' END
+    WHERE first_name = '' OR last_name = ''
+  `);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS sss_number VARCHAR(12) NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS philhealth_number VARCHAR(14) NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS pagibig_number VARCHAR(14) NOT NULL DEFAULT ''`);
@@ -543,6 +728,42 @@ async function initDatabase() {
     UPDATE employees SET phone = LPAD(FLOOR(RANDOM() * 100000000000)::text, 11, '1')
     WHERE phone ~ '^0000000000' OR phone ~ '_';
   `);
+  /* Ensure no duplicates before adding unique indexes on government IDs */
+  const govIdIndexes = [
+    { col: 'sss_number', name: 'idx_employees_sss_unique' },
+    { col: 'philhealth_number', name: 'idx_employees_philhealth_unique' },
+    { col: 'pagibig_number', name: 'idx_employees_pagibig_unique' },
+    { col: 'tin_number', name: 'idx_employees_tin_unique' }
+  ];
+  for (const idx of govIdIndexes) {
+    /* Deduplicate by keeping only the earliest employee per duplicate value */
+    await pool.query(`
+      WITH dupes AS (
+        SELECT ${idx.col}, MIN(id) AS keep_id
+        FROM employees
+        WHERE ${idx.col} != ''
+        GROUP BY ${idx.col}
+        HAVING COUNT(*) > 1
+      )
+      UPDATE employees e
+      SET ${idx.col} = CONCAT(e.${idx.col}, '_DUP_', e.id)
+      FROM dupes
+      WHERE e.${idx.col} = dupes.${idx.col}
+        AND e.id != dupes.keep_id
+        AND POSITION('_DUP_' IN e.${idx.col}) = 0
+    `);
+    await pool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE tablename = 'employees' AND indexname = '${idx.name}'
+        ) THEN
+          CREATE UNIQUE INDEX ${idx.name} ON employees(${idx.col}) WHERE ${idx.col} != '';
+        END IF;
+      END $$;
+    `);
+  }
+
   await pool.query(`
     DO $$ BEGIN
       IF EXISTS (
@@ -596,25 +817,99 @@ async function initDatabase() {
     END $$;
   `);
 
+  /* ── Attendance system integration (shared DB, `attendance` schema) ── */
+  await pool.query(`CREATE SCHEMA IF NOT EXISTS attendance`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance.employees (
+      id SERIAL PRIMARY KEY,
+      employee_id VARCHAR(50) NULL UNIQUE,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NULL,
+      phone VARCHAR(50) NULL,
+      password_hash VARCHAR(255) NULL,
+      daily_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+      face_image VARCHAR(255) NULL,
+      face_left VARCHAR(255) NULL,
+      face_right VARCHAR(255) NULL,
+      face_encoding TEXT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      admin_notes TEXT NULL,
+      registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      approved_at TIMESTAMP NULL
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance.attendance (
+      id SERIAL PRIMARY KEY,
+      employee_id VARCHAR(50) NOT NULL,
+      type VARCHAR(20) NOT NULL,
+      rate_snapshot DECIMAL(10,2) NULL,
+      timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_attendance_employee
+        FOREIGN KEY (employee_id) REFERENCES attendance.employees(employee_id) ON DELETE CASCADE
+    )
+  `);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS payroll_employee_id INTEGER`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS government_id VARCHAR(50) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS email VARCHAR(255) NULL`);
+
+  /* Payroll review/acceptance step before bulk printing */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payroll_reviews (
+      period_key VARCHAR(20) PRIMARY KEY,
+      period_days INTEGER NOT NULL DEFAULT 7,
+      accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      accepted_by INTEGER NULL REFERENCES users(id) ON DELETE SET NULL
+    )
+  `);
+
   const defaultUsers = [
     { username: process.env.BOOTSTRAP_USERNAME || 'admin', password: process.env.BOOTSTRAP_PASSWORD || 'kvsk@2018', role: process.env.BOOTSTRAP_ROLE || 'admin' },
-    { username: 'hr', password: 'hr123', role: 'hr' }
+    { username: process.env.BOOTSTRAP_HR_USERNAME || 'hr', password: process.env.BOOTSTRAP_HR_PASSWORD || 'hr123', role: process.env.BOOTSTRAP_HR_ROLE || 'hr' }
   ];
 
   for (const u of defaultUsers) {
-    const exists = await pool.query('SELECT id FROM users WHERE username = $1', [u.username]);
+    const exists = await pool.query('SELECT id, role, must_change_password FROM users WHERE username = $1', [u.username]);
     if (!exists.rowCount) {
       const hash = await bcrypt.hash(u.password, 10);
       await pool.query(
-        'INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)',
+        'INSERT INTO users (username, password_hash, role, must_change_password) VALUES ($1, $2, $3, false)',
         [u.username, hash, u.role]
       );
       console.log(`  Created user: ${u.username} (${u.role})`);
     } else {
-      /* Keep existing passwords intact; only ensure the configured role remains correct. */
-      await pool.query('UPDATE users SET role = $1, updated_at = NOW() WHERE username = $2', [u.role, u.username]);
-      console.log(`  Verified user: ${u.username} (${u.role})`);
+      const existing = exists.rows[0];
+      if (existing.role !== u.role || existing.must_change_password) {
+        await pool.query('UPDATE users SET role = $1, must_change_password = false, updated_at = NOW() WHERE id = $2', [u.role, existing.id]);
+        console.log(`  Updated user: ${u.username} (${u.role})`);
+      }
     }
+  }
+
+  /* Migration: replace default accounts with new admin & HR users */
+  const karlExists = await pool.query("SELECT id FROM users WHERE username = 'karl'");
+  if (!karlExists.rowCount) {
+    console.log('  Running user migration (add karl, jamil, joey; remove admin, hr)...');
+    await pool.query('DELETE FROM audit_logs');
+    const oldUserIds = await pool.query("SELECT id FROM users WHERE username IN ('admin', 'hr')");
+    for (const row of oldUserIds.rows) {
+      await pool.query('UPDATE payroll_statuses SET updated_by = NULL WHERE updated_by = $1', [row.id]);
+    }
+    await pool.query("DELETE FROM users WHERE username IN ('admin', 'hr')");
+    const newUsers = [
+      { username: 'karl', password: 'karl123', role: 'admin' },
+      { username: 'jamil', password: 'jamil123', role: 'hr' },
+      { username: 'joey', password: 'joey123', role: 'hr' }
+    ];
+    for (const u of newUsers) {
+      const hash = await bcrypt.hash(u.password, 10);
+      await pool.query(
+        'INSERT INTO users (username, password_hash, role, must_change_password) VALUES ($1, $2, $3, false)',
+        [u.username, hash, u.role]
+      );
+      console.log(`  Created user: ${u.username} (${u.role})`);
+    }
+    console.log('  User migration complete; audit logs cleared.');
   }
 }
 
@@ -626,12 +921,22 @@ async function logAudit(userId, action, entity, entityId, details = {}) {
   );
 }
 
-app.get('/api/me', (req, res) => {
+app.get('/api/me', async (req, res) => {
   let sessionTTL = null;
   if (req.session?.cookie?._expires) {
     sessionTTL = Math.max(0, Math.floor((new Date(req.session.cookie._expires) - new Date()) / 1000));
   }
-  res.json({ user: req.session.user || null, sessionTTL });
+  let lastLogin = null;
+  if (req.session?.user?.id) {
+    try {
+      const lr = await pool.query(
+        `SELECT created_at FROM audit_logs WHERE user_id = $1 AND action = 'login' ORDER BY created_at DESC LIMIT 1 OFFSET 1`,
+        [req.session.user.id]
+      );
+      if (lr.rowCount > 0) lastLogin = lr.rows[0].created_at;
+    } catch (_) { /* ignore */ }
+  }
+  res.json({ user: req.session.user || null, sessionTTL, csrfToken: req.session?.csrfToken || null, lastLogin });
 });
 
 app.post('/api/login', loginLimiter, async (req, res) => {
@@ -641,9 +946,25 @@ app.post('/api/login', loginLimiter, async (req, res) => {
   if (!user || !(await bcrypt.compare(password || '', user.password_hash))) {
     return res.status(401).json({ error: 'Invalid username or password.' });
   }
-  req.session.user = { id: user.id, username: user.username, role: user.role };
-  const sessionTTL = req.session?.cookie?.maxAge ? Math.floor(req.session.cookie.maxAge / 1000) : null;
-  res.json({ user: req.session.user, sessionTTL });
+  const sessionUser = { id: user.id, username: user.username, role: user.role, must_change_password: user.must_change_password || false };
+  req.session.regenerate((err) => {
+    if (err) return res.status(500).json({ error: 'Session error.' });
+    req.session.user = sessionUser;
+    req.session.save((saveErr) => {
+      if (saveErr) return res.status(500).json({ error: 'Session error.' });
+      const sessionTTL = req.session?.cookie?.maxAge ? Math.floor(req.session.cookie.maxAge / 1000) : null;
+      const csrfToken = generateCsrfToken();
+      req.session.csrfToken = csrfToken;
+      res.cookie('csrf_token', csrfToken, {
+        httpOnly: false,
+        sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 1000 * 60 * 60 * 8
+      });
+      logAudit(user.id, 'login', 'session', user.id, { username: user.username });
+      res.json({ user: req.session.user, sessionTTL, csrfToken });
+    });
+  });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -654,7 +975,7 @@ app.get('/api/employees', requireAuth, async (req, res) => {
   const search = `%${req.query.search || ''}%`;
   const active = req.query.active;
   const params = [search];
-  let where = 'WHERE (emp_number ILIKE $1 OR name ILIKE $1 OR sss_number ILIKE $1 OR philhealth_number ILIKE $1 OR pagibig_number ILIKE $1 OR tin_number ILIKE $1)';
+  let where = 'WHERE (emp_number ILIKE $1 OR name ILIKE $1 OR email ILIKE $1 OR sss_number ILIKE $1 OR philhealth_number ILIKE $1 OR pagibig_number ILIKE $1 OR tin_number ILIKE $1)';
   if (active === 'true' || active === 'false') {
     params.push(active === 'true');
     where += ` AND active = $${params.length}`;
@@ -669,20 +990,36 @@ app.get('/api/employees', requireAuth, async (req, res) => {
 });
 
 app.post('/api/employees', requireAuth, async (req, res) => {
-  const { name, phone, rate, active = true, pay_period_days = 7 } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: 'Employee name is required.' });
+  const { first_name, last_name, name, phone, rate, active = true, pay_period_days = 7 } = req.body;
+  const empFirstName = (first_name || '').trim();
+  const empLastName = (last_name || '').trim();
+  const empName = empFirstName && empLastName ? `${empFirstName} ${empLastName}` : (name || '').trim();
+  if (!empName) return res.status(400).json({ error: 'Employee first and last name are required.' });
   if (!phone?.trim()) return res.status(400).json({ error: 'Phone number is required.' });
   if (!/^[0-9]{11}$/.test(phone.trim())) {
     return res.status(400).json({ error: 'Phone number must be exactly 11 digits (numbers only).' });
   }
-  if (rate === undefined || rate === '' || Number(rate) < 0) {
-    return res.status(400).json({ error: 'Valid employee rate is required.' });
+  if (rate === undefined || rate === '' || Number(rate) < 500) {
+    return res.status(400).json({ error: 'Daily rate must be at least ₱500.00.' });
   }
 
   /* Validate government ID formats */
   const govIdResult = validateGovIds(req.body);
   if (!govIdResult.valid) {
     return res.status(400).json({ error: govIdResult.message });
+  }
+
+  /* Check government ID uniqueness */
+  const govIdFields = ['sss_number', 'philhealth_number', 'pagibig_number', 'tin_number'];
+  const govIdLabels = { sss_number: 'SSS Number', philhealth_number: 'PhilHealth Number', pagibig_number: 'Pag-IBIG Number', tin_number: 'TIN Number' };
+  for (const field of govIdFields) {
+    const value = (req.body[field] || '').trim();
+    if (value) {
+      const existing = await pool.query(`SELECT id FROM employees WHERE ${field} = $1 AND ${field} != ''`, [value]);
+      if (existing.rowCount > 0) {
+        return res.status(409).json({ error: `${govIdLabels[field]} is already in use by another employee.` });
+      }
+    }
   }
 
   const periodDays = Math.max(1, Math.floor(Number(pay_period_days) || 7));
@@ -696,41 +1033,112 @@ app.post('/api/employees', requireAuth, async (req, res) => {
     return res.status(409).json({ error: 'Phone number is already in use by another employee.' });
   }
 
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const tempPassword = String(req.body.password || '');
+  if (tempPassword && !email) {
+    return res.status(400).json({ error: 'Email is required to create a mobile login for the employee.' });
+  }
+  if (tempPassword && tempPassword.length < 8) {
+    return res.status(400).json({ error: 'Temporary password must be at least 8 characters.' });
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+  if (email) {
+    const emailCheck = await pool.query(
+      'SELECT id FROM attendance.employees WHERE LOWER(email) = $1',
+      [email]
+    );
+    if (emailCheck.rowCount > 0) {
+      return res.status(409).json({ error: 'Email is already in use by another mobile account.' });
+    }
+  }
+
   const empNumber = await pool.query(
     `SELECT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0')) AS emp_number`
   );
-  const result = await pool.query(
-    `INSERT INTO employees (emp_number, name, phone, rate, pay_period_days, active, sss_number, philhealth_number, pagibig_number, tin_number)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-     RETURNING *`,
-    [empNumber.rows[0].emp_number, name, phone.trim(), rate, periodDays, active,
-     req.body.sss_number || '', req.body.philhealth_number || '', req.body.pagibig_number || '', req.body.tin_number || '']
-  );
-  await logAudit(req.session.user.id, 'create', 'employee', result.rows[0].id, {
-    name,
-    phone,
-    rate,
-    pay_period_days: periodDays,
-    emp_number: empNumber.rows[0].emp_number
-  });
-  res.status(201).json(result.rows[0]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `INSERT INTO employees (emp_number, first_name, last_name, name, phone, email, rate, pay_period_days, active, sss_number, philhealth_number, pagibig_number, tin_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING *`,
+      [empNumber.rows[0].emp_number, empFirstName, empLastName, empName, phone.trim(), email, rate, periodDays, active,
+       req.body.sss_number || '', req.body.philhealth_number || '', req.body.pagibig_number || '', req.body.tin_number || '']
+    );
+    const newEmployeeId = result.rows[0].id;
+
+    let attendanceAccount = null;
+    if (email && tempPassword) {
+      const attendanceEmpId = await client.query(
+        `SELECT (
+           'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
+           LPAD(COALESCE(MAX(NULLIF(split_part(employee_id, '-', 4), '')::int), 0) + 1, 4, '0')
+         ) AS emp_id
+         FROM attendance.employees
+         WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
+      );
+      const passwordHash = await bcrypt.hash(tempPassword, 10);
+      await client.query(
+        `INSERT INTO attendance.employees
+           (employee_id, name, email, phone, password_hash, daily_rate, status, approved_at, payroll_employee_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'approved', NOW(), $7)`,
+        [attendanceEmpId.rows[0].emp_id, empName, email, phone.trim(), passwordHash, Number(rate), newEmployeeId]
+      );
+      attendanceAccount = attendanceEmpId.rows[0].emp_id;
+    }
+
+    await client.query('COMMIT');
+    await logAudit(req.session.user.id, 'create', 'employee', newEmployeeId, {
+      name: empName,
+      phone,
+      email,
+      rate,
+      pay_period_days: periodDays,
+      emp_number: empNumber.rows[0].emp_number,
+      mobile_account: attendanceAccount || null
+    });
+    res.status(201).json({ ...result.rows[0], mobile_account: attendanceAccount });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
-app.put('/api/employees/:id', requireAuth, async (req, res) => {
-  const { name, phone, rate, active = true, pay_period_days = 7 } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: 'Employee name is required.' });
+app.put('/api/employees/:id', requireAuth, validateIdParam, async (req, res) => {
+  const { first_name, last_name, name, phone, rate, active = true, pay_period_days = 7 } = req.body;
+  const empFirstName = (first_name || '').trim();
+  const empLastName = (last_name || '').trim();
+  const empName = empFirstName && empLastName ? `${empFirstName} ${empLastName}` : (name || '').trim();
+  if (!empName) return res.status(400).json({ error: 'Employee first and last name are required.' });
   if (!phone?.trim()) return res.status(400).json({ error: 'Phone number is required.' });
   if (!/^[0-9]{11}$/.test(phone.trim())) {
     return res.status(400).json({ error: 'Phone number must be exactly 11 digits (numbers only).' });
   }
-  if (rate === undefined || rate === '' || Number(rate) < 0) {
-    return res.status(400).json({ error: 'Valid employee rate is required.' });
+  if (rate === undefined || rate === '' || Number(rate) < 500) {
+    return res.status(400).json({ error: 'Daily rate must be at least ₱500.00.' });
   }
 
   /* Validate government ID formats */
   const govIdResult = validateGovIds(req.body);
   if (!govIdResult.valid) {
     return res.status(400).json({ error: govIdResult.message });
+  }
+
+  /* Check government ID uniqueness (exclude current employee) */
+  const govIdFields = ['sss_number', 'philhealth_number', 'pagibig_number', 'tin_number'];
+  const govIdLabels = { sss_number: 'SSS Number', philhealth_number: 'PhilHealth Number', pagibig_number: 'Pag-IBIG Number', tin_number: 'TIN Number' };
+  for (const field of govIdFields) {
+    const value = (req.body[field] || '').trim();
+    if (value) {
+      const existing = await pool.query(`SELECT id FROM employees WHERE ${field} = $1 AND ${field} != '' AND id != $2`, [value, req.params.id]);
+      if (existing.rowCount > 0) {
+        return res.status(409).json({ error: `${govIdLabels[field]} is already in use by another employee.` });
+      }
+    }
   }
 
   const periodDays = Math.max(1, Math.floor(Number(pay_period_days) || 7));
@@ -747,32 +1155,77 @@ app.put('/api/employees/:id', requireAuth, async (req, res) => {
   const before = await pool.query('SELECT * FROM employees WHERE id = $1', [req.params.id]);
   const result = await pool.query(
     `UPDATE employees
-     SET name = $1, phone = $2, rate = $3, pay_period_days = $4, active = $5,
-         sss_number = $6, philhealth_number = $7, pagibig_number = $8, tin_number = $9,
+     SET first_name = $1, last_name = $2, name = $3, phone = $4, rate = $5, pay_period_days = $6, active = $7,
+         sss_number = $8, philhealth_number = $9, pagibig_number = $10, tin_number = $11, email = $12,
          updated_at = NOW()
-     WHERE id = $10
+     WHERE id = $13
      RETURNING *`,
-    [name, phone.trim(), rate, periodDays, active,
+    [empFirstName, empLastName, empName, phone.trim(), rate, periodDays, active,
      req.body.sss_number || '', req.body.philhealth_number || '', req.body.pagibig_number || '', req.body.tin_number || '',
-     req.params.id]
+     String(req.body.email || '').trim().toLowerCase(), req.params.id]
   );
   if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+
+  /* Upsert mobile (attendance app) account when email + temp password provided */
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const tempPassword = String(req.body.password || '');
+  let mobileAccount = null;
+  if (tempPassword) {
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required to reset the mobile login.' });
+    }
+    if (tempPassword.length < 8) {
+      return res.status(400).json({ error: 'Temporary password must be at least 8 characters.' });
+    }
+    const passwordHash = await bcrypt.hash(tempPassword, 10);
+    const existingAccount = await pool.query(
+      'SELECT id, employee_id FROM attendance.employees WHERE payroll_employee_id = $1',
+      [req.params.id]
+    );
+    if (existingAccount.rowCount > 0) {
+      await pool.query(
+        `UPDATE attendance.employees
+         SET email = $1, password_hash = $2, name = $3, phone = $4, daily_rate = $5, status = 'approved'
+         WHERE id = $6`,
+        [email, passwordHash, empName, phone.trim(), rate, existingAccount.rows[0].id]
+      );
+      mobileAccount = existingAccount.rows[0].employee_id;
+    } else {
+      const attendanceEmpId = await pool.query(
+        `SELECT (
+           'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
+           LPAD(COALESCE(MAX(NULLIF(split_part(employee_id, '-', 4), '')::int), 0) + 1, 4, '0')
+         ) AS emp_id
+         FROM attendance.employees
+         WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
+      );
+      await pool.query(
+        `INSERT INTO attendance.employees
+           (employee_id, name, email, phone, password_hash, daily_rate, status, approved_at, payroll_employee_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'approved', NOW(), $7)`,
+        [attendanceEmpId.rows[0].emp_id, empName, email, phone.trim(), passwordHash, Number(rate), req.params.id]
+      );
+      mobileAccount = attendanceEmpId.rows[0].emp_id;
+    }
+  }
+
   await logAudit(req.session.user.id, 'update', 'employee', Number(req.params.id), {
     before: before.rows[0] || null,
-    after: result.rows[0]
+    after: result.rows[0],
+    mobile_account: mobileAccount
   });
-  res.json(result.rows[0]);
+  res.json({ ...result.rows[0], mobile_account: mobileAccount });
 });
 
-app.delete('/api/employees/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/employees/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   await pool.query('UPDATE employees SET active = false WHERE id = $1', [req.params.id]);
   await logAudit(req.session.user.id, 'archive', 'employee', Number(req.params.id), {});
   res.json({ ok: true });
 });
 
-app.post('/api/employees/:id/photo', requireAuth, upload.single('photo'), async (req, res) => {
+app.post('/api/employees/:id/photo', requireAuth, validateIdParam, upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-  const photoUrl = '/uploads/' + req.file.filename;
+  const photoUrl = '/attendance-faces/' + req.file.filename;
   const result = await pool.query(
     'UPDATE employees SET photo_url = $1 WHERE id = $2 RETURNING photo_url',
     [photoUrl, req.params.id]
@@ -781,7 +1234,7 @@ app.post('/api/employees/:id/photo', requireAuth, upload.single('photo'), async 
   res.json({ photo_url: result.rows[0].photo_url });
 });
 
-app.delete('/api/employees/:id/photo', requireAuth, async (req, res) => {
+app.delete('/api/employees/:id/photo', requireAuth, validateIdParam, async (req, res) => {
   const result = await pool.query(
     `UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING photo_url`,
     [req.params.id]
@@ -790,7 +1243,7 @@ app.delete('/api/employees/:id/photo', requireAuth, async (req, res) => {
   res.json({ photo_url: null });
 });
 
-app.put('/api/employees/:id/restore', requireAuth, requireAdmin, async (req, res) => {
+app.put('/api/employees/:id/restore', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const result = await pool.query(
     'UPDATE employees SET active = true WHERE id = $1 RETURNING *',
     [req.params.id]
@@ -800,7 +1253,7 @@ app.put('/api/employees/:id/restore', requireAuth, requireAdmin, async (req, res
   res.json(result.rows[0]);
 });
 
-app.delete('/api/employees/:id/permanent', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/employees/:id/permanent', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const empId = Number(req.params.id);
   const existing = await pool.query('SELECT * FROM employees WHERE id = $1', [empId]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Employee not found.' });
@@ -1000,7 +1453,36 @@ app.post('/api/attendance/bulk', requireAuth, async (req, res) => {
   }
 });
 
-app.put('/api/attendance/:id', requireAuth, async (req, res) => {
+app.post('/api/attendance/mark-all', requireAuth, async (req, res) => {
+  const { work_date, employeeIds = [] } = req.body;
+  if (!work_date) return res.status(400).json({ error: 'work_date is required.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let count = 0;
+    for (const employeeId of employeeIds) {
+      if (await isDateLockedForEmployee(employeeId, work_date)) continue;
+      const emp = await client.query('SELECT rate FROM employees WHERE id = $1 AND active = true', [employeeId]);
+      if (!emp.rowCount) continue;
+      await client.query(
+        `INSERT INTO attendance_logs (employee_id, work_date, rate_snapshot, notes, created_by)
+         VALUES ($1, $2, $3, 'Present', $4)
+         ON CONFLICT (employee_id, work_date) DO NOTHING`,
+        [employeeId, work_date, emp.rows[0].rate, req.session.user.id]
+      );
+      count++;
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, count });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/attendance/:id', requireAuth, validateIdParam, async (req, res) => {
   const { work_date, time_in = null, time_out = null, notes = '' } = req.body;
   const existing = await pool.query('SELECT employee_id, work_date FROM attendance_logs WHERE id = $1', [req.params.id]);
   if (existing.rowCount && await isDateLockedForEmployee(existing.rows[0].employee_id, existing.rows[0].work_date)) {
@@ -1017,7 +1499,7 @@ app.put('/api/attendance/:id', requireAuth, async (req, res) => {
   res.json(result.rows[0]);
 });
 
-app.delete('/api/attendance/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/attendance/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const existing = await pool.query('SELECT * FROM attendance_logs WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Attendance record not found.' });
   const rec = existing.rows[0];
@@ -1029,7 +1511,7 @@ app.delete('/api/attendance/:id', requireAuth, requireAdmin, async (req, res) =>
   res.json({ ok: true });
 });
 
-app.delete('/api/cash-advances/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/cash-advances/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const existing = await pool.query('SELECT * FROM cash_advances WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'C/A record not found.' });
   const rec = existing.rows[0];
@@ -1097,7 +1579,7 @@ app.post('/api/extra-payments', requireAuth, async (req, res) => {
   res.status(201).json(result.rows[0]);
 });
 
-app.put('/api/extra-payments/:id', requireAuth, async (req, res) => {
+app.put('/api/extra-payments/:id', requireAuth, validateIdParam, async (req, res) => {
   const { employee_id, amount, extra_date, notes = '' } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
@@ -1122,7 +1604,7 @@ app.put('/api/extra-payments/:id', requireAuth, async (req, res) => {
   res.json(result.rows[0]);
 });
 
-app.delete('/api/extra-payments/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/extra-payments/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const existing = await pool.query('SELECT * FROM extra_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Extra payment not found.' });
   const rec = existing.rows[0];
@@ -1190,7 +1672,7 @@ app.post('/api/salary-payments', requireAuth, async (req, res) => {
   res.status(201).json(result.rows[0]);
 });
 
-app.put('/api/salary-payments/:id', requireAuth, async (req, res) => {
+app.put('/api/salary-payments/:id', requireAuth, validateIdParam, async (req, res) => {
   const { employee_id, amount, payment_date = todayInManila(), notes = '' } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
@@ -1217,7 +1699,7 @@ app.put('/api/salary-payments/:id', requireAuth, async (req, res) => {
   res.json(result.rows[0]);
 });
 
-app.delete('/api/salary-payments/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/salary-payments/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const existing = await pool.query('SELECT * FROM salary_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Salary payment not found.' });
   const rec = existing.rows[0];
@@ -1285,7 +1767,7 @@ app.post('/api/bale-payments', requireAuth, async (req, res) => {
   res.status(201).json(result.rows[0]);
 });
 
-app.put('/api/bale-payments/:id', requireAuth, async (req, res) => {
+app.put('/api/bale-payments/:id', requireAuth, validateIdParam, async (req, res) => {
   const { employee_id, amount, payment_date = todayInManila(), notes = '' } = req.body;
   if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
@@ -1312,7 +1794,7 @@ app.put('/api/bale-payments/:id', requireAuth, async (req, res) => {
   res.json(result.rows[0]);
 });
 
-app.delete('/api/bale-payments/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/bale-payments/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const existing = await pool.query('SELECT * FROM bale_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Bale payment not found.' });
   const rec = existing.rows[0];
@@ -1471,7 +1953,7 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
        GROUP BY employee_id
      )
      SELECT e.id AS employee_id, e.emp_number, e.name,
-       e.pay_period_days,
+       e.pay_period_days, e.photo_url,
        COALESCE(a.displayed_rate, e.rate)::numeric(12,2) AS rate,
        COALESCE(a.days, 0) AS days,
        COALESCE(ad.cash_advance, 0)::numeric(12,2) AS cash_advance,
@@ -1507,7 +1989,10 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
     [weekStart, weekEnd, search]
   );
 
-  const rows = (await Promise.all(result.rows.map(async row => {
+  const allEmployeeIds = result.rows.map(r => r.employee_id);
+  const carryoverMap = await getPayrollCarryoversBulk(allEmployeeIds, weekStart, getPeriodDays(result.rows[0]?.pay_period_days || 7));
+
+  const rows = result.rows.map(row => {
     const salary = money(row.salary);
     const cashAdvance = money(row.cash_advance);
     const salaryPaidAmount = money(row.salary_paid_amount);
@@ -1515,7 +2000,7 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
     const balePaymentAmount = money(row.bale_paid_amount);
     const legacyPaidAmount = money(row.legacy_paid_amount);
     const empPeriodDays = getPeriodDays(row.pay_period_days);
-    const carryovers = await getPayrollCarryoversBefore(row.employee_id, weekStart, empPeriodDays);
+    const carryovers = carryoverMap.get(row.employee_id) || { baleBalance: 0, unpaidBalance: 0 };
     const previousBaleBalance = carryovers.baleBalance;
     const previousUnpaidBalance = carryovers.unpaidBalance;
     const weekState = calculatePayrollWeekState({
@@ -1566,7 +2051,7 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
       paid_at: row.paid_at,
       payroll_status: row.payroll_status || null
     };
-  }))).filter(row =>
+  }).filter(row =>
     includeInactive ||
     row.days > 0 ||
     row.cash_advance > 0 ||
@@ -1577,11 +2062,23 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
     row.previous_unpaid_balance > 0
   );
 
+  const reviewResult = await pool.query(
+    `SELECT r.accepted_at, r.accepted_by, u.username AS accepted_by_username
+     FROM payroll_reviews r
+     LEFT JOIN users u ON u.id = r.accepted_by
+     WHERE r.period_key = $1`,
+    [weekStart]
+  );
+  const review = reviewResult.rowCount
+    ? { accepted: true, accepted_at: reviewResult.rows[0].accepted_at, accepted_by: reviewResult.rows[0].accepted_by, accepted_by_username: reviewResult.rows[0].accepted_by_username }
+    : { accepted: false };
+
   res.json({
     weekStart,
     weekEnd,
     periodDays,
     rows,
+    review,
     isPeriodLocked: rows.some(r => r.payroll_status === 'generated'),
     summary: {
       employees: rows.length,
@@ -1594,6 +2091,22 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
       totalPreviousUnpaid: rows.reduce((sum, row) => sum + row.previous_unpaid_balance, 0)
     }
   });
+});
+
+/* Accept a payroll period after review — required before Bulk Print. */
+app.post('/api/payroll/review', requireAuth, requireAdmin, async (req, res) => {
+  const periodDays = getPeriodDays(req.body.periodDays);
+  const weekStart = req.body.week
+    ? payrollWeekStartOf(req.body.week)
+    : periodStartOf(todayInManila(), periodDays);
+  await pool.query(
+    `INSERT INTO payroll_reviews (period_key, period_days, accepted_by)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (period_key) DO UPDATE SET accepted_at = NOW(), accepted_by = $3`,
+    [weekStart, periodDays, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'review_accept', 'payroll', null, { period_key: weekStart, period_days: periodDays });
+  res.json({ ok: true, accepted: true, period_key: weekStart });
 });
 
 /* Generating a payslip finalizes this employee's selected payroll period. */
@@ -1616,19 +2129,59 @@ app.post('/api/payroll/:employeeId/generate', requireAuth, async (req, res) => {
     [employeeId, weekStart, weekEnd]
   );
   const d = hasData.rows[0];
-  if (!d.has_salary && !d.has_bale && !d.has_extra) {
-    return res.status(400).json({ error: 'Cannot generate payslip: walang bayad na transaction para sa period na ito. Magbayad muna bago mag-generate ng payslip.' });
+  if (!d.has_attendance && !d.has_bale && !d.has_extra) {
+    return res.status(400).json({ error: 'Cannot generate payslip: no attendance or transactions found for this period.' });
   }
-  const result = await pool.query(
-    `INSERT INTO payroll_statuses (employee_id, week_start, status, updated_by, updated_at)
-     VALUES ($1, $2, 'generated', $3, NOW())
-     ON CONFLICT (employee_id, week_start)
-     DO UPDATE SET status = 'generated', updated_by = EXCLUDED.updated_by, updated_at = NOW()
-     RETURNING *`,
-    [employeeId, weekStart, req.session.user.id]
+
+  /* Calculate salary based on attendance × rate + extra pay */
+  const earningsResult = await pool.query(
+    `SELECT COALESCE(SUM(al.rate_snapshot), 0)::numeric(12,2) AS salary,
+            COALESCE(MAX(ep.extra_total), 0)::numeric(12,2) AS extra_pay
+     FROM (SELECT $1::int AS employee_id) e
+     LEFT JOIN attendance_logs al ON al.employee_id = e.employee_id AND al.work_date BETWEEN $2 AND $3
+     LEFT JOIN (
+       SELECT employee_id, SUM(amount)::numeric(12,2) AS extra_total
+       FROM extra_payments
+       WHERE employee_id = $1 AND extra_date BETWEEN $2 AND $3
+       GROUP BY employee_id
+     ) ep ON ep.employee_id = e.employee_id`,
+    [employeeId, weekStart, weekEnd]
   );
-  await logAudit(req.session.user.id, 'generate', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart });
-  res.json(result.rows[0]);
+  const salaryAmount = money(earningsResult.rows[0]?.salary || 0);
+  const extraAmount = money(earningsResult.rows[0]?.extra_pay || 0);
+  const totalEarnings = salaryAmount + extraAmount;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (totalEarnings > 0 && !d.has_salary) {
+      /* Auto-insert salary payment for earnings (only if none exists) */
+      await client.query(
+        `INSERT INTO salary_payments (employee_id, amount, payment_date, notes, created_by)
+         VALUES ($1, $2, $3, 'Auto-paid via payslip generation', $4)`,
+        [employeeId, totalEarnings, weekEnd, req.session.user.id]
+      );
+    }
+
+    const result = await client.query(
+      `INSERT INTO payroll_statuses (employee_id, week_start, status, updated_by, updated_at)
+       VALUES ($1, $2, 'generated', $3, NOW())
+       ON CONFLICT (employee_id, week_start)
+       DO UPDATE SET status = 'generated', updated_by = EXCLUDED.updated_by, updated_at = NOW()
+       RETURNING *`,
+      [employeeId, weekStart, req.session.user.id]
+    );
+
+    await client.query('COMMIT');
+    await logAudit(req.session.user.id, 'generate', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart, auto_paid: totalEarnings });
+    res.json(result.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.post('/api/payroll/:employeeId/unlock', requireAuth, async (req, res) => {
@@ -1637,14 +2190,31 @@ app.post('/api/payroll/:employeeId/unlock', requireAuth, async (req, res) => {
   if (!employee.rowCount) return res.status(404).json({ error: 'Employee not found.' });
   const periodDays = getPeriodDays(employee.rows[0].pay_period_days);
   const weekStart = periodStartOf(req.body.weekStart || todayInManila(), periodDays);
-  const result = await pool.query(
-    `UPDATE payroll_statuses SET status = 'unpaid', updated_by = $1, updated_at = NOW()
-     WHERE employee_id = $2 AND week_start = $3 RETURNING *`,
-    [req.session.user.id, employeeId, weekStart]
-  );
-  if (!result.rowCount) return res.status(404).json({ error: 'Generated payslip not found.' });
-  await logAudit(req.session.user.id, 'unlock', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart });
-  res.json(result.rows[0]);
+  const weekEnd = addDays(weekStart, periodDays - 1);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    /* Remove auto-created salary payment from payslip generation */
+    await client.query(
+      `DELETE FROM salary_payments
+       WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3 AND notes = 'Auto-paid via payslip generation'`,
+      [employeeId, weekStart, weekEnd]
+    );
+    const result = await client.query(
+      `UPDATE payroll_statuses SET status = 'unpaid', updated_by = $1, updated_at = NOW()
+       WHERE employee_id = $2 AND week_start = $3 RETURNING *`,
+      [req.session.user.id, employeeId, weekStart]
+    );
+    if (!result.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Generated payslip not found.' }); }
+    await client.query('COMMIT');
+    await logAudit(req.session.user.id, 'unlock', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart });
+    res.json(result.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.put('/api/payroll/payment', requireAuth, async (req, res) => {
@@ -1821,19 +2391,183 @@ app.put('/api/password', requireAuth, async (req, res) => {
   if (new_password.length < 6) {
     return res.status(400).json({ error: 'New password must be at least 6 characters.' });
   }
-  const userResult = await pool.query('SELECT id, password_hash FROM users WHERE id = $1', [req.session.user.id]);
+  const userResult = await pool.query('SELECT id, password_hash, must_change_password FROM users WHERE id = $1', [req.session.user.id]);
   if (!userResult.rowCount) return res.status(404).json({ error: 'User not found.' });
   const user = userResult.rows[0];
-  const valid = await bcrypt.compare(current_password, user.password_hash);
-  if (!valid) return res.status(401).json({ error: 'Current password is incorrect.' });
+  if (!user.must_change_password) {
+    const valid = await bcrypt.compare(current_password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect.' });
+  }
+  if (current_password === new_password && !user.must_change_password) {
+    return res.status(400).json({ error: 'New password must be different from current password.' });
+  }
   const newHash = await bcrypt.hash(new_password, 12);
-  await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [newHash, user.id]);
-  await logAudit(user.id, 'update', 'user', user.id, { action: 'password_change' });
+  await pool.query('UPDATE users SET password_hash = $1, must_change_password = false, updated_at = NOW() WHERE id = $2', [newHash, user.id]);
+  await logAudit(user.id, 'update', 'user', user.id, { action: 'password_change', forced: user.must_change_password });
   res.json({ ok: true });
 });
 
+/* ── Attendance Registrations (Flutter app approvals) ── */
+function registrationStatusParam(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (['pending', 'review', 'approved', 'rejected', 'archived'].includes(s)) return s;
+  return 'pending';
+}
+
+app.get('/api/registrations', requireAuth, async (req, res) => {
+  const status = registrationStatusParam(req.query.status);
+  const search = `%${req.query.search || ''}%`;
+  let where;
+  if (status === 'approved' || status === 'rejected') {
+    where = `status = $2`;
+  } else {
+    where = `status IN ('pending', 'review')`;
+  }
+  const params = [search, ...(status === 'approved' || status === 'rejected' ? [status] : [])];
+  const result = await pool.query(
+    `SELECT id, employee_id, name, email, phone, face_image,
+            status, admin_notes, registered_at, approved_at, payroll_employee_id
+     FROM attendance.employees
+     WHERE ${where} AND (name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR employee_id ILIKE $1)
+     ORDER BY CASE status WHEN 'review' THEN 0 ELSE 1 END, registered_at DESC`,
+    params
+  );
+  const countsResult = await pool.query(
+    `SELECT status, COUNT(*)::int AS count FROM attendance.employees GROUP BY status`
+  );
+  const counts = { pending: 0, review: 0, approved: 0, rejected: 0, archived: 0 };
+  for (const row of countsResult.rows) {
+    const key = registrationStatusParam(row.status);
+    if (key in counts) counts[key] = row.count;
+  }
+  res.json({ rows: result.rows, counts });
+});
+
+app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (req, res) => {
+  const { rate, pay_period_days = 7 } = req.body;
+  const existing = await pool.query(
+    `SELECT * FROM attendance.employees WHERE id = $1 AND status IN ('pending', 'review')`,
+    [req.params.id]
+  );
+  if (!existing.rowCount) return res.status(404).json({ error: 'Registration not found or already reviewed.' });
+  const reg = existing.rows[0];
+
+  if (rate === undefined || rate === '' || Number(rate) < 500) {
+    return res.status(400).json({ error: 'Daily rate must be at least ₱500.00.' });
+  }
+  const periodDays = Math.max(1, Math.floor(Number(pay_period_days) || 7));
+
+  const phone = String(reg.phone || '').trim();
+  if (!/^[0-9]{11}$/.test(phone)) {
+    return res.status(400).json({ error: 'Registration phone must be exactly 11 digits (numbers only).' });
+  }
+  const phoneCheck = await pool.query('SELECT id, name FROM employees WHERE phone = $1', [phone]);
+  let linkExisting = null;
+  if (phoneCheck.rowCount > 0) {
+    linkExisting = phoneCheck.rows[0];
+  } else {
+    const email = String(reg.email || '').trim();
+    if (email) {
+      const emailCheck = await pool.query('SELECT id, name FROM employees WHERE LOWER(email) = LOWER($1)', [email]);
+      if (emailCheck.rowCount > 0) linkExisting = emailCheck.rows[0];
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const name = (reg.name || '').trim();
+    let payrollEmployeeId;
+    const faceFilename = String(reg.face_image || '').trim();
+    const photoUrl = faceFilename ? `/attendance-faces/${encodeURIComponent(faceFilename)}` : null;
+    if (linkExisting) {
+      payrollEmployeeId = linkExisting.id;
+      await client.query(
+        `UPDATE employees
+         SET rate = $1, pay_period_days = $2,
+             photo_url = CASE WHEN photo_url IS NULL OR photo_url = '' THEN $3 ELSE photo_url END
+         WHERE id = $4`,
+        [Number(rate), periodDays, photoUrl, payrollEmployeeId]
+      );
+    } else {
+      const empNumber = await client.query(
+        `SELECT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0')) AS emp_number`
+      );
+      const parts = name.split(/\s+/);
+      const first = parts[0] || '';
+      const last = parts.slice(1).join(' ') || '';
+
+      const empInsert = await client.query(
+        `INSERT INTO employees (emp_number, first_name, last_name, name, phone, rate, pay_period_days, active, photo_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)
+         RETURNING id`,
+        [empNumber.rows[0].emp_number, first, last, name, phone, Number(rate), periodDays, photoUrl]
+      );
+      payrollEmployeeId = empInsert.rows[0].id;
+    }
+
+    const newEmpId = await client.query(
+      `SELECT (
+         'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
+         LPAD((COALESCE(MAX(NULLIF(split_part(employee_id, '-', 4), '')::int), 0) + 1)::text, 4, '0')
+       ) AS emp_id
+       FROM attendance.employees
+       WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
+    );
+    const attendanceEmpId = newEmpId.rows[0].emp_id;
+
+    await client.query(
+      `UPDATE attendance.employees
+       SET status = 'approved', employee_id = $1, approved_at = NOW(), admin_notes = NULL, payroll_employee_id = $2
+       WHERE id = $3`,
+      [attendanceEmpId, payrollEmployeeId, req.params.id]
+    );
+
+    await client.query('COMMIT');
+    await logAudit(req.session.user.id, 'approve', 'registration', Number(req.params.id), {
+      name,
+      phone,
+      rate: Number(rate),
+      attendance_employee_id: attendanceEmpId,
+      payroll_employee_id: payrollEmployeeId
+    });
+    res.status(201).json({
+      ok: true,
+      attendance_employee_id: attendanceEmpId,
+      payroll_employee_id: payrollEmployeeId
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/registrations/:id/reject', requireAuth, validateIdParam, async (req, res) => {
+  const notes = String(req.body.notes || '').trim().slice(0, 300);
+  const result = await pool.query(
+    `UPDATE attendance.employees SET status = 'rejected', admin_notes = $1
+     WHERE id = $2 AND status IN ('pending', 'review') RETURNING id`,
+    [notes, req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: 'Registration not found or already reviewed.' });
+  await logAudit(req.session.user.id, 'reject', 'registration', Number(req.params.id), { notes });
+  res.json({ ok: true });
+});
+
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', uptime: process.uptime(), db: 'connected' });
+  } catch (err) {
+    res.status(503).json({ status: 'error', db: 'disconnected' });
+  }
+});
+
 app.use((req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.sendFile(path.join(__dirname, 'attendance_system', 'public', 'index.html'));
 });
 
 app.use((err, req, res, next) => {
@@ -1846,8 +2580,83 @@ initDatabase()
     app.listen(PORT, () => {
       console.log(`Payroll system running at http://localhost:${PORT}`);
     });
+    ensureAttendanceBackend();
   })
   .catch(error => {
     console.error('Failed to start app:', error);
     process.exit(1);
   });
+
+/* ---- Attendance backend (FastAPI) auto-start ---- */
+let attendanceBackend = null;
+const ATTENDANCE_BACKEND_AUTOSTART = String(process.env.ATTENDANCE_BACKEND_AUTOSTART ?? 'true').toLowerCase() !== 'false';
+const ATTENDANCE_PORT = Number(process.env.ATTENDANCE_PORT) || 8000;
+const ATTENDANCE_PYTHON_CANDIDATES = [
+  process.env.ATTENDANCE_BACKEND_PYTHON,
+  'python',
+  'py',
+].filter(Boolean);
+
+function attendancePortInUse() {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(1000);
+    socket.once('connect', () => { socket.destroy(); resolve(true); });
+    socket.once('timeout', () => { socket.destroy(); resolve(false); });
+    socket.once('error', () => resolve(false));
+    socket.connect(ATTENDANCE_PORT, '127.0.0.1');
+  });
+}
+
+function spawnAttendanceBackend(pythonCmd) {
+  const backendDir = path.join(__dirname, 'attendance_system', 'backend');
+  const child = spawn(pythonCmd, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', String(ATTENDANCE_PORT)], {
+    cwd: backendDir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let spawnFailed = false;
+  child.stdout.on('data', (data) => process.stdout.write(`[attendance] ${data}`));
+  child.stderr.on('data', (data) => process.stderr.write(`[attendance] ${data}`));
+  child.on('error', (err) => {
+    spawnFailed = true;
+    const nextIndex = ATTENDANCE_PYTHON_CANDIDATES.indexOf(pythonCmd) + 1;
+    if (nextIndex < ATTENDANCE_PYTHON_CANDIDATES.length) {
+      console.log(`[attendance] '${pythonCmd}' not available, trying '${ATTENDANCE_PYTHON_CANDIDATES[nextIndex]}'.`);
+      spawnAttendanceBackend(ATTENDANCE_PYTHON_CANDIDATES[nextIndex]);
+    } else {
+      console.error(`[attendance] Could not start attendance backend (${pythonCmd}): ${err.message}`);
+      attendanceBackend = null;
+    }
+  });
+  child.on('exit', (code) => {
+    if (!spawnFailed) {
+      console.log(`[attendance] Attendance backend exited (code=${code}).`);
+      attendanceBackend = null;
+    }
+  });
+  attendanceBackend = child;
+}
+
+async function ensureAttendanceBackend() {
+  if (!ATTENDANCE_BACKEND_AUTOSTART) {
+    console.log('[attendance] Auto-start disabled (ATTENDANCE_BACKEND_AUTOSTART=false).');
+    return;
+  }
+  if (await attendancePortInUse()) {
+    console.log(`[attendance] Already running on port ${ATTENDANCE_PORT}.`);
+    return;
+  }
+  console.log(`[attendance] Starting backend on port ${ATTENDANCE_PORT}...`);
+  spawnAttendanceBackend(ATTENDANCE_PYTHON_CANDIDATES[0]);
+}
+
+function stopAttendanceBackend() {
+  if (attendanceBackend) {
+    try { attendanceBackend.kill(); } catch (e) { /* already gone */ }
+    attendanceBackend = null;
+  }
+}
+
+process.on('exit', stopAttendanceBackend);
+process.on('SIGINT', () => { stopAttendanceBackend(); process.exit(0); });
+process.on('SIGTERM', () => { stopAttendanceBackend(); process.exit(0); });

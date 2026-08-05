@@ -12,6 +12,8 @@ CREATE SEQUENCE IF NOT EXISTS employee_number_seq START 1;
 CREATE TABLE IF NOT EXISTS employees (
   id SERIAL PRIMARY KEY,
   emp_number VARCHAR(40) UNIQUE NOT NULL DEFAULT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0')),
+  first_name VARCHAR(80) NOT NULL DEFAULT '',
+  last_name VARCHAR(80) NOT NULL DEFAULT '',
   name VARCHAR(160) NOT NULL,
   phone VARCHAR(20) NOT NULL,
   rate NUMERIC(12, 2) NOT NULL CHECK (rate >= 0),
@@ -85,6 +87,10 @@ CREATE TABLE IF NOT EXISTS extra_payments (
 
 CREATE INDEX IF NOT EXISTS idx_attendance_logs_work_date ON attendance_logs(work_date);
 CREATE INDEX IF NOT EXISTS idx_cash_advances_date ON cash_advances(advance_date);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_sss_unique ON employees(sss_number) WHERE sss_number != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_philhealth_unique ON employees(philhealth_number) WHERE philhealth_number != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_pagibig_unique ON employees(pagibig_number) WHERE pagibig_number != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_tin_unique ON employees(tin_number) WHERE tin_number != '';
 CREATE INDEX IF NOT EXISTS idx_employees_name ON employees(name);
 CREATE INDEX IF NOT EXISTS idx_payroll_statuses_week ON payroll_statuses(week_start);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity, entity_id);

@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="fil">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KVSK Payroll System — Manwal ng Gumagamit</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --brand: #dc2626; --brand-light: #ef4444; --ink: #1a1d23; --ink-light: #4a4e57; --muted: #6b7280; --soft: #f3f4f6; --line: #e5e7eb; --panel: #ffffff; --bg: #f9fafb; --danger: #dc2626; --radius: 8px; --radius-md: 12px; --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; --shadow: 0 2px 8px rgba(0,0,0,0.08); }
+  body { font-family: var(--font); background: var(--bg); color: var(--ink); line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .cover { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 60px 40px; background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 50%, #1a1a1a 100%); color: #fff; position: relative; overflow: hidden; }
+  .cover::before { content: ''; position: absolute; width: 600px; height: 600px; border-radius: 50%; background: radial-gradient(circle, rgba(220,38,38,0.18) 0%, transparent 70%); top: -200px; right: -200px; }
+  .cover::after { content: ''; position: absolute; width: 400px; height: 400px; border-radius: 50%; background: radial-gradient(circle, rgba(255,255,255,0.05) 0%, transparent 70%); bottom: -100px; left: -100px; }
+  .cover * { position: relative; z-index: 1; }
+  .cover .logo-badge { width: 80px; height: 80px; background: var(--brand); border-radius: 20px; display: flex; align-items: center; justify-content: center; font-size: 36px; font-weight: 900; margin-bottom: 24px; box-shadow: 0 8px 32px rgba(220,38,38,0.35); }
+  .cover h1 { font-size: 42px; font-weight: 900; letter-spacing: -1px; margin-bottom: 8px; }
+  .cover .subtitle { font-size: 20px; color: #a3a3a3; font-weight: 500; margin-bottom: 40px; }
+  .cover .meta { display: flex; gap: 40px; font-size: 14px; color: #737373; justify-content: center; flex-wrap: wrap; margin-top: 80px; }
+  .cover .meta span { display: flex; flex-direction: column; gap: 4px; }
+  .cover .meta strong { color: #d4d4d4; font-weight: 600; }
+  .toc { position: sticky; top: 0; z-index: 100; background: var(--panel); border-bottom: 1px solid var(--line); padding: 12px 40px; display: flex; gap: 4px; overflow-x: auto; box-shadow: var(--shadow); }
+  .toc a { text-decoration: none; color: var(--muted); font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: var(--radius); white-space: nowrap; transition: all 0.15s; }
+  .toc a:hover { background: var(--soft); color: var(--ink); }
+  .toc a.active { background: var(--brand); color: #fff; }
+  main { max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }
+  section { margin-bottom: 60px; scroll-margin-top: 80px; }
+  h2 { font-size: 28px; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 3px solid var(--brand); display: inline-block; }
+  h3 { font-size: 20px; font-weight: 700; margin: 28px 0 12px; color: var(--ink-light); }
+  p { margin-bottom: 14px; color: var(--ink-light); font-size: 15px; }
+  ul, ol { margin: 12px 0 18px; padding-left: 24px; }
+  li { margin-bottom: 6px; font-size: 15px; color: var(--ink-light); }
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  .screenshot { margin: 24px 0; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--line); box-shadow: var(--shadow-lg); background: #1a1a1a; }
+  .screenshot-head { display: flex; align-items: center; gap: 8px; padding: 10px 16px; background: #1a1a1a; }
+  .screenshot-dots { display: flex; gap: 6px; }
+  .screenshot-dots span { width: 10px; height: 10px; border-radius: 50%; }
+  .screenshot-dots span:nth-child(1) { background: var(--red-500); }
+  .screenshot-dots span:nth-child(2) { background: #eab308; }
+  .screenshot-dots span:nth-child(3) { background: #22c55e; }
+  .screenshot-title { color: #737373; font-size: 11px; font-weight: 600; margin-left: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .screenshot-body { background: var(--bg); padding: 4px; text-align: center; }
+  .screenshot-body img { max-width: 100%; height: auto; display: block; border-radius: 4px; }
+  .screenshot-caption { background: var(--panel); padding: 10px 16px; font-size: 13px; color: var(--muted); text-align: center; border-top: 1px solid var(--line-light); font-style: italic; }
+
+  .callout { padding: 16px 20px; border-radius: var(--radius); margin: 16px 0; display: flex; gap: 12px; align-items: flex-start; }
+  .callout-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; flex-shrink: 0; }
+  .callout p { margin: 0; font-size: 14px; }
+  .callout.tip { background: #fef2f2; border: 1px solid #fee2e2; }
+  .callout.tip .callout-icon { background: #dc2626; color: #fff; }
+  .callout.warning { background: #fef3c7; border: 1px solid #fde68a; }
+  .callout.warning .callout-icon { background: #d97706; color: #fff; }
+  .callout.info { background: #f3f4f6; border: 1px solid #d1d5db; }
+  .callout.info .callout-icon { background: #1a1a1a; color: #fff; }
+  table.manual-table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+  table.manual-table th { background: var(--soft); font-weight: 700; text-transform: uppercase; font-size: 12px; letter-spacing: 0.5px; color: var(--muted); padding: 12px 14px; text-align: left; border-bottom: 2px solid var(--line); }
+  table.manual-table td { padding: 10px 14px; border-bottom: 1px solid var(--line-light); }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.admin { background: #dcfce7; color: #166534; }
+  .badge.hr { background: #fef2f2; color: #075985; }
+  .badge.paid { background: #dcfce7; color: #166534; }
+  .badge.unpaid { background: #fef2f2; color: #991b1b; }
+  .badge.partial { background: #fef3c7; color: #92400e; }
+  .badge.locked { background: #f3e8ff; color: #6b21a8; }
+  kbd { display: inline-block; padding: 3px 8px; font-size: 12px; font-weight: 600; font-family: var(--font); background: var(--soft); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 1px 0 var(--line); }
+  footer { text-align: center; padding: 40px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); margin-top: 40px; }
+  .step-list { counter-reset: step; list-style: none; padding: 0; }
+  .step-list li { counter-increment: step; padding: 12px 16px 12px 48px; position: relative; background: var(--panel); border: 1px solid var(--line-light); border-radius: var(--radius); margin-bottom: 8px; font-size: 14px; }
+  .step-list li::before { content: counter(step); position: absolute; left: 12px; top: 12px; width: 26px; height: 26px; background: var(--brand); color: #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+  
+  @media (max-width: 768px) { main { padding: 24px 16px 60px; } h2 { font-size: 22px; } .cover h1 { font-size: 28px; } .toc { padding: 8px 16px; } .toc a { font-size: 12px; padding: 6px 10px; } }
+  @media print { .toc { display: none; } .cover { min-height: 100vh; page-break-after: always; } }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <div class="logo-badge">K</div>
+  <h1>KVSK Payroll System</h1>
+  <p class="subtitle">Attendance &amp; Payroll Management System</p>
+  <p style="font-size:18px;color:#d4d4d4;margin-top:-24px;">MANWAL NG GUMAGAMIT</p>
+  <div style="margin-top:60px;display:flex;gap:16px;flex-wrap:wrap;justify-content:center;">
+    <span style="background:rgba(255,255,255,0.1);padding:8px 18px;border-radius:999px;font-size:13px;color:#a3a3a3;">KVSK CCTV &amp; IT Solutions</span>
+    <span style="background:rgba(255,255,255,0.1);padding:8px 18px;border-radius:999px;font-size:13px;color:#a3a3a3;">Hulyo 2026</span>
+    <span style="background:rgba(255,255,255,0.1);padding:8px 18px;border-radius:999px;font-size:13px;color:#a3a3a3;">Bersyon 1.1</span>
+  </div>
+  <div class="meta">
+    <span><strong>Ini-develop ni:</strong> Karl Vincent S. Katigbak</span>
+    <span><strong>Email:</strong> kvsk.cctv.itsolutions@gmail.com</span>
+    <span><strong>Contact:</strong> 0917 846 6710</span>
+  </div>
+</div>
+
+<nav class="toc" id="toc">
+  <a href="#intro">Panimula</a>
+  <a href="#login">Login</a>
+  <a href="#dashboard">Dashboard</a>
+  <a href="#employees">Employees</a>
+  <a href="#attendance">Attendance</a>
+  <a href="#payroll">Payroll</a>
+  <a href="#cashadvance">Cash Advance</a>
+  <a href="#archive">Archive</a>
+  <a href="#audit">Audit Trail</a>
+  <a href="#payslip">Payslip</a>
+  <a href="#backup">Backup</a>
+  <a href="#shortcuts">Shortcuts</a>
+  <a href="#faq">FAQ</a>
+</nav>
+
+<main>
+
+<section id="intro">
+<h2>1. Panimula</h2>
+<p>Ang <strong>KVSK Payroll System</strong> ay isang web-based na aplikasyon para sa <strong>KVSK CCTV &amp; IT Solutions</strong> upang mapadali ang pag-manage ng mga empleyado, attendance, sahod, cash advance (bale/utang), at payslip generation.</p>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Cash Advance View</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-cashadvance.png" alt="Cash Advance View" loading="lazy"></div>
+    <div class="screenshot-caption">Cash Advance (Bale) management — magdagdag ng cash advances at i-track ang mga utang.</div>
+  </div>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Payroll View</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-payroll.png" alt="Payroll View" loading="lazy"></div>
+    <div class="screenshot-caption">Payroll — dito makikita ang kumpletong talaan ng sahod ng bawat empleyado bawat linggo.</div>
+  </div>
+
+<h3>Tech Stack</h3>
+<table class="manual-table">
+<tr><th>Component</th><th>Technology</th></tr>
+<tr><td>Backend</td><td>Node.js + Express 5</td></tr>
+<tr><td>Database</td><td>PostgreSQL 14+</td></tr>
+<tr><td>Frontend</td><td>Vanilla JavaScript (SPA)</td></tr>
+<tr><td>Auth</td><td>Session-based with bcryptjs</td></tr>
+<tr><td>Desktop</td><td>Electron + electron-builder</td></tr>
+</table>
+
+<div class="callout info">
+<div class="callout-icon">i</div>
+<p>Ang system na ito ay dinisenyo para sa small to medium businesses. Pwedeng gamitin sa web browser o bilang desktop application sa Windows.</p>
+</div>
+</section>
+
+<section id="login">
+<h2>2. Login at Pag-access</h2>
+
+<h3>2.1 Ang Login Screen</h3>
+<p>Pagbukas ng system, makikita mo ang login screen na may mga field para sa Username at Password.</p>
+
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Login Screen</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-login.png" alt="Login Screen" loading="lazy"></div>
+    <div class="screenshot-caption">Actual screenshot ng login screen sa KVSK Payroll System.</div>
+  </div>
+<div style="display:flex;flex-direction:column;gap:14px;">
+<div><span style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">USERNAME</span><div style="padding:10px 14px;border:1px solid var(--line);border-radius:8px;font-size:14px;background:var(--soft);">admin</div></div>
+<div><span style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">PASSWORD</span><div style="padding:10px 14px;border:1px solid var(--line);border-radius:8px;font-size:14px;background:var(--soft);display:flex;justify-content:space-between;">******** <span style="color:var(--muted);cursor:pointer;">SHOW</span></div></div>
+<div style="display:flex;align-items:center;gap:8px;"><div style="width:16px;height:16px;border:2px solid var(--muted);border-radius:3px;"></div><span style="font-size:13px;">Remember username</span></div>
+<div style="padding:12px;background: #dc2626;color:#fff;text-align:center;border-radius:8px;font-weight:700;font-size:15px;cursor:pointer;">Sign In</div>
+</div>
+<div style="display:flex;justify-content:center;gap:12px;margin-top:20px;">
+<span class="badge admin">Admin</span>
+<span class="badge hr">HR Staff</span>
+</div>
+</div>
+</div>
+</div>
+
+<h3>2.2 Paano Mag-login</h3>
+<ol class="step-list">
+<li>I-type ang iyong Username (halimbawa: admin o hr).</li>
+<li>I-type ang iyong Password.</li>
+<li>Kung gusto mong maalala ang username, i-check ang "Remember username".</li>
+<li>Pindutin ang "Sign In" button.</li>
+</ol>
+
+<div class="callout tip">
+<div class="callout-icon">!</div>
+<p><strong>Caps Lock warning:</strong> Awtomatikong maglalabas ng babala kung naka-on ang Caps Lock habang nagta-type ng password.</p>
+</div>
+
+<h3>2.3 User Roles at Permissions</h3>
+<table class="manual-table">
+<tr><th>Feature</th><th><span class="badge admin">Admin</span></th><th><span class="badge hr">HR Staff</span></th></tr>
+<tr><td>View employees</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Add / Edit employees</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Archive employees</td><td>Yes</td><td>No</td></tr>
+<tr><td>Permanent delete</td><td>Yes</td><td>No</td></tr>
+<tr><td>View audit trail</td><td>Yes</td><td>No</td></tr>
+<tr><td>Manage payroll</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Generate payslip</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Cash advance</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Delete records</td><td>Yes</td><td>No</td></tr>
+<tr><td>Backup management</td><td>Yes</td><td>No</td></tr>
+</table>
+
+<h3>2.4 Default User Accounts</h3>
+<table class="manual-table">
+<tr><th>Username</th><th>Password</th><th>Role</th></tr>
+<tr><td><code>admin</code></td><td><code>kvsk@2018</code></td><td><span class="badge admin">Admin</span></td></tr>
+<tr><td><code>hr</code></td><td><code>hr123</code></td><td><span class="badge hr">HR Staff</span></td></tr>
+</table>
+
+<div class="callout warning">
+<div class="callout-icon">!</div>
+<p><strong>Important:</strong> Palitan agad ang default password pagkatapos ng unang login para sa seguridad.</p>
+</div>
+
+<h3>2.5 Session Timeout</h3>
+<ul>
+<li>Ang session ay 8 oras bago mag-expire kung walang ginagawa.</li>
+<li>May countdown timer sa sidebar.</li>
+<li>Isang session lang bawat user -- kapag nag-login sa ibang device, ma-di-destroy ang lumang session.</li>
+</ul>
+</section>
+
+<section id="dashboard">
+<h2>3. Dashboard</h2>
+<p>Ang Dashboard ang unang makikita pagkatapos mag-login. Dito makikita ang summary ng lahat ng mahahalagang datos.</p>
+
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Dashboard View</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-dashboard.png" alt="Dashboard View" loading="lazy"></div>
+    <div class="screenshot-caption">Actual screenshot ng dashboard view sa KVSK Payroll System.</div>
+  </div>
+<div style="padding:16px;border-radius:10px;border-left:4px solid #075985;background:var(--panel);box-shadow:var(--shadow);"><span style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--muted);">This Week's Salary</span><strong style="display:block;font-size:28px;margin-top:6px;">P18,500</strong></div>
+<div style="padding:16px;border-radius:10px;border-left:4px solid #166534;background:var(--panel);box-shadow:var(--shadow);"><span style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--muted);">Total Paid</span><strong style="display:block;font-size:28px;margin-top:6px;">P12,000</strong></div>
+<div style="padding:16px;border-radius:10px;border-left:4px solid #c2410c;background:var(--panel);box-shadow:var(--shadow);"><span style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--muted);">Remaining Balance</span><strong style="display:block;font-size:28px;margin-top:6px;">P6,500</strong></div>
+<div style="padding:16px;border-radius:10px;border-left:4px solid #92400e;background:var(--panel);box-shadow:var(--shadow);"><span style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--muted);">Advance Balance</span><strong style="display:block;font-size:28px;margin-top:6px;">P3,200</strong></div>
+</div>
+</div>
+</div>
+
+<h3>3.1 Summary Cards</h3>
+<table class="manual-table">
+<tr><th>Card</th><th>Ibig Sabihin</th></tr>
+<tr><td><strong>Active Employees</strong></td><td>Bilang ng aktibong empleyado</td></tr>
+<tr><td><strong>Present Today</strong></td><td>Bilang ng empleyadong nag-log ng attendance ngayong araw</td></tr>
+<tr><td><strong>This Week's Salary</strong></td><td>Kabuuang sahod para sa linggong ito</td></tr>
+<tr><td><strong>Total Paid</strong></td><td>Kabuuang halaga ng sahod na nabayaran na</td></tr>
+<tr><td><strong>Remaining Balance</strong></td><td>Natitira pang hindi nababayarang sahod</td></tr>
+<tr><td><strong>Advance Balance</strong></td><td>Kabuuang utang (bale/cash advance) ng mga empleyado</td></tr>
+</table>
+
+<h3>3.2 Quick Actions</h3>
+<p>May mga Quick Action cards sa ilalim ng dashboard: Payroll, Attendance, Employees, Archive, at Audit Trail (Admin lang). Pindutin ang card para pumunta sa view na iyon.</p>
+</section>
+
+<section id="employees">
+<h2>4. Employee Management</h2>
+<p>Ang Employee section ay para sa pag-manage ng lahat ng empleyado -- pagdagdag, pag-edit, pag-archive, at pag-upload ng litrato.</p>
+
+<h3>4.1 Employee Table</h3>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Employee Table</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-employees.png" alt="Employee Table" loading="lazy"></div>
+    <div class="screenshot-caption">Actual screenshot ng employee table sa KVSK Payroll System.</div>
+  </div>
+</div>
+<div style="border:1px solid var(--line);border-radius:8px;overflow:hidden;">
+<div style="display:grid;grid-template-columns:40px 70px 2fr 1fr 80px 80px 80px;padding:10px 14px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);background:var(--soft);">Pic / ID / Name / Phone / Rate / Status / Actions</div>
+<div style="display:grid;grid-template-columns:40px 70px 2fr 1fr 80px 80px 80px 80px;padding:12px 14px;font-size:13px;border-top:1px solid var(--line-light);align-items:center;">
+<span style="width:30px;height:30px;background:#dc2626;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;">JD</span>
+<span>EMP-001</span><span><strong>Juan Dela Cruz</strong></span><span>09171234567</span><span><strong>P575</strong></span>
+<span><span class="badge paid">Active</span></span>
+<span>Edit</span><span style="color:#dc2626;">Archive</span>
+</div>
+</div>
+</div>
+</div>
+
+<h3>4.2 Pagdagdag ng Empleyado</h3>
+<ol class="step-list">
+<li>Pumunta sa Employees view (pindutin ang <kbd>4</kbd> sa keyboard).</li>
+<li>Pindutin ang "+ Add Employee" button.</li>
+<li>May lalabas na modal form na may mga field: Full Name, Phone Number (11 digits), Daily Rate, Government IDs (SSS, PhilHealth, Pag-IBIG, TIN), at Pay Period.</li>
+<li>Pwedeng mag-upload ng profile photo (JPEG/PNG, max 5MB).</li>
+<li>Pindutin ang "Add Employee" para i-save.</li>
+</ol>
+
+<h3>4.3 Pag-edit at Pag-archive</h3>
+<ul>
+<li><strong>Edit:</strong> Pindutin ang Edit button sa tabi ng empleyado para baguhin ang details.</li>
+<li><strong>Archive (Admin only):</strong> Pindutin ang Archive button para i-soft delete ang empleyado. Pwedeng i-restore sa Archive section.</li>
+<li><strong>Permanent Delete (Admin only):</strong> Sa Archive section, pindutin ang "Delete Forever" para permanenteng tanggalin ang empleyado at lahat ng records nito.</li>
+</ul>
+
+<div class="callout warning">
+<div class="callout-icon">!</div>
+<p><strong>Tandaan:</strong> Ang permanenteng pag-delete ng empleyado ay hindi na maaaring i-undo. Lahat ng records (attendance, cash advances, payroll) ay tatanggalin din.</p>
+</div>
+</section>
+
+<section id="attendance">
+<h2>5. Attendance Tracking</h2>
+<p>Dito nire-record ang araw-araw na attendance ng mga empleyado.</p>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Attendance View</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-attendance.png" alt="Attendance View" loading="lazy"></div>
+    <div class="screenshot-caption">Attendance — pumili ng petsa at mag-log ng attendance ng mga empleyado.</div>
+  </div>
+
+<h3>5.1 Pag-log ng Attendance</h3>
+<ol class="step-list">
+<li>Pumunta sa Attendance view (pindutin ang <kbd>3</kbd>).</li>
+<li>Piliin ang petsa gamit ang date picker o pindutin ang Previous Day / Next Day.</li>
+<li>Pumili ng Employee mula sa searchable dropdown.</li>
+<li>Pindutin ang "Add Attendance" button.</li>
+<li>Lalabas ang empleyado sa listahan na may "Present" badge.</li>
+</ol>
+
+<h3>5.2 Toolbar at Summary</h3>
+<ul>
+<li><strong>Date Picker:</strong> Mini calendar na may green/red dots para sa attendance status.</li>
+<li><strong>Search:</strong> Maghanap ng empleyado sa attendance list.</li>
+<li><strong>Previous/Next Day:</strong> Mag-navigate sa ibang petsa.</li>
+<li><strong>Summary Cards:</strong> Present Today, Date, Workday Number, Payroll Week, Week Ends.</li>
+</ul>
+
+<h3>5.3 Pag-delete ng Attendance (Admin Only)</h3>
+<p>Pindutin ang Delete button sa row ng attendance record. Hindi pwedeng mag-delete kung naka-lock na ang payroll period.</p>
+
+<div class="callout tip">
+<div class="callout-icon">!</div>
+<p><strong>Tip:</strong> Pwedeng mag-log ng attendance nang maramihan gamit ang Bulk Attendance -- pumili ng mga empleyado at markahan silang present sa isang buong linggo.</p>
+</div>
+</section>
+
+<section id="payroll">
+<h2>6. Payroll Management</h2>
+<p>Ito ang pinakamahalagang section -- dino-compute ang sahod, nagre-record ng payments, at gumagawa ng payslip.</p>
+
+<h3>6.1 Payroll Toolbar</h3>
+<p>Ang toolbar ay may: Week Start picker, Pay Period selector (Weekly/Semi-monthly), Search field, at Previous/Next buttons.</p>
+
+<h3>6.2 Payment Statuses</h3>
+<table class="manual-table">
+<tr><th>Status</th><th>Meaning</th></tr>
+<tr><td><span class="badge unpaid">Unpaid</span></td><td>Walang bayad na na-record</td></tr>
+<tr><td><span class="badge partial">Partial</span></td><td>May bayad pero may natitira pang balance</td></tr>
+<tr><td><span class="badge paid">Paid</span></td><td>Buo nang nabayaran</td></tr>
+<tr><td><span class="badge locked">Generated</span></td><td>May payslip na at naka-lock ang period</td></tr>
+</table>
+
+<h3>6.3 Paano Mag-manage ng Payroll</h3>
+<ol class="step-list">
+<li>Pumunta sa Payroll view (pindutin ang <kbd>2</kbd>).</li>
+<li>Piliin ang tamang week gamit ang date picker.</li>
+<li>Pindutin ang "Manage" button sa tabi ng empleyado.</li>
+<li>Sa modal, makikita ang overview ng sahod at transactions.</li>
+<li>Pindutin ang "+ Magdagdag" para magdagdag ng transaction.</li>
+</ol>
+
+<h3>6.4 Mga Uri ng Transaction</h3>
+<table class="manual-table">
+<tr><th>Transaction Type</th><th>Description</th></tr>
+<tr><td><strong>Bayad Sahod</strong></td><td>Pagbayad ng sahod (amount <= balance)</td></tr>
+<tr><td><strong>Cash Advance (Bale)</strong></td><td>Pagbigay ng cash advance / utang</td></tr>
+<tr><td><strong>Bayad Bale</strong></td><td>Pagbayad ng empleyado sa kanyang utang</td></tr>
+<tr><td><strong>Dagdag Sahod</strong></td><td>Bonus, adjustment, o extra payment</td></tr>
+</table>
+
+<h3>6.5 Pag-generate ng Payslip</h3>
+<ol class="step-list">
+<li>Sa payroll entry modal, pindutin ang "Gumawa ng Payslip".</li>
+<li>Ang period ay ma-lo-lock -- hindi na pwedeng magbago ng attendance o transactions.</li>
+<li>Lalabas ang payslip na pwedeng i-print (Ctrl+P) o i-save bilang PDF.</li>
+<li>Pwedeng i-Unlock ng Admin kung kailangan ng correction.</li>
+</ol>
+
+<div class="callout warning">
+<div class="callout-icon">!</div>
+<p><strong>Important:</strong> Kapag na-generate na ang payslip at naka-lock, hindi na pwedeng magdagdag o magbago ng attendance at transactions para sa period na iyon.</p>
+</div>
+
+<h3>6.6 CSV Export at Bulk Print</h3>
+<ul>
+<li><strong>Export CSV:</strong> I-download ang payroll data para sa Excel.</li>
+<li><strong>Bulk Print:</strong> I-print lahat ng payslip nang sabay-sabay (kung lahat ay generated na).</li>
+</ul>
+</section>
+
+<section id="cashadvance">
+<h2>7. Cash Advance (Bale/Utang)</h2>
+<p>Ang Cash Advance section ay para sa pag-manage ng mga cash advances (bale) na ibinibigay sa mga empleyado.</p>
+
+<h3>7.1 Pagdagdag ng Cash Advance</h3>
+<ol class="step-list">
+<li>Pumunta sa Cash Advance view.</li>
+<li>Piliin ang empleyado mula sa dropdown.</li>
+<li>Ilagay ang halaga ng cash advance.</li>
+<li>Piliin ang petsa gamit ang mini calendar.</li>
+<li>Maglagay ng puna/notes (optional).</li>
+<li>Pindutin ang "Add C/A" o "Update C/A".</li>
+</ol>
+
+<div class="callout info">
+<div class="callout-icon">i</div>
+<p><strong>Limit:</strong> Isang cash advance lang bawat empleyado bawat araw. Hindi pwedeng mag-edit o mag-delete kung naka-lock na ang payroll period.</p>
+</div>
+
+<h3>7.2 View at Navigation</h3>
+<p>Gamit ang Week Start picker, pwedeng mag-navigate sa iba't ibang linggo. Pareho ang toolbar sa Payroll -- may search, pay period selector, at Previous/Next buttons.</p>
+</section>
+
+<section id="archive">
+<h2>8. Archive</h2>
+<p>Dito makikita ang mga naka-archive na empleyado. Ang archive ay parang "soft delete" -- pwedeng i-restore anumang oras.</p>
+
+<h3>8.1 Mga Action sa Archive</h3>
+<table class="manual-table">
+<tr><th>Action</th><th>Description</th><th>Admin Only</th></tr>
+<tr><td><strong>Restore</strong></td><td>Ibalik ang empleyado sa active status</td><td>Yes</td></tr>
+<tr><td><strong>Payslip</strong></td><td>Tingnan ang payslip ng empleyado</td><td>Yes</td></tr>
+<tr><td><strong>Delete Forever</strong></td><td>Permanenteng tanggalin ang empleyado at lahat ng records</td><td>Yes</td></tr>
+</table>
+
+<div class="callout warning">
+<div class="callout-icon">!</div>
+<p><strong>Warning:</strong> Ang "Delete Forever" ay permanenteng magtatanggal ng empleyado kasama ang lahat ng records. Hindi na ito pwedeng i-undo.</p>
+</div>
+</section>
+
+<section id="audit">
+<h2>9. Audit Trail (Admin Only)</h2>
+<p>Ang Audit Trail ay isang kumpletong talaan ng lahat ng actions na ginawa sa system. Admin lang ang may access.</p>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Audit Trail Logs</span></div>
+    <div class="screenshot-body" style="padding:20px;background:#f9fafb;">
+      <div style="max-width:700px;margin:0 auto;font-family:Inter,sans-serif;">
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+          <select style="padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;background:#fff;"><option>All Entities</option><option>Employee</option><option>Cash Advance</option><option>Attendance</option></select>
+          <select style="padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;background:#fff;"><option>All Actions</option><option>Create</option><option>Update</option><option>Delete</option></select>
+          <input type="text" placeholder="Search..." style="padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;flex:1;">
+          <input type="date" style="padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;">
+          <span style="padding:6px 16px;background:#1a1a1a;color:#fff;border-radius:6px;font-size:12px;font-weight:600;cursor:default;">Export CSV</span>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;border:1px solid #e5e7eb;">
+          <thead><tr style="background:#1a1a1a;color:#fff;">
+            <th style="padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;">Date/Time</th>
+            <th style="padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;">User</th>
+            <th style="padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;">Action</th>
+            <th style="padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;">Entity</th>
+            <th style="padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;">Details</th>
+          </tr></thead>
+          <tbody>
+            <tr style="border-bottom:1px solid #e5e7eb;"><td style="padding:8px 10px;">2026-07-28 09:30</td><td style="padding:8px 10px;font-weight:600;">admin</td><td style="padding:8px 10px;"><span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;">Create</span></td><td style="padding:8px 10px;">Employee</td><td style="padding:8px 10px;color:#6b7280;font-size:12px;">Added Juan Dela Cruz (EMP-001)</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;background:#f9fafb;"><td style="padding:8px 10px;">2026-07-28 10:15</td><td style="padding:8px 10px;font-weight:600;">admin</td><td style="padding:8px 10px;"><span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;">Update</span></td><td style="padding:8px 10px;">Employee</td><td style="padding:8px 10px;color:#6b7280;font-size:12px;">Updated rate: P550 to P575</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;"><td style="padding:8px 10px;">2026-07-28 11:00</td><td style="padding:8px 10px;font-weight:600;">hr</td><td style="padding:8px 10px;"><span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;">Create</span></td><td style="padding:8px 10px;">Attendance</td><td style="padding:8px 10px;color:#6b7280;font-size:12px;">Marked present on 2026-07-28</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;background:#f9fafb;"><td style="padding:8px 10px;">2026-07-28 14:00</td><td style="padding:8px 10px;font-weight:600;">admin</td><td style="padding:8px 10px;"><span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;">Delete</span></td><td style="padding:8px 10px;">Cash Advance</td><td style="padding:8px 10px;color:#6b7280;font-size:12px;">Removed C/A P500 for Juan Dela Cruz</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;"><td style="padding:8px 10px;">2026-07-28 15:30</td><td style="padding:8px 10px;font-weight:600;">admin</td><td style="padding:8px 10px;"><span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;">Create</span></td><td style="padding:8px 10px;">Extra Payment</td><td style="padding:8px 10px;color:#6b7280;font-size:12px;">Added P200 bonus for Maria Santos</td></tr>
+          </tbody>
+        </table>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:12px;color:#6b7280;">
+          <span>Showing 1-5 of 12 entries</span>
+          <div style="display:flex;gap:4px;">
+            <span style="padding:4px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;">Previous</span>
+            <span style="padding:4px 10px;background:#1a1a1a;color:#fff;border-radius:4px;font-size:12px;">1</span>
+            <span style="padding:4px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;">2</span>
+            <span style="padding:4px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;">3</span>
+            <span style="padding:4px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;">Next</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="screenshot-caption">Audit Trail — kumpletong talaan ng lahat ng actions sa system na may filters, search, date range, at CSV export.</div>
+  </div>
+
+<h3>9.1 Filters</h3>
+<ul>
+<li><strong>Entity Filter</strong> -- Pumili ng uri (Employee, Cash Advance, Extra Payment, etc.)</li>
+<li><strong>Action Filter</strong> -- Pumili ng action (Create, Update, Delete, Archive, Restore, Permanent Delete)</li>
+<li><strong>Search</strong> -- Maghanap sa details ng audit logs</li>
+<li><strong>Date Range</strong> -- Pumili ng from-to date</li>
+<li><strong>Export CSV</strong> -- I-download ang audit logs bilang CSV file</li>
+</ul>
+
+<h3>9.2 Paano Buksan ang Audit Trail</h3>
+<ul>
+<li>Pindutin ang "Audit Trail" button sa Dashboard quick actions.</li>
+<li>Pindutin ang "Audit Trail" button sa Payroll section (Admin lang nakakakita).</li>
+</ul>
+</section>
+
+<section id="payslip">
+<h2>10. Payslip Generation</h2>
+<p>Ang payslip ay isang detalyadong talaan ng sahod ng empleyado para sa isang period.</p>
+
+<h3>10.1 Nilalaman ng Payslip</h3>
+<table class="manual-table">
+<tr><th>Section</th><th>Nilalaman</th></tr>
+<tr><td><strong>Header</strong></td><td>Company name (KVSK CCTV & IT Solutions), address, contact info</td></tr>
+<tr><td><strong>Period</strong></td><td>Panahon (start date - end date)</td></tr>
+<tr><td><strong>Employee Info</strong></td><td>Pangalan, employee number, daily rate, days worked, status</td></tr>
+<tr><td><strong>Araw-araw na Tala</strong></td><td>Bawat araw -- kita, bale, kabuuan</td></tr>
+<tr><td><strong>Kabuuang Kita</strong></td><td>Sahod + Dagdag Sahod + Carry Over</td></tr>
+<tr><td><strong>Balensa ng Bale</strong></td><td>Utang mula nakaraan + bagong bale - bayad bale = natitirang utang</td></tr>
+<tr><td><strong>Pagkilala</strong></td><td>Lagda ng empleyado, posisyon, at petsa</td></tr>
+</table>
+
+<h3>10.2 Paano Gumawa ng Payslip</h3>
+<ol class="step-list">
+<li>Pumunta sa Payroll view at piliin ang tamang period.</li>
+<li>Pindutin ang "Manage" button sa tabi ng empleyado.</li>
+<li>I-verify na tama ang lahat ng transactions.</li>
+<li>Pindutin ang "Tingnan Payslip" para i-preview (read-only).</li>
+<li>Pindutin ang "Gumawa ng Payslip" para i-lock at i-generate ang final payslip.</li>
+<li>I-print (Ctrl+P) o i-save bilang PDF.</li>
+</ol>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Generated Payslip</span></div>
+    <div class="screenshot-body" style="padding:24px;background:#f9fafb;">
+      <div style="max-width:500px;margin:0 auto;font-family:Inter,sans-serif;border:1px solid #d1d5db;border-radius:8px;overflow:hidden;background:#fff;">
+        <div style="background:#1a1a1a;color:#fff;padding:16px 20px;text-align:center;">
+          <div style="font-size:18px;font-weight:800;letter-spacing:1px;">KVSK CCTV & IT SOLUTIONS</div>
+          <div style="font-size:11px;color:#a3a3a3;">195 B. Laurena Poblacion, Tanauan City</div>
+          <div style="font-size:11px;color:#a3a3a3;margin-top:4px;">PAYSLIP</div>
+        </div>
+        <div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;">
+          <div style="display:flex;justify-content:space-between;font-size:13px;">
+            <div><strong>Employee:</strong> Juan Dela Cruz<br><strong>ID:</strong> EMP-001</div>
+            <div style="text-align:right;"><strong>Period:</strong> Jul 27 - Aug 2, 2026<br><strong>Daily Rate:</strong> P575.00</div>
+          </div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead><tr style="background:#1a1a1a;color:#fff;"><th style="padding:8px 12px;text-align:left;font-size:11px;">Date</th><th style="padding:8px 12px;text-align:center;font-size:11px;">Rate</th><th style="padding:8px 12px;text-align:right;font-size:11px;">Earnings</th></tr></thead>
+          <tbody>
+            <tr style="border-bottom:1px solid #e5e7eb;"><td style="padding:6px 12px;">Mon, Jul 27</td><td style="padding:6px 12px;text-align:center;">P575</td><td style="padding:6px 12px;text-align:right;">P575.00</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;background:#f9fafb;"><td style="padding:6px 12px;">Tue, Jul 28</td><td style="padding:6px 12px;text-align:center;">P575</td><td style="padding:6px 12px;text-align:right;">P575.00</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;"><td style="padding:6px 12px;">Wed, Jul 29</td><td style="padding:6px 12px;text-align:center;">P575</td><td style="padding:6px 12px;text-align:right;">P575.00</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;background:#f9fafb;"><td style="padding:6px 12px;">Thu, Jul 30</td><td style="padding:6px 12px;text-align:center;">P575</td><td style="padding:6px 12px;text-align:right;">P575.00</td></tr>
+            <tr style="border-bottom:1px solid #e5e7eb;"><td style="padding:6px 12px;">Fri, Jul 31</td><td style="padding:6px 12px;text-align:center;">P575</td><td style="padding:6px 12px;text-align:right;">P575.00</td></tr>
+          </tbody>
+        </table>
+        <div style="padding:12px 20px;background:#f0fdf4;border-top:2px solid #16a34a;">
+          <div style="display:flex;justify-content:space-between;font-size:14px;">
+            <span><strong>Gross Pay (5 days):</strong></span><span><strong style="color:#166534;">P2,875.00</strong></span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin-top:4px;">
+            <span>Cash Advance Deduction:</span><span>- P500.00</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:#6b7280;">
+            <span>Extra Payment:</span><span>+ P200.00</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:16px;font-weight:800;border-top:2px solid #16a34a;padding-top:8px;margin-top:8px;">
+            <span>NET PAY:</span><span style="color:#166534;">P2,575.00</span>
+          </div>
+        </div>
+        <div style="padding:12px 20px;font-size:11px;color:#6b7280;border-top:1px solid #e5e7eb;display:flex;justify-content:space-between;">
+          <span>Bale Balance: P800.00</span>
+          <span>Previous Unpaid: P0.00</span>
+        </div>
+      </div>
+    </div>
+    <div class="screenshot-caption">Sample payslip — ipinapakita ang araw-araw na breakdown ng sahod, gross pay, deductions, at net pay. Pwedeng i-print o i-save bilang PDF.</div>
+  </div>
+</section>
+
+<section id="backup">
+<h2>11. Backup Management</h2>
+<ul>
+<li>Tuwing 11:00 PM (Manila time) ay awtomatikong nagba-backup ang database.</li>
+<li>Maximum na 30 backups ang iniimbak -- ang pinakaluma ay awtomatikong tatanggalin.</li>
+<li>Ang backups ay naka-imbak sa backups/ directory.</li>
+<li>Pwedeng mag-manual backup (Admin only).</li>
+</ul>
+</section>
+
+<section id="shortcuts">
+<h2>12. Keyboard Shortcuts</h2>
+<table class="manual-table">
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>1</kbd></td><td>Dashboard</td></tr>
+<tr><td><kbd>2</kbd></td><td>Payroll</td></tr>
+<tr><td><kbd>3</kbd></td><td>Attendance</td></tr>
+<tr><td><kbd>4</kbd></td><td>Employees</td></tr>
+<tr><td><kbd>5</kbd></td><td>Archive</td></tr>
+<tr><td><kbd>Left Arrow</kbd></td><td>Previous week / period</td></tr>
+<tr><td><kbd>Right Arrow</kbd></td><td>Next week / period</td></tr>
+<tr><td><kbd>Esc</kbd></td><td>Close modal / popup</td></tr>
+</table>
+<div class="callout tip">
+<div class="callout-icon">!</div>
+<p>Hindi gumagana ang keyboard shortcuts kapag nagta-type sa input fields.</p>
+</div>
+
+<h2>13. Dark Mode / Light Mode</h2>
+<p>Pindutin ang Dark Mode sa sidebar para mag-switch ng theme. Ang preference ay na-sa-save sa browser. Ang login screen ay laging naka-light mode.</p>
+<div class="screenshot">
+    <div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Dashboard — Dark Mode</span></div>
+    <div class="screenshot-body"><img src="screenshots/screenshot-dashboard-dark.png" alt="Dashboard Dark Mode" loading="lazy"></div>
+    <div class="screenshot-caption">Dark Mode — mas madaling gamitin sa gabi o sa mababang liwanag.</div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px;">
+    <div class="screenshot"><div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Dark — Attendance</span></div><div class="screenshot-body"><img src="screenshots/screenshot-attendance-dark.png" alt="Attendance Dark" loading="lazy"></div></div>
+    <div class="screenshot"><div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Dark — Payroll</span></div><div class="screenshot-body"><img src="screenshots/screenshot-payroll-dark.png" alt="Payroll Dark" loading="lazy"></div></div>
+    <div class="screenshot" style="grid-column:1/-1;"><div class="screenshot-head"><div class="screenshot-dots"><span></span><span></span><span></span></div><span class="screenshot-title">Dark — Employees</span></div><div class="screenshot-body"><img src="screenshots/screenshot-employees-dark.png" alt="Employees Dark" loading="lazy"></div></div>
+  </div>
+
+<h2>14. Sidebar Navigation</h2>
+<p>Ang sidebar ay may Main Menu (Dashboard, Payroll, Attendance, Employees, Archive), User Info (username, role badge), Actions (Dark Mode, Change Password, Switch User, Logout), at Session Timer. Pwedeng i-collapse ang sidebar para mas maraming space. Sa mobile, nagiging hamburger menu na may bottom navigation bar.</p>
+</section>
+
+<section id="faq">
+<h2>15. Frequently Asked Questions</h2>
+
+<h3>Paano mag-login kung nakalimutan ang password?</h3>
+<p>Makipag-ugnayan sa Admin para ma-reset ang password. Pwedeng mag-change password sa sidebar pagkatapos mag-login.</p>
+
+<h3>Bakit naka-lock ang payroll period?</h3>
+<p>Kapag na-generate na ang payslip ng isang empleyado, ma-lo-lock ang period. Pwedeng i-unlock ng Admin kung kailangan ng correction.</p>
+
+<h3>Paano mag-print ng payslip?</h3>
+<p>Pagkatapos i-generate ang payslip, magbubukas ito sa bagong window. Pwedeng pindutin ang Ctrl+P para i-print, o piliin ang "Save as PDF".</p>
+
+<h3>Pwede bang mag-delete ng attendance record?</h3>
+<p>Oo, pero Admin lang ang pwedeng mag-delete. Hindi pwedeng mag-delete kung naka-lock na ang payroll period.</p>
+
+<h3>Paano baguhin ang daily rate ng empleyado?</h3>
+<p>Pumunta sa Employees section, pindutin ang "Edit" sa tabi ng empleyado, at baguhin ang "Daily Rate" field.</p>
+
+<h3>Ano ang pagkakaiba ng "Bayad Sahod" at "Bayad Bale"?</h3>
+<ul>
+<li><strong>Bayad Sahod</strong> -- Pagbabayad ng sahod (bawas sa salary balance)</li>
+<li><strong>Bayad Bale</strong> -- Pagbabayad ng empleyado sa utang (bawas sa bale balance)</li>
+</ul>
+
+<h3>Ano ang "Bale" o "Cash Advance"?</h3>
+<p>Ang bale ay perang ipapautang ng kompanya sa empleyado. Ito ay ibabawas sa susunod na sahod. Tinatawag din itong cash advance o utang.</p>
+
+<h3>Pwede bang magkaroon ng dalawang session nang sabay?</h3>
+<p>Hindi. Kapag nag-login sa ibang device, ang lumang session ay awtomatikong ma-di-destroy.</p>
+
+<h3>Paano mag-export ng datos para sa Excel?</h3>
+<p>Pwedeng i-export ang payroll data bilang CSV (pindutin ang "Export CSV" sa Payroll). Pwedeng i-export din ang Audit Trail.</p>
+</section>
+
+<footer>
+<p><strong>KVSK Payroll System</strong> -- Attendance &amp; Payroll Management</p>
+<p>KVSK CCTV &amp; IT Solutions | 195 B. Laurena Poblacion, Tanauan City</p>
+<p>kvsk.cctv.itsolutions@gmail.com | 0917 846 6710</p>
+<p style="margin-top:12px;font-size:12px;">Bersyon 1.1 | Hulyo 2026 | Ginawa para sa KVSK CCTV &amp; IT Solutions</p>
+</footer>
+
+</main>
+
+<script>
+const links = document.querySelectorAll('.toc a');
+const secs = document.querySelectorAll('section[id]');
+function update() {
+  let cur = '';
+  secs.forEach(s => { if (window.scrollY >= s.offsetTop - 100) cur = s.id; });
+  links.forEach(l => l.classList.toggle('active', l.getAttribute('href') === '#' + cur));
+}
+window.addEventListener('scroll', update);
+window.addEventListener('load', update);
+</script>
+
+</body>
+</html>
