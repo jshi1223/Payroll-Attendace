@@ -214,8 +214,11 @@ def _seed_default_admin(cursor) -> None:
         return
 
     username = _get_env("DEFAULT_ADMIN_USERNAME", "admin")
-    password = _get_env("DEFAULT_ADMIN_PASSWORD", "admin123")
-    email = _get_env("DEFAULT_ADMIN_EMAIL", "admin@example.com")
+    password = _get_env("DEFAULT_ADMIN_PASSWORD", "")
+    email = _get_env("DEFAULT_ADMIN_EMAIL", "")
+    if not password:
+        print("Skip seeding default admin: DEFAULT_ADMIN_PASSWORD is not set.")
+        return
     hashed = pwd_context.hash(password)
 
     cursor.execute(

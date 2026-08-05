@@ -1,12 +1,19 @@
+import os
+import sys
+
 from passlib.context import CryptContext
 import psycopg2
 
 from db import DB_CONFIG
 
 
-TARGET_USERNAME = "admin"
-NEW_PASSWORD = "admin123"
-NEW_EMAIL = "vaness098a@gmail.com"
+TARGET_USERNAME = os.getenv("ADMIN_RESET_USERNAME", "admin")
+NEW_PASSWORD = os.getenv("ADMIN_NEW_PASSWORD", "").strip()
+NEW_EMAIL = os.getenv("ADMIN_NEW_EMAIL", "vaness098a@gmail.com")
+
+if not NEW_PASSWORD:
+    print("Error: ADMIN_NEW_PASSWORD environment variable is required.")
+    sys.exit(1)
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 hashed = pwd.hash(NEW_PASSWORD)

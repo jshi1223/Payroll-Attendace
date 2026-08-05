@@ -36,7 +36,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_CONFIG = DATABASE_URL or {
     "host": _get_env("DB_HOST", "localhost"),
     "user": _get_env("DB_USER", "attendance_user"),
-    "password": os.getenv("DB_PASSWORD", "attendance_pass"),
+    "password": os.getenv("DB_PASSWORD", ""),
     "dbname": _get_env("DB_NAME", "attendance_db"),
     "port": int(_get_env("DB_PORT", "5432")),
 }

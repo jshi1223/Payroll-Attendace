@@ -863,10 +863,13 @@ async function initDatabase() {
     )
   `);
 
-  const defaultUsers = [
-    { username: process.env.BOOTSTRAP_USERNAME || 'admin', password: process.env.BOOTSTRAP_PASSWORD || 'kvsk@2018', role: process.env.BOOTSTRAP_ROLE || 'admin' },
-    { username: process.env.BOOTSTRAP_HR_USERNAME || 'hr', password: process.env.BOOTSTRAP_HR_PASSWORD || 'hr123', role: process.env.BOOTSTRAP_HR_ROLE || 'hr' }
-  ];
+  const defaultUsers = [];
+  const bootstrapAdmin = { username: process.env.BOOTSTRAP_USERNAME || 'admin', password: process.env.BOOTSTRAP_PASSWORD, role: process.env.BOOTSTRAP_ROLE || 'admin' };
+  const bootstrapHr = { username: process.env.BOOTSTRAP_HR_USERNAME || 'hr', password: process.env.BOOTSTRAP_HR_PASSWORD, role: process.env.BOOTSTRAP_HR_ROLE || 'hr' };
+  if (bootstrapAdmin.password) defaultUsers.push(bootstrapAdmin);
+  else console.log('  Skip creating admin: BOOTSTRAP_PASSWORD is not set.');
+  if (bootstrapHr.password) defaultUsers.push(bootstrapHr);
+  else console.log('  Skip creating HR user: BOOTSTRAP_HR_PASSWORD is not set.');
 
   for (const u of defaultUsers) {
     const exists = await pool.query('SELECT id, role, must_change_password FROM users WHERE username = $1', [u.username]);
@@ -886,31 +889,6 @@ async function initDatabase() {
     }
   }
 
-  /* Migration: replace default accounts with new admin & HR users */
-  const karlExists = await pool.query("SELECT id FROM users WHERE username = 'karl'");
-  if (!karlExists.rowCount) {
-    console.log('  Running user migration (add karl, jamil, joey; remove admin, hr)...');
-    await pool.query('DELETE FROM audit_logs');
-    const oldUserIds = await pool.query("SELECT id FROM users WHERE username IN ('admin', 'hr')");
-    for (const row of oldUserIds.rows) {
-      await pool.query('UPDATE payroll_statuses SET updated_by = NULL WHERE updated_by = $1', [row.id]);
-    }
-    await pool.query("DELETE FROM users WHERE username IN ('admin', 'hr')");
-    const newUsers = [
-      { username: 'karl', password: 'karl123', role: 'admin' },
-      { username: 'jamil', password: 'jamil123', role: 'hr' },
-      { username: 'joey', password: 'joey123', role: 'hr' }
-    ];
-    for (const u of newUsers) {
-      const hash = await bcrypt.hash(u.password, 10);
-      await pool.query(
-        'INSERT INTO users (username, password_hash, role, must_change_password) VALUES ($1, $2, $3, false)',
-        [u.username, hash, u.role]
-      );
-      console.log(`  Created user: ${u.username} (${u.role})`);
-    }
-    console.log('  User migration complete; audit logs cleared.');
-  }
 }
 
 async function logAudit(userId, action, entity, entityId, details = {}) {

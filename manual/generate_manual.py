@@ -498,7 +498,7 @@ para(
     'at bagong password.')
 
 add_img('screenshot-15-change-password.png', 'Figure 12.1: Change Password Screen')
-note('Default admin password is "admin123". Change it immediately after first login.')
+note('The default admin password is configured in the .env file (BOOTSTRAP_PASSWORD). Change it immediately after first login.')
 
 pb()
 
@@ -699,7 +699,7 @@ faqs = [
     ('How to print multiple payslips?',
      'Use "Bulk Print Payslips" in the Payroll view after generating all payslips.'),
     ('Default password?',
-     '"admin123". Change immediately after first login.'),
+     'Set in the .env file (BOOTSTRAP_PASSWORD). Change immediately after first login.'),
     ('System not loading?',
      'Refresh (F5). If the problem persists, check that the server and database are running.'),
 ]
