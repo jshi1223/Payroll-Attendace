@@ -21,10 +21,14 @@ class RegistrationScreen extends StatefulWidget {
 
 class _RegistrationScreenState extends State<RegistrationScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _nameCtrl = TextEditingController();
+  final _firstNameCtrl = TextEditingController();
+  final _lastNameCtrl = TextEditingController();
   final _emailCtrl = TextEditingController();
   final _phoneCtrl = TextEditingController();
-  final _govIdCtrl = TextEditingController();
+  final _sssCtrl = TextEditingController();
+  final _philhealthCtrl = TextEditingController();
+  final _pagibigCtrl = TextEditingController();
+  final _tinCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
   final _confirmPasswordCtrl = TextEditingController();
   bool _passwordVisible = false;
@@ -34,6 +38,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   bool _hasBiometrics = false;
 
   static final RegExp _emailPattern = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
+  static final RegExp _sssPattern = RegExp(r'^\d{2}-\d{7}-\d$');
+  static final RegExp _philhealthPattern = RegExp(r'^\d{2}-\d{9}-\d$');
+  static final RegExp _pagibigPattern = RegExp(r'^\d{4}-\d{4}-\d{4}$');
+  static final RegExp _tinPattern = RegExp(r'^\d{3}-\d{3}-\d{3}-\d{3}$');
 
   int _pageStep = 0;
   bool _isCheckingAvailability = false;
@@ -64,10 +72,14 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   @override
   void dispose() {
-    _nameCtrl.dispose();
+    _firstNameCtrl.dispose();
+    _lastNameCtrl.dispose();
     _emailCtrl.dispose();
     _phoneCtrl.dispose();
-    _govIdCtrl.dispose();
+    _sssCtrl.dispose();
+    _philhealthCtrl.dispose();
+    _pagibigCtrl.dispose();
+    _tinCtrl.dispose();
     _passwordCtrl.dispose();
     _confirmPasswordCtrl.dispose();
     super.dispose();
@@ -98,14 +110,22 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         body: {
           'email': _emailCtrl.text.trim(),
           'phone': _normalizedPhoneNumber(),
+          'sss_number': _sssCtrl.text.trim(),
+          'philhealth_number': _philhealthCtrl.text.trim(),
+          'pagibig_number': _pagibigCtrl.text.trim(),
+          'tin_number': _tinCtrl.text.trim(),
         },
       );
       final data = ApiClient.jsonObject(res.body) ?? const {};
       final available = data['available'] == true;
+      final govIdTaken = (data['gov_id_taken'] as String?)?.trim();
 
       if (!available) {
         setState(() {
-          _statusMsg = 'These details are already in use.';
+          _statusMsg =
+              (govIdTaken != null && govIdTaken.isNotEmpty)
+              ? govIdTaken
+              : 'These details are already in use.';
         });
         return;
       }
@@ -190,11 +210,15 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         final response = await ApiClient.postForm(
           '/register',
           body: {
-            'name': _nameCtrl.text.trim(),
+            'first_name': _firstNameCtrl.text.trim(),
+            'last_name': _lastNameCtrl.text.trim(),
             'email': _emailCtrl.text.trim(),
             'phone': _normalizedPhoneNumber(),
             'password': _passwordCtrl.text,
-            'government_id': _govIdCtrl.text.trim(),
+            'sss_number': _sssCtrl.text.trim(),
+            'philhealth_number': _philhealthCtrl.text.trim(),
+            'pagibig_number': _pagibigCtrl.text.trim(),
+            'tin_number': _tinCtrl.text.trim(),
           },
         );
 
@@ -417,17 +441,34 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                 child: Column(
                   children: [
                     _AppField(
-                      ctrl: _nameCtrl,
-                      label: 'Full Name',
-                      hint: 'Enter your full name',
+                      ctrl: _firstNameCtrl,
+                      label: 'First Name',
+                      hint: 'Enter your first name',
                       icon: Icons.person_rounded,
                       required: true,
                       textCapitalization: TextCapitalization.words,
                       textInputAction: TextInputAction.next,
-                      autofillHints: const [AutofillHints.name],
+                      autofillHints: const [AutofillHints.givenName],
                       validator: (value) {
                         if ((value ?? '').trim().isEmpty) {
-                          return 'Full name is required.';
+                          return 'First name is required.';
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 14),
+                    _AppField(
+                      ctrl: _lastNameCtrl,
+                      label: 'Last Name',
+                      hint: 'Enter your last name',
+                      icon: Icons.person_outline_rounded,
+                      required: true,
+                      textCapitalization: TextCapitalization.words,
+                      textInputAction: TextInputAction.next,
+                      autofillHints: const [AutofillHints.familyName],
+                      validator: (value) {
+                        if ((value ?? '').trim().isEmpty) {
+                          return 'Last name is required.';
                         }
                         return null;
                       },
@@ -508,17 +549,102 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                         return null;
                       },
                     ),
-                    const SizedBox(height: 14),
+                    const SizedBox(height: 8),
+                    const Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'Government IDs',
+                        style: TextStyle(
+                          color: BrandColors.text,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
                     _AppField(
-                      ctrl: _govIdCtrl,
-                      label: 'Government ID',
-                      hint: 'e.g. SSS / UMID / Driver\u2019s License no.',
+                      ctrl: _sssCtrl,
+                      label: 'SSS Number',
+                      hint: 'e.g. 12-3456789-0',
                       icon: Icons.badge_rounded,
                       required: true,
                       textInputAction: TextInputAction.next,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
+                        LengthLimitingTextInputFormatter(11),
+                      ],
                       validator: (value) {
-                        if ((value ?? '').trim().isEmpty) {
-                          return 'Government ID is required.';
+                        final text = (value ?? '').trim();
+                        if (text.isEmpty) return 'SSS Number is required.';
+                        if (!_sssPattern.hasMatch(text)) {
+                          return 'Format: 12-3456789-0';
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 14),
+                    _AppField(
+                      ctrl: _philhealthCtrl,
+                      label: 'PhilHealth Number',
+                      hint: 'e.g. 12-345678901-2',
+                      icon: Icons.health_and_safety_rounded,
+                      required: true,
+                      textInputAction: TextInputAction.next,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
+                        LengthLimitingTextInputFormatter(14),
+                      ],
+                      validator: (value) {
+                        final text = (value ?? '').trim();
+                        if (text.isEmpty) {
+                          return 'PhilHealth Number is required.';
+                        }
+                        if (!_philhealthPattern.hasMatch(text)) {
+                          return 'Format: 12-345678901-2';
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 14),
+                    _AppField(
+                      ctrl: _pagibigCtrl,
+                      label: 'Pag-IBIG Number',
+                      hint: 'e.g. 1234-5678-9012',
+                      icon: Icons.home_work_rounded,
+                      required: true,
+                      textInputAction: TextInputAction.next,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
+                        LengthLimitingTextInputFormatter(14),
+                      ],
+                      validator: (value) {
+                        final text = (value ?? '').trim();
+                        if (text.isEmpty) {
+                          return 'Pag-IBIG Number is required.';
+                        }
+                        if (!_pagibigPattern.hasMatch(text)) {
+                          return 'Format: 1234-5678-9012';
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 14),
+                    _AppField(
+                      ctrl: _tinCtrl,
+                      label: 'TIN Number',
+                      hint: 'e.g. 123-456-789-012',
+                      icon: Icons.receipt_long_rounded,
+                      required: true,
+                      textInputAction: TextInputAction.next,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
+                        LengthLimitingTextInputFormatter(15),
+                      ],
+                      validator: (value) {
+                        final text = (value ?? '').trim();
+                        if (text.isEmpty) return 'TIN Number is required.';
+                        if (!_tinPattern.hasMatch(text)) {
+                          return 'Format: 123-456-789-012';
                         }
                         return null;
                       },

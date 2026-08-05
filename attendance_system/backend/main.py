@@ -8,6 +8,7 @@ import cv2                  # FIX: moved from inside function to top-level
 import numpy as np
 import json
 import os
+import re
 import shutil
 import uuid
 import anyio
@@ -797,6 +798,18 @@ def _ensure_attendance_schema() -> None:
               AND a.type = 'time_in'
               AND a.rate_snapshot IS NULL
         """)
+        for col, definition in {
+            "first_name": "VARCHAR(80) NOT NULL DEFAULT ''",
+            "last_name": "VARCHAR(80) NOT NULL DEFAULT ''",
+            "sss_number": "VARCHAR(12) NOT NULL DEFAULT ''",
+            "philhealth_number": "VARCHAR(14) NOT NULL DEFAULT ''",
+            "pagibig_number": "VARCHAR(14) NOT NULL DEFAULT ''",
+            "tin_number": "VARCHAR(15) NOT NULL DEFAULT ''",
+            "payroll_employee_id": "INTEGER NULL",
+        }.items():
+            if not column_exists(cursor, "employees", col):
+                cursor.execute(f"ALTER TABLE employees ADD COLUMN {col} {definition}")
+        db.commit()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admin_audit_logs (
                 id SERIAL PRIMARY KEY,
@@ -1445,14 +1458,28 @@ def change_admin_password(
 
 
 # â”€â”€â”€ REGISTER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+REGISTER_GOV_ID_VALIDATORS = {
+    "sss_number": (r"^\d{2}-\d{7}-\d$", "SSS Number", "12-3456789-0 (10 digits)"),
+    "philhealth_number": (r"^\d{2}-\d{9}-\d$", "PhilHealth Number", "12-345678901-2 (12 digits)"),
+    "pagibig_number": (r"^\d{4}-\d{4}-\d{4}$", "Pag-IBIG Number", "1234-5678-9012 (12 digits)"),
+    "tin_number": (r"^\d{3}-\d{3}-\d{3}-\d{3}$", "TIN Number", "123-456-789-012 (12 digits)"),
+}
+
+
 @app.post("/register")
 async def register(
     background_tasks: BackgroundTasks,
-    name: str = Form(...),
+    name: str = Form(""),
     email: str = Form(""),
     phone: str = Form(""),
     password: str = Form(...),
     government_id: str = Form(""),
+    first_name: str = Form(""),
+    last_name: str = Form(""),
+    sss_number: str = Form(""),
+    philhealth_number: str = Form(""),
+    pagibig_number: str = Form(""),
+    tin_number: str = Form(""),
 ):
     db = get_db()
     
@@ -1461,10 +1488,40 @@ async def register(
             raise HTTPException(status_code=400, detail="Email is required.")
         if not phone.strip():
             raise HTTPException(status_code=400, detail="Phone number is required.")
-        if not government_id.strip():
-            raise HTTPException(status_code=400, detail="Government ID is required.")
         if len(password.strip()) < 8:
             raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+        first_name_clean = first_name.strip()
+        last_name_clean = last_name.strip()
+        if first_name_clean or last_name_clean:
+            if not first_name_clean:
+                raise HTTPException(status_code=400, detail="First name is required.")
+            if not last_name_clean:
+                raise HTTPException(status_code=400, detail="Last name is required.")
+            full_name = f"{first_name_clean} {last_name_clean}"
+        else:
+            if not name.strip():
+                raise HTTPException(status_code=400, detail="First and last name are required.")
+            full_name = name.strip()
+
+        gov_inputs = {
+            "sss_number": sss_number.strip(),
+            "philhealth_number": philhealth_number.strip(),
+            "pagibig_number": pagibig_number.strip(),
+            "tin_number": tin_number.strip(),
+        }
+        legacy_gov_id = government_id.strip()
+        if all(not value for value in gov_inputs.values()) and legacy_gov_id:
+            gov_ids = {"government_id": legacy_gov_id}
+        else:
+            gov_ids = {}
+            for field, (pattern, label, hint) in REGISTER_GOV_ID_VALIDATORS.items():
+                value = gov_inputs[field]
+                if not value:
+                    raise HTTPException(status_code=400, detail=f"{label} is required.")
+                if not re.fullmatch(pattern, value):
+                    raise HTTPException(status_code=400, detail=f"{label} format is invalid. Format: {hint}.")
+                gov_ids[field] = value
 
         email_check = _normalize_email(email)
         phone_check = _phone_candidates(phone)
@@ -1494,19 +1551,59 @@ async def register(
                 details.append("Phone number already registered.")
             raise HTTPException(status_code=409, detail=" ".join(details))
 
+        for field, value in gov_ids.items():
+            if field == "government_id":
+                continue
+            cursor = db.cursor(dictionary=True)
+            cursor.execute(
+                f"SELECT id FROM employees WHERE {field} = %s AND {field} != ''",
+                (value,),
+            )
+            if cursor.fetchone():
+                label = REGISTER_GOV_ID_VALIDATORS[field][1]
+                raise HTTPException(status_code=409, detail=f"{label} is already in use.")
+
+        payroll_employee_id = None
+        if "sss_number" in gov_ids:
+            cursor = db.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT id FROM public.employees
+                WHERE sss_number = %s
+                  AND philhealth_number = %s
+                  AND pagibig_number = %s
+                  AND tin_number = %s
+                """,
+                (gov_ids["sss_number"], gov_ids["philhealth_number"], gov_ids["pagibig_number"], gov_ids["tin_number"]),
+            )
+            matches = cursor.fetchall()
+            if len(matches) == 1:
+                payroll_employee_id = matches[0]["id"]
+
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            INSERT INTO employees (name, email, phone, password_hash, government_id, status)
-            VALUES (%s, %s, %s, %s, %s, 'pending')
+            INSERT INTO employees (
+                name, first_name, last_name, email, phone, password_hash,
+                sss_number, philhealth_number, pagibig_number, tin_number,
+                government_id, status, payroll_employee_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
         """, (
-            name,
+            full_name,
+            first_name_clean,
+            last_name_clean,
             email.strip(),
             phone.strip(),
             pwd_context.hash(password.strip()),
-            government_id.strip(),
+            gov_ids.get("sss_number", ""),
+            gov_ids.get("philhealth_number", ""),
+            gov_ids.get("pagibig_number", ""),
+            gov_ids.get("tin_number", ""),
+            gov_ids.get("government_id", ""),
+            payroll_employee_id,
         ))
         db.commit()
-        background_tasks.add_task(_notify_admin_registration, name.strip(), email.strip(), phone.strip())
+        background_tasks.add_task(_notify_admin_registration, full_name, email.strip(), phone.strip())
 
         return {
             "message": "Registration submitted. Waiting for admin approval.",
@@ -1518,7 +1615,14 @@ async def register(
 
 
 @app.post("/register/check-availability")
-def register_check_availability(email: str = Form(""), phone: str = Form("")):
+def register_check_availability(
+    email: str = Form(""),
+    phone: str = Form(""),
+    sss_number: str = Form(""),
+    philhealth_number: str = Form(""),
+    pagibig_number: str = Form(""),
+    tin_number: str = Form(""),
+):
     if not email.strip():
         raise HTTPException(status_code=400, detail="Email is required.")
     if not phone.strip():
@@ -1544,10 +1648,29 @@ def register_check_availability(email: str = Form(""), phone: str = Form("")):
             if email_taken or phone_taken:
                 break
 
+        gov_id_taken = None
+        for field, value in {
+            "sss_number": sss_number.strip(),
+            "philhealth_number": philhealth_number.strip(),
+            "pagibig_number": pagibig_number.strip(),
+            "tin_number": tin_number.strip(),
+        }.items():
+            if not value:
+                continue
+            cursor = db.cursor(dictionary=True)
+            cursor.execute(
+                f"SELECT id FROM employees WHERE {field} = %s AND {field} != ''",
+                (value,),
+            )
+            if cursor.fetchone():
+                gov_id_taken = f"{REGISTER_GOV_ID_VALIDATORS[field][1]} already in use."
+                break
+
         return {
-            "available": not (email_taken or phone_taken),
+            "available": not (email_taken or phone_taken) and gov_id_taken is None,
             "email_taken": email_taken,
             "phone_taken": phone_taken,
+            "gov_id_taken": gov_id_taken,
         }
     finally:
         db.close()

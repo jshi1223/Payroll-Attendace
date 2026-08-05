@@ -851,6 +851,12 @@ async function initDatabase() {
   `);
   await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS payroll_employee_id INTEGER`);
   await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS government_id VARCHAR(50) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS first_name VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS last_name VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS sss_number VARCHAR(12) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS philhealth_number VARCHAR(14) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS pagibig_number VARCHAR(14) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS tin_number VARCHAR(15) NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS email VARCHAR(255) NULL`);
 
   /* Payroll review/acceptance step before bulk printing */
@@ -2403,10 +2409,12 @@ app.get('/api/registrations', requireAuth, async (req, res) => {
   }
   const params = [search, ...(status === 'approved' || status === 'rejected' ? [status] : [])];
   const result = await pool.query(
-    `SELECT id, employee_id, name, email, phone, face_image,
+    `SELECT id, employee_id, name, first_name, last_name, email, phone, face_image,
+            sss_number, philhealth_number, pagibig_number, tin_number,
             status, admin_notes, registered_at, approved_at, payroll_employee_id
      FROM attendance.employees
-     WHERE ${where} AND (name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR employee_id ILIKE $1)
+     WHERE ${where} AND (name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR employee_id ILIKE $1
+            OR sss_number ILIKE $1 OR philhealth_number ILIKE $1 OR pagibig_number ILIKE $1 OR tin_number ILIKE $1)
      ORDER BY CASE status WHEN 'review' THEN 0 ELSE 1 END, registered_at DESC`,
     params
   );
@@ -2439,15 +2447,21 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
   if (!/^[0-9]{11}$/.test(phone)) {
     return res.status(400).json({ error: 'Registration phone must be exactly 11 digits (numbers only).' });
   }
-  const phoneCheck = await pool.query('SELECT id, name FROM employees WHERE phone = $1', [phone]);
   let linkExisting = null;
-  if (phoneCheck.rowCount > 0) {
-    linkExisting = phoneCheck.rows[0];
-  } else {
-    const email = String(reg.email || '').trim();
-    if (email) {
-      const emailCheck = await pool.query('SELECT id, name FROM employees WHERE LOWER(email) = LOWER($1)', [email]);
-      if (emailCheck.rowCount > 0) linkExisting = emailCheck.rows[0];
+  if (reg.payroll_employee_id) {
+    const payrollLink = await pool.query('SELECT id, name FROM employees WHERE id = $1', [reg.payroll_employee_id]);
+    if (payrollLink.rowCount > 0) linkExisting = payrollLink.rows[0];
+  }
+  if (!linkExisting) {
+    const phoneCheck = await pool.query('SELECT id, name FROM employees WHERE phone = $1', [phone]);
+    if (phoneCheck.rowCount > 0) {
+      linkExisting = phoneCheck.rows[0];
+    } else {
+      const email = String(reg.email || '').trim();
+      if (email) {
+        const emailCheck = await pool.query('SELECT id, name FROM employees WHERE LOWER(email) = LOWER($1)', [email]);
+        if (emailCheck.rowCount > 0) linkExisting = emailCheck.rows[0];
+      }
     }
   }
 
@@ -2473,14 +2487,28 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
         `SELECT ('EMP-' || LPAD(nextval('employee_number_seq')::text, 5, '0')) AS emp_number`
       );
       const parts = name.split(/\s+/);
-      const first = parts[0] || '';
-      const last = parts.slice(1).join(' ') || '';
+      const first = (reg.first_name || '').trim() || parts[0] || '';
+      const last = (reg.last_name || '').trim() || parts.slice(1).join(' ') || '';
+
+      const govCols = [];
+      const govVals = [];
+      for (const f of ['sss_number', 'philhealth_number', 'pagibig_number', 'tin_number']) {
+        const v = String(reg[f] || '').trim();
+        if (!v) continue;
+        const taken = await client.query(`SELECT id FROM employees WHERE ${f} = $1 AND ${f} != ''`, [v]);
+        if (taken.rowCount === 0) {
+          govCols.push(f);
+          govVals.push(v);
+        }
+      }
+      const govSql = govCols.length ? `, ${govCols.join(', ')}` : '';
+      const govPlaceholders = govCols.length ? `, ${govCols.map((_, i) => `$${9 + i}`).join(', ')}` : '';
 
       const empInsert = await client.query(
-        `INSERT INTO employees (emp_number, first_name, last_name, name, phone, rate, pay_period_days, active, photo_url)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)
+        `INSERT INTO employees (emp_number, first_name, last_name, name, phone, rate, pay_period_days, active, photo_url${govSql})
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8${govPlaceholders})
          RETURNING id`,
-        [empNumber.rows[0].emp_number, first, last, name, phone, Number(rate), periodDays, photoUrl]
+        [empNumber.rows[0].emp_number, first, last, name, phone, Number(rate), periodDays, photoUrl, ...govVals]
       );
       payrollEmployeeId = empInsert.rows[0].id;
     }

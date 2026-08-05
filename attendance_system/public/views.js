@@ -1704,6 +1704,7 @@ function renderApprovals() {
               <th>Photo</th>
               <th>Name</th>
               <th>Contact</th>
+              <th>Government IDs</th>
               <th>Registered</th>
               <th>Status</th>
               <th>Admin Notes</th>
@@ -1727,6 +1728,12 @@ function renderApprovals() {
                   <div>${highlight(row.email || '—')}</div>
                   <div class="muted" style="font-size:12px;">${highlight(row.phone || '—')}</div>
                 </td>
+                <td>
+                  ${[['SSS', row.sss_number], ['PhilHealth', row.philhealth_number], ['Pag-IBIG', row.pagibig_number], ['TIN', row.tin_number]]
+                    .filter(([, v]) => v)
+                    .map(([label, v]) => `<div class="muted" style="font-size:12px;">${label}: ${highlight(v)}</div>`)
+                    .join('') || '<span class="muted" style="font-size:12px;">—</span>'}
+                </td>
                 <td>${formatShortDate(row.registered_at)}</td>
                 <td><span class="badge reg-status-${row.status}">${row.status}</span></td>
                 <td class="muted" style="max-width:180px;font-size:12px;">${escapeHtml(row.admin_notes || '')}</td>
@@ -1737,7 +1744,7 @@ function renderApprovals() {
                     : `<span class="muted" style="font-size:12px;">${row.payroll_employee_id ? 'Linked to payroll #' + row.payroll_employee_id : 'Reviewed'}</span>`}
                 </td>
               </tr>`;
-            }).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No registrations</strong><span>Registrations made from the attendance app will appear here for approval.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No registrations</strong><span>Registrations made from the attendance app will appear here for approval.</span></td></tr>`}
           </tbody>
         </table>
       </div>
