@@ -8,6 +8,8 @@ function confirmDeleteModal() {
   const isBalePayment = resource === 'bale-payments';
   const isExtraPayment = resource === 'extra-payments';
   const isCashAdvance = resource === 'cash-advances';
+  const isAttendance = resource === 'attendance';
+  const isAppMarkedAttendance = isAttendance && !!state.pendingDelete.appMarked;
   let title = 'Delete Record';
   let message = `Are you sure you want to delete this ${escapeHtml(resource.replace('-', ' '))}? This action cannot be undone.`;
   let confirmText = 'Delete';
@@ -32,6 +34,12 @@ function confirmDeleteModal() {
   } else if (isCashAdvance) {
     title = 'Delete Cash Advance';
     message = 'Delete this cash advance record? This action cannot be undone.';
+  } else if (isAttendance) {
+    title = isAppMarkedAttendance ? 'Delete App-Marked Attendance' : 'Delete Attendance';
+    message = isAppMarkedAttendance
+      ? 'This attendance was marked by the employee through the attendance app (biometric verification).'
+      : 'This attendance record will be removed.';
+    message += ' Type <strong>DELETE</strong> and enter a reason. This will be recorded in the audit trail and synced to the employee app.';
   }
 
   return `
@@ -44,10 +52,13 @@ function confirmDeleteModal() {
           </div>
           <button class="icon-btn" id="closeDeleteModal" aria-label="Close">x</button>
         </div>
-        ${isPermanent ? '<div class="modal-body"><label>Type <strong>DELETE</strong> to confirm:<input id="permanentDeleteConfirm" type="text" placeholder="DELETE" autocomplete="off" style="margin-top:4px;"></label></div>' : ''}
+        ${isPermanent || isAttendance ? `<div class="modal-body">
+          <label>Type <strong>DELETE</strong> to confirm:<input id="typedDeleteConfirm" type="text" placeholder="DELETE" autocomplete="off" style="margin-top:4px;"></label>
+          ${isAttendance ? '<label style="margin-top:12px;display:block;">Reason for deletion:<textarea id="attendanceDeleteReason" rows="3" maxlength="500" placeholder="Explain why this attendance must be deleted" style="margin-top:4px;resize:vertical;"></textarea></label>' : ''}
+        </div>` : ''}
         <div class="modal-actions">
           <button class="ghost" type="button" id="cancelDelete">Cancel</button>
-          <button class="danger" type="button" id="confirmDelete" ${isPermanent ? 'disabled' : ''}>${confirmText}</button>
+          <button class="danger" type="button" id="confirmDelete" ${isPermanent || isAttendance ? 'disabled' : ''}>${confirmText}</button>
         </div>
       </section>
     </div>
@@ -58,13 +69,20 @@ function bindConfirmDeleteModal() {
   const modal = document.querySelector('#confirmDeleteModal');
   if (!modal) return;
 
-  const confirmInput = document.querySelector('#permanentDeleteConfirm');
+  const confirmInput = document.querySelector('#typedDeleteConfirm');
+  const reasonInput = document.querySelector('#attendanceDeleteReason');
   const confirmBtn = document.querySelector('#confirmDelete');
-  if (confirmInput && confirmBtn) {
-    confirmInput.addEventListener('input', () => {
-      confirmBtn.disabled = confirmInput.value.trim().toUpperCase() !== 'DELETE';
-    });
+  const updateDeleteButton = () => {
+    if (!confirmBtn || !state.pendingDelete) return;
+    const isAttendance = state.pendingDelete.resource === 'attendance';
+    const confirmed = (confirmInput?.value.trim().toUpperCase() || '') === 'DELETE';
+    const hasReason = !isAttendance || Boolean(reasonInput?.value.trim());
+    confirmBtn.disabled = !confirmed || !hasReason;
+  };
+  if (confirmInput) {
+    confirmInput.addEventListener('input', updateDeleteButton);
   }
+  if (reasonInput) reasonInput.addEventListener('input', updateDeleteButton);
 
   const close = () => {
     const modalEmployeeId = state.pendingDelete?._modalEmployeeId;
@@ -90,6 +108,17 @@ function bindConfirmDeleteModal() {
       const resource = state.pendingDelete.resource;
       const isPermanent = resource === 'employees-permanent';
       const isLegacyPayment = resource === 'legacy-payment';
+      const isAttendance = resource === 'attendance';
+      const needsTypedConfirm = isPermanent || isAttendance;
+      if (needsTypedConfirm && (document.querySelector('#typedDeleteConfirm')?.value.trim().toUpperCase() || '') !== 'DELETE') {
+        return close();
+      }
+      const deleteReason = document.querySelector('#attendanceDeleteReason')?.value.trim() || '';
+      if (isAttendance && !deleteReason) {
+        showToast('A deletion reason is required for attendance.', 'error');
+        loadingButton(btn, false);
+        return;
+      }
 
       let url, method, body;
       if (isPermanent) {
@@ -102,6 +131,7 @@ function bindConfirmDeleteModal() {
       } else {
         url = `/api/${resource}/${state.pendingDelete.id}`;
         method = 'DELETE';
+        if (isAttendance) body = JSON.stringify({ confirmation: 'DELETE', reason: deleteReason });
       }
 
       await api(url, { method, body });
@@ -393,7 +423,7 @@ function bindPayrollEntryModal() {
       backdrop.innerHTML = `
         <section class="modal confirm-modal" style="max-width:380px;">
           <div class="modal-head">
-            <div><h2>Generate Payslip?</h2><p>This will <strong>LOCK</strong> this payroll period. No more changes allowed.</p></div>
+            <div><h2>Generate Payslip?</h2><p>This will <strong>LOCK</strong> this payroll period and auto-record the salary as <strong>paid</strong>. No more changes allowed.</p></div>
             <button class="icon-btn" id="closeGenerateConfirm" aria-label="Close">x</button>
           </div>
           <div class="modal-actions">
@@ -427,8 +457,9 @@ function bindPayrollEntryModal() {
         const generatedRow = state.payroll.rows.find(item => Number(item.employee_id) === Number(row.employee_id)) || row;
         state.payrollModalEmployee = null;
         state.payrollTransactionModal = false;
-        showToast('Payslip generated and payroll locked.');
-        renderPayslip(generatedRow);
+        showToast('Payslip generated and salary auto-paid.');
+        state._generatedPayslip = generatedRow;
+        renderPayroll();
       } catch (error) {
         state.payrollModalEmployee = selectedEmployee;
         renderPayroll();
@@ -456,6 +487,75 @@ function bindPayrollEntryModal() {
   document.querySelector('#peGeneratePayslip')?.addEventListener('click', generatePayslip);
 }
 
+/* ── Payslip Generated Success Modal ── */
+function payslipGeneratedModal() {
+  const row = state._generatedPayslip;
+  if (!row) return '';
+  const pd = state.payPeriodDays || row.pay_period_days || 7;
+  const periodStart = state.week;
+  const periodEnd = addDays(periodStart, pd - 1);
+  const totalEarnings = Number(row.salary || 0) + Number(row.extra_payment_amount || 0) + Number(row.previous_unpaid_balance || 0);
+  const netPay = Math.max(totalEarnings - Number(row.bale_paid_amount || 0), 0);
+  const initials = row.name ? row.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() : '?';
+  return `
+    <div class="modal-backdrop pg-success-backdrop" id="payslipGeneratedModal">
+      <section class="modal confirm-modal pg-success-modal" role="dialog" aria-modal="true" aria-labelledby="pgSuccessTitle">
+        <div class="modal-head">
+          <div class="pg-success-icon">✓</div>
+          <div>
+            <h2 id="pgSuccessTitle">Payslip Generated</h2>
+            <p>This payroll period is now <strong>LOCKED</strong>. No more changes allowed.</p>
+          </div>
+          <button class="icon-btn" id="closePayslipGenerated" aria-label="Close">x</button>
+        </div>
+        <div class="pg-success-body">
+          <div class="pg-success-employee">
+            <div class="pg-success-avatar" style="background:var(--brand);">${escapeHtml(initials)}</div>
+            <div>
+              <strong>${escapeHtml(row.name)}</strong>
+              <span>${escapeHtml(row.emp_number || '')} · ${getPeriodLabel(pd)}</span>
+            </div>
+          </div>
+          <div class="pg-success-grid">
+            <div><span>Period</span><strong>${formatShortDate(periodStart)} – ${formatShortDate(periodEnd)}</strong></div>
+            <div><span>Days Worked</span><strong>${row.days}</strong></div>
+            <div><span>Gross Pay</span><strong>${formatMoney(totalEarnings)}</strong></div>
+            <div><span>NET PAY</span><strong class="pg-net-pay">${formatMoney(netPay)}</strong></div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="ghost" id="closePayslipGenerated">Close</button>
+          <button class="primary" id="viewPayslipGenerated">View / Print Payslip</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindPayslipGeneratedModal() {
+  const modal = document.querySelector('#payslipGeneratedModal');
+  if (!modal) return;
+  const row = state._generatedPayslip;
+  if (!row) return;
+
+  const close = () => {
+    state._generatedPayslip = null;
+    reRenderCurrentView();
+  };
+
+  setupModalKeyboard('#payslipGeneratedModal', close);
+  document.querySelector('#closePayslipGenerated')?.addEventListener('click', close);
+  modal.addEventListener('click', event => {
+    if (event.target === modal) close();
+  });
+  document.querySelector('#viewPayslipGenerated')?.addEventListener('click', () => {
+    const payslipRow = state._generatedPayslip;
+    state._generatedPayslip = null;
+    if (payslipRow) renderPayslip(payslipRow);
+    else reRenderCurrentView();
+  });
+}
+
 /* ── Employee Modal ── */
 function employeeModal(employee = {}) {
   const isEdit = Boolean(employee.id);
@@ -471,49 +571,59 @@ function employeeModal(employee = {}) {
         <div class="modal-head">
           <div style="display:flex;align-items:center;gap:14px;">
             <div>
-              <h2>${isEdit ? 'Edit Employee' : 'Add Employee'}</h2>
-              <p>${isEdit ? 'Update employee details and current rate.' : 'Create a new employee record.'}</p>
+              <h2 id="employeeModalTitle">${isEdit ? 'Edit Employee' : 'Employee Details'}</h2>
+              <p id="employeeModalDescription">${isEdit ? 'Update employee details.' : 'Fill in the employee details first.'}</p>
             </div>
           </div>
           <button class="icon-btn" id="closeEmployeeModal" aria-label="Close">x</button>
         </div>
+        ${isEdit ? '' : `
+        <div class="wizard-steps" id="employeeWizardSteps">
+          <div class="wizard-step active" data-step="1"><span class="wizard-step-num">1</span> Employee Details</div>
+          <div class="wizard-step" data-step="2"><span class="wizard-step-num">2</span> Temporary Password</div>
+        </div>`}
         <form class="form-grid" id="employeeForm" enctype="multipart/form-data">
           <input type="hidden" name="id" value="${employee.id || ''}">
-          <div class="profile-photo-wrap" style="cursor:default;">
-            <div class="profile-photo" id="profilePhotoPreview" style="${photoStyle}">${photoContent}</div>
-            ${hasPhoto ? '<div class="profile-photo-label">Photo uploaded by employee</div>' : '<div class="profile-photo-label">No photo uploaded by employee</div>'}
-          </div>
-          <div class="section-title">Basic Information</div>
-          ${isEdit ? `<label>Emp Number<div class="readonly-field">${employee.emp_number}</div></label>` : ''}
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-            <label>First Name<input name="first_name" value="${escapeHtml(employee.first_name || '')}" placeholder="Enter first name" required></label>
-            <label>Last Name<input name="last_name" value="${escapeHtml(employee.last_name || employee.name?.split(' ').slice(1).join(' ') || '')}" placeholder="Enter last name" required></label>
-          </div>
-          <input type="hidden" name="name" value="${escapeHtml(employee.name || '')}">
-          <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="09171234567" pattern="[0-9]{11}" minlength="11" maxlength="11" inputmode="numeric" id="phoneInput" required><span class="field-hint">Must be 11 digits. Numbers only.</span></label>
-          <div class="section-title">Mobile Login <span style="font-weight:400;font-size:12px;color:var(--muted);">(para sa attendance app)</span></div>
-          <label>Email<input name="email" type="email" value="${escapeHtml(employee.email || '')}" placeholder="employee@email.com" autocomplete="off"></label>
-          <label>Temporary Password<input name="password" type="text" value="" placeholder="${isEdit ? 'Leave blank to keep current password' : 'Min 8 characters'}" minlength="8" autocomplete="new-password"><span class="field-hint">${isEdit ? 'Only fill in to reset the employee\'s app password.' : 'The employee logs in to the app with this email + password.'}</span></label>
-          <div class="section-title">Government IDs <span style="font-weight:400;font-size:12px;color:var(--muted);">(type digits, dashes auto-inserted)</span></div>
-          <label>SSS Number<input name="sss_number" type="text" value="${escapeHtml(employee.sss_number || '')}" placeholder="__-_______-_" maxlength="12" class="gov-id-input" data-format="sss" inputmode="numeric" autocomplete="off"></label>
-          <label>PhilHealth<input name="philhealth_number" type="text" value="${escapeHtml(employee.philhealth_number || '')}" placeholder="__-_________-_" maxlength="14" class="gov-id-input" data-format="philhealth" inputmode="numeric" autocomplete="off"></label>
-          <label>Pag-IBIG<input name="pagibig_number" type="text" value="${escapeHtml(employee.pagibig_number || '')}" placeholder="____-____-____" maxlength="14" class="gov-id-input" data-format="pagibig" inputmode="numeric" autocomplete="off"></label>
-          <label>TIN Number<input name="tin_number" type="text" value="${escapeHtml(employee.tin_number || '')}" placeholder="___-___-___-___" maxlength="15" class="gov-id-input" data-format="tin" inputmode="numeric" autocomplete="off"></label>
-          <div class="section-title">Payroll Settings</div>
-          <label>Daily Rate (₱)<input name="rate" type="number" min="500" step="0.01" value="${employee.rate || ''}" placeholder="500.00" required><span class="field-hint">Minimum rate is ₱500.00</span></label>
-          <label>Pay Period
-            <select name="pay_period_days">
-              <option value="7" ${(employee.pay_period_days || 7) === 7 ? 'selected' : ''}>Weekly (7 days)</option>
-              <option value="14" ${employee.pay_period_days === 14 ? 'selected' : ''}>Semi-monthly (14 days)</option>
-              <option value="21" ${employee.pay_period_days === 21 ? 'selected' : ''}>3 Weeks (21 days)</option>
-              <option value="30" ${employee.pay_period_days === 30 ? 'selected' : ''}>Monthly (30 days)</option>
-            </select>
-          </label>
-          <label>Status<select name="active"><option value="true" ${employee.active !== false ? 'selected' : ''}>Active</option><option value="false" ${employee.active === false ? 'selected' : ''}>Inactive (Archive)</option></select></label>
+          <input type="hidden" name="pay_period_days" value="${employee.pay_period_days || 7}">
+          ${isEdit ? '' : '<div class="wizard-panel" id="employeeStep1">'}
+            <div class="profile-photo-wrap" style="cursor:default;">
+              <div class="profile-photo" id="profilePhotoPreview" style="${photoStyle}">${photoContent}</div>
+              ${hasPhoto ? '<div class="profile-photo-label">Photo uploaded by employee</div>' : '<div class="profile-photo-label">No photo uploaded by employee</div>'}
+            </div>
+            <div class="section-title">Basic Information</div>
+            ${isEdit ? `<label>Emp Number<div class="readonly-field">${employee.emp_number}</div></label>` : ''}
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <label>First Name<input name="first_name" value="${escapeHtml(employee.first_name || '')}" placeholder="Enter first name" required></label>
+              <label>Last Name<input name="last_name" value="${escapeHtml(employee.last_name || employee.name?.split(' ').slice(1).join(' ') || '')}" placeholder="Enter last name" required></label>
+            </div>
+            <input type="hidden" name="name" value="${escapeHtml(employee.name || '')}">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <label>Phone Number<input name="phone" type="tel" value="${escapeHtml(employee.phone || '')}" placeholder="09171234567" pattern="[0-9]{11}" minlength="11" maxlength="11" inputmode="numeric" id="phoneInput" required><span class="field-hint">Must be 11 digits. Numbers only.</span></label>
+              <label>Email<input name="email" type="email" value="${escapeHtml(employee.email || '')}" placeholder="employee@email.com" autocomplete="off" required><span class="field-hint">Used as the employee's login in the attendance app.</span></label>
+            </div>
+            <div class="section-title">Government IDs <span style="font-weight:400;font-size:12px;color:var(--muted);">(type digits, dashes auto-inserted)</span></div>
+            <div class="gov-id-grid">
+              <label>SSS Number<input name="sss_number" type="text" value="${escapeHtml(employee.sss_number || '')}" placeholder="__-_______-_" maxlength="12" class="gov-id-input" data-format="sss" inputmode="numeric" autocomplete="off" required></label>
+              <label>PhilHealth<input name="philhealth_number" type="text" value="${escapeHtml(employee.philhealth_number || '')}" placeholder="__-_________-_" maxlength="14" class="gov-id-input" data-format="philhealth" inputmode="numeric" autocomplete="off" required></label>
+              <label>Pag-IBIG<input name="pagibig_number" type="text" value="${escapeHtml(employee.pagibig_number || '')}" placeholder="____-____-____" maxlength="14" class="gov-id-input" data-format="pagibig" inputmode="numeric" autocomplete="off" required></label>
+              <label>TIN Number<input name="tin_number" type="text" value="${escapeHtml(employee.tin_number || '')}" placeholder="___-___-___-___" maxlength="15" class="gov-id-input" data-format="tin" inputmode="numeric" autocomplete="off" required></label>
+            </div>
+            <div class="section-title">Payroll Settings</div>
+            <label>Daily Rate (₱)<input name="rate" type="number" min="500" step="0.01" value="${employee.rate || ''}" placeholder="500.00" required><span class="field-hint">Minimum rate is ₱500.00</span></label>
+            <label>Status<select name="active"><option value="true" ${employee.active !== false ? 'selected' : ''}>Active</option><option value="false" ${employee.active === false ? 'selected' : ''}>Inactive (Archive)</option></select></label>
+          ${isEdit ? '' : '</div>'}
+          ${isEdit ? '' : `
+          <div class="wizard-panel" id="employeeStep2" hidden>
+            <div class="section-title">Temporary Password <span style="font-weight:400;font-size:12px;color:var(--muted);">(para sa attendance app login)</span></div>
+            <label>Temporary Password<input name="password" type="text" value="" placeholder="Min 8 characters" minlength="8" required autocomplete="new-password"><span class="field-hint">The employee will use this password to sign in to the app.</span></label>
+            <label>Confirm Temporary Password<input name="password_confirm" type="text" value="" placeholder="Repeat the temporary password" minlength="8" required autocomplete="new-password"></label>
+          </div>`}
           <div class="error error-box" id="employeeFormError"></div>
           <div class="modal-actions">
             <button class="ghost" type="button" id="cancelEmployeeModal">Cancel</button>
-            <button class="primary" type="submit">${isEdit ? 'Update Employee' : 'Add Employee'}</button>
+            ${isEdit ? '' : `<button class="ghost" type="button" id="employeeBackBtn" hidden style="display:none;">Back</button>`}
+            ${isEdit ? '' : `<button class="primary" type="button" id="employeeNextBtn">Next</button>`}
+            <button class="primary" type="submit" id="employeeSubmitBtn" ${isEdit ? '' : 'hidden style="display:none;"'}>${isEdit ? 'Update Employee' : 'Add Employee'}</button>
           </div>
         </form>
       </section>
@@ -535,6 +645,48 @@ function bindEmployeeModal() {
   phoneInputEl?.addEventListener('input', () => {
     phoneInputEl.value = phoneInputEl.value.replace(/\D/g, '');
   });
+
+  /* Wizard: navigate between Step 1 (Details) and Step 2 (Mobile Login) */
+  const step1Panel = document.querySelector('#employeeStep1');
+  const step2Panel = document.querySelector('#employeeStep2');
+  const nextBtn = document.querySelector('#employeeNextBtn');
+  const backBtn = document.querySelector('#employeeBackBtn');
+  const submitBtn = document.querySelector('#employeeSubmitBtn');
+  const stepEls = Array.from(document.querySelectorAll('#employeeWizardSteps .wizard-step'));
+
+  const setStep = (step) => {
+    step1Panel.hidden = step !== 1;
+    step2Panel.hidden = step !== 2;
+    nextBtn.hidden = step === 2;
+    backBtn.hidden = step !== 2;
+    submitBtn.hidden = step !== 2;
+    nextBtn.style.display = step === 2 ? 'none' : '';
+    backBtn.style.display = step === 2 ? '' : 'none';
+    submitBtn.style.display = step === 2 ? '' : 'none';
+    stepEls.forEach(el => el.classList.toggle('active', Number(el.dataset.step) === step));
+    const title = document.querySelector('#employeeModalTitle');
+    const description = document.querySelector('#employeeModalDescription');
+    if (title) title.textContent = step === 1 ? 'Employee Details' : 'Temporary Password';
+    if (description) description.textContent = step === 1
+      ? 'Fill in the employee details first.'
+      : 'Set the employee’s temporary password before adding the employee.';
+    const modalEl = document.querySelector('#employeeModal section.modal');
+    if (modalEl) modalEl.scrollTop = 0;
+  };
+
+  const goToStep2 = () => {
+    const formEl2 = document.querySelector('#employeeForm');
+    const firstInvalid = formEl2?.querySelector('#employeeStep1 [required]:invalid');
+    if (firstInvalid) {
+      firstInvalid.reportValidity();
+      firstInvalid.focus();
+      return;
+    }
+    setStep(2);
+  };
+
+  nextBtn?.addEventListener('click', goToStep2);
+  backBtn?.addEventListener('click', () => setStep(1));
 
   /* Auto-format Government ID inputs */
   document.querySelectorAll('.gov-id-input').forEach(input => {
@@ -576,6 +728,12 @@ function bindEmployeeModal() {
   });
   document.querySelector('#employeeForm').addEventListener('submit', async event => {
     event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const employeeId = formData.get('id');
+    if (!employeeId && step2Panel?.hidden) {
+      goToStep2();
+      return;
+    }
     const errorBox = document.querySelector('#employeeFormError');
     const submitButton = event.currentTarget.querySelector('button[type="submit"]');
     errorBox.textContent = '';
@@ -594,10 +752,37 @@ function bindEmployeeModal() {
       phoneInput?.classList.add('field-valid');
     }
 
+    /* Step 2 validation: email format + temporary password rules */
+    const emailInput = document.querySelector('input[name="email"]');
+    const email = emailInput?.value?.trim() || '';
+    const passwordInput = document.querySelector('input[name="password"]');
+    const password = passwordInput?.value || '';
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      emailInput?.classList.add('field-error');
+      errorBox.textContent = 'Please enter a valid email address.';
+      submitButton.disabled = false;
+      emailInput?.focus();
+      return;
+    }
+    emailInput?.classList.remove('field-error');
+    if (!employeeId && email && !password) {
+      passwordInput?.classList.add('field-error');
+      errorBox.textContent = 'Temporary password is required to create the mobile login.';
+      submitButton.disabled = false;
+      passwordInput?.focus();
+      return;
+    }
+    if (!employeeId && email && password.length < 8) {
+      passwordInput?.classList.add('field-error');
+      errorBox.textContent = 'Temporary password must be at least 8 characters.';
+      submitButton.disabled = false;
+      passwordInput?.focus();
+      return;
+    }
+    passwordInput?.classList.remove('field-error');
+
     submitButton.disabled = true;
     loadingButton(submitButton, true);
-    const formData = new FormData(event.currentTarget);
-    const employeeId = formData.get('id');
     formData.delete('photo');
     const payload = Object.fromEntries(formData);
     delete payload.id;
@@ -644,8 +829,8 @@ function auditTrailModal() {
           <button class="icon-btn" id="closeAuditModal" aria-label="Close">x</button>
         </div>
         <div class="audit-filters">
-          <select id="auditEntityFilter"><option value="">All Entities</option><option value="employee">Employee</option><option value="cash_advance">Cash Advance</option><option value="extra_payment">Extra Payment</option><option value="payroll_payment">Payroll Payment</option><option value="payroll_extra_payment">Extra Payment (old)</option></select>
-          <select id="auditActionFilter"><option value="">All Actions</option><option value="create">Create</option><option value="update">Update</option><option value="delete">Delete</option><option value="archive">Archive</option><option value="restore">Restore</option><option value="permanent_delete">Permanent Delete</option></select>
+          <select id="auditEntityFilter"><option value="">All Entities</option><option value="employee">Employee</option><option value="attendance">Attendance</option><option value="cash_advance">Cash Advance</option><option value="extra_payment">Extra Payment</option><option value="payroll_payment">Payroll Payment</option><option value="payroll_extra_payment">Extra Payment (old)</option></select>
+          <select id="auditActionFilter"><option value="">All Actions</option><option value="create">Create</option><option value="update">Update</option><option value="delete">Delete</option><option value="archive">Archive</option><option value="restore">Restore</option><option value="permanent_delete">Permanent Delete</option><option value="reject">Reject</option><option value="reset-device">Reset Device</option></select>
           <input id="auditSearch" placeholder="Search details..." value="${escapeHtml(auditFilterState.search)}">
           ${miniDatePickerHTML('auditDateFrom', 'From', auditFilterState.date_from || todayInManila(), { hideLabel: true })}
           ${miniDatePickerHTML('auditDateTo', 'To', auditFilterState.date_to || todayInManila(), { hideLabel: true })}
@@ -688,6 +873,10 @@ async function renderAuditTable() {
         if (details.name) parts.push('Name: ' + escapeHtml(details.name));
         if (details.employee_id) parts.push('Emp ID: ' + details.employee_id);
         if (details.week_start) parts.push('Week: ' + details.week_start);
+        if (details.work_date) parts.push('Date: ' + escapeHtml(details.work_date));
+        if (details.time_in) parts.push('Time In: ' + escapeHtml(details.time_in));
+        if (details.attempted_time_out) parts.push('Attempted Out: ' + escapeHtml(details.attempted_time_out));
+        if (details.reason) parts.push('Reason: ' + escapeHtml(details.reason));
         if (details.paid_amount) parts.push('Paid: ' + formatMoney(details.paid_amount));
         if (details.extra_payment_amount) parts.push('Extra: ' + formatMoney(details.extra_payment_amount));
         if (details.notes) parts.push('Notes: ' + escapeHtml(details.notes));
@@ -1022,6 +1211,7 @@ function confirmDialog(title, message, confirmText = 'Confirm', confirmClass = '
 /* ── Manage Payroll Modal ── */
 function managePayrollModalBody(emp, pd) {
   const hasEmp = Boolean(emp);
+  const isLocked = hasEmp && emp.payroll_status === 'generated';
   const baleLogs = hasEmp ? state.balePayments.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id)) : [];
   const extraLogs = hasEmp ? state.extraPayments.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id)) : [];
   const attLogs = hasEmp ? state.attendance.rows.filter(r => Number(r.employee_id) === Number(emp.employee_id)) : [];
@@ -1038,7 +1228,10 @@ function managePayrollModalBody(emp, pd) {
     }
     const resType = logType === 'C/A Payment' || logType === 'Bayad Bale' ? 'bale-payments'
       : 'extra-payments';
-    return `<tr><td>${log.date}</td><td>${log.type}</td><td><strong>${formatMoney(log.amount)}</strong></td><td>${escapeHtml(log.notes || '-')}</td><td class="actions"><button class="danger mp-delete-log" data-res="${resType}" data-id="${log.id}">Delete</button></td></tr>`;
+    const deleteAction = isLocked
+      ? '<span class="muted" title="Cannot delete — payroll is locked" style="font-size:12px;">🔒</span>'
+      : `<button class="danger mp-delete-log" data-res="${resType}" data-id="${log.id}">Delete</button>`;
+    return `<tr><td>${log.date}</td><td>${log.type}</td><td><strong>${formatMoney(log.amount)}</strong></td><td>${escapeHtml(log.notes || '-')}</td><td class="actions">${deleteAction}</td></tr>`;
   }).join('') || '<tr><td colspan="5" class="empty-state"><em>No transactions yet</em></td></tr>';
 
   const overviewHTML = hasEmp ? `
@@ -1046,11 +1239,18 @@ function managePayrollModalBody(emp, pd) {
     <div><span>Previous Unpaid</span><strong>${formatMoney(emp.previous_unpaid_balance)}</strong></div><div><span>Previous C/A</span><strong>${formatMoney(emp.previous_bale_balance)}</strong></div><div><span>BALANCE</span><strong class="balance-amount">${formatMoney(emp.balance)}</strong></div><div><span>C/A BAL.</span><strong>${formatMoney(emp.remaining_bale_balance)}</strong></div>
   ` : '<div style="grid-column:1/-1;text-align:center;color:var(--muted);padding:24px 0;">Search and select an employee to view payroll details.</div>';
 
+  const lockBanner = isLocked ? `
+    <div class="mp-locked-banner">
+      <span class="mp-locked-icon">🔒</span>
+      <div><strong>Payroll locked</strong><p>This payroll period was already generated. Unlock to make changes.</p></div>
+    </div>` : '';
+
   return `
+    ${lockBanner}
     <div class="pe-overview-grid" id="mpOverviewGrid" style="${hasEmp ? '' : 'border:0;padding:0;'}">${overviewHTML}</div>
-    ${hasEmp ? '<button class="primary pe-add-transaction-btn" id="mpAddTransaction">+ Add Transaction</button>' : ''}
+    ${hasEmp && !isLocked ? '<button class="primary pe-add-transaction-btn" id="mpAddTransaction">+ Add Transaction</button>' : ''}
     ${hasEmp ? `<div class="pe-history" id="mpHistory"><div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Notes</th><th>Actions</th></tr></thead><tbody>${logRows}</tbody></table></div></div>` : ''}
-    <div class="pe-footer" id="mpFooter"><button class="ghost" type="button" id="cancelManagePayroll">Close</button>${hasEmp ? '<div><button class="ghost" type="button" id="mpPreviewPayslip">Preview Payslip</button><button class="primary" type="button" id="mpGeneratePayslip">Generate Payslip</button></div>' : ''}</div>
+    <div class="pe-footer" id="mpFooter"><button class="ghost" type="button" id="cancelManagePayroll">Close</button>${hasEmp ? `<div><button class="ghost" type="button" id="mpPreviewPayslip">Preview Payslip</button>${isLocked ? '<button class="primary" type="button" id="mpUnlockPayroll">Unlock Payroll</button>' : '<button class="primary" type="button" id="mpGeneratePayslip">Generate Payslip</button>'}</div>` : ''}</div>
   `;
 }
 
@@ -1268,11 +1468,14 @@ function bindManagePayrollModal() {
           });
           if (res.error) { alert(res.error); return; }
           await refresh();
-          const fresh = (state.payroll?.rows || []).find(r => Number(r.employee_id) === Number(emp.employee_id));
-          if (fresh) state.managePayrollSelected = fresh;
-          const body = document.querySelector('#managePayrollBody');
-          if (body) body.innerHTML = managePayrollModalBody(fresh || emp, state.payPeriodDays || 7);
+          const fresh = (state.payroll?.rows || []).find(r => Number(r.employee_id) === Number(emp.employee_id)) || emp;
+          state.showManagePayroll = false;
+          state.managePayrollSelected = null;
+          state.managePayrollTransModal = false;
+          state._managePayrollSearch = '';
+          state._generatedPayslip = fresh;
           showToast('Payslip generated and salary auto-paid.');
+          reRenderCurrentView();
         } catch (e) {
           showToast(e.message, 'error');
         }
@@ -1288,6 +1491,37 @@ function bindManagePayrollModal() {
       modal.insertAdjacentHTML('beforeend', managePayrollTransModalHTML(state.managePayrollSelected));
       bindMiniCalendar('mpTransDate', () => {});
       updateMpTransactionLimits();
+      return;
+    }
+
+    /* Unlock Payroll (direct, no navigation) */
+    if (target.id === 'mpUnlockPayroll') {
+      (async () => {
+        const emp = state.managePayrollSelected;
+        if (!emp) return;
+        const confirmed = await confirmDialog(
+          'Unlock this payroll?',
+          'This will allow changes again and remove the auto-paid salary for this period.',
+          'Unlock',
+          'primary'
+        );
+        if (!confirmed) return;
+        try {
+          const res = await api(`/api/payroll/${emp.employee_id}/unlock`, {
+            method: 'POST',
+            body: JSON.stringify({ weekStart: state.week })
+          });
+          if (res.error) { showToast(res.error, 'error'); return; }
+          showToast('Payroll unlocked. You can manage transactions again.');
+          await refresh();
+          const fresh = (state.payroll?.rows || []).find(r => Number(r.employee_id) === Number(emp.employee_id));
+          if (fresh) state.managePayrollSelected = fresh;
+          const body = document.querySelector('#managePayrollBody');
+          if (body) body.innerHTML = managePayrollModalBody(fresh || emp, state.payPeriodDays || 7);
+        } catch (e) {
+          showToast(e.message, 'error');
+        }
+      })();
       return;
     }
   });
@@ -1433,10 +1667,6 @@ function approveRegistrationModal() {
           </div>
           <form id="approveRegistrationForm" novalidate>
             <label>Daily Rate (₱)<input name="rate" type="number" min="500" step="0.01" required placeholder="e.g. 650"></label>
-            <label>Pay Period Days<select name="pay_period_days">
-              <option value="7" ${(state.payPeriodDays || 7) === 7 ? 'selected' : ''}>Weekly (7 days)</option>
-              <option value="14" ${(state.payPeriodDays || 7) === 14 ? 'selected' : ''}>Semi-monthly (14 days)</option>
-            </select></label>
             <div class="error error-box" id="approveRegError"></div>
             <div class="modal-actions">
               <button class="ghost" type="button" id="cancelApproveRegistration">Cancel</button>
@@ -1466,14 +1696,13 @@ function bindApproveRegistrationModal() {
     if (!reg) return close();
     const form = e.target;
     const rate = form.elements.rate.value;
-    const pay_period_days = form.elements.pay_period_days.value;
     const btn = document.querySelector('#confirmApproveRegistration');
     const errEl = document.querySelector('#approveRegError');
     loadingButton(btn, true);
     try {
       await api(`/api/registrations/${reg.id}/approve`, {
         method: 'POST',
-        body: JSON.stringify({ rate, pay_period_days })
+        body: JSON.stringify({ rate })
       });
       state._approveRegistration = null;
       await loadRegistrations();
@@ -1549,6 +1778,72 @@ function bindRejectRegistrationModal() {
   });
 }
 
+function resetDeviceModal() {
+  const reg = state._resetDeviceRegistration;
+  if (!reg) return '';
+  return `
+    <div class="modal-backdrop" id="resetDeviceModal">
+      <section class="modal confirm-modal">
+        <div class="modal-head">
+          <div>
+            <h2>Reset Device Binding</h2>
+            <p>Unbind the phone of <strong>${escapeHtml(reg.name)}</strong>?</p>
+          </div>
+          <button class="icon-btn" id="closeResetDevice" aria-label="Close">x</button>
+        </div>
+        <form id="resetDeviceForm">
+          <div class="modal-body">
+            <p class="muted">
+              The account is currently bound to the device that registered it
+              (GCash-style). Resetting lets the employee sign in from a new
+              phone — the <em>next device that signs in</em> becomes the new
+              bound device.
+            </p>
+          </div>
+          <div class="modal-foot">
+            <button type="button" class="ghost" id="cancelResetDevice">Cancel</button>
+            <button type="submit" class="btn danger" id="confirmResetDevice">Reset Device</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+function bindResetDeviceModal() {
+  const modal = document.querySelector('#resetDeviceModal');
+  if (!modal) return;
+  const close = () => {
+    state._resetDeviceRegistration = null;
+    reRenderCurrentView();
+  };
+  setupModalKeyboard('#resetDeviceModal', close);
+  document.querySelector('#closeResetDevice')?.addEventListener('click', close);
+  document.querySelector('#cancelResetDevice')?.addEventListener('click', close);
+  modal.addEventListener('click', e => { if (e.target === modal) close(); });
+  document.querySelector('#resetDeviceForm')?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const reg = state._resetDeviceRegistration;
+    if (!reg) return close();
+    const btn = document.querySelector('#confirmResetDevice');
+    loadingButton(btn, true);
+    try {
+      await api(`/api/registrations/${reg.id}/reset-device`, {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      state._resetDeviceRegistration = null;
+      await loadRegistrations();
+      reRenderCurrentView();
+      showToast(`Device binding cleared for ${reg.name}.`);
+    } catch (error) {
+      showToast(error.message, 'error');
+    } finally {
+      loadingButton(btn, false);
+    }
+  });
+}
+
 /* ── Payroll Review & Accept Modal ── */
 function payrollReviewModal() {
   const summary = state.payroll?.summary || {};
@@ -1559,32 +1854,80 @@ function payrollReviewModal() {
   const isAdmin = state.user.role === 'admin';
   const allGenerated = totalCount > 0 && generatedCount === totalCount;
   const pd = state.payPeriodDays || 7;
+  const statusLabel = (row) => row.payroll_status === 'generated'
+    ? (row.payment_status === 'paid' ? 'Paid/Generated' : row.payment_status === 'partial' ? 'Partial/Generated' : 'Locked')
+    : row.payment_status === 'paid' ? 'Paid' : row.payment_status === 'partial' ? 'Partial' : 'Unpaid';
+  const statusClass = (row) => row.payroll_status === 'generated' ? 'generated' : row.payment_status;
+  const previewHTML = (row) => `
+    <div class="review-preview">
+      <div class="review-preview-head">
+        <strong>${escapeHtml(row.name)}</strong>
+        <span>No.: ${escapeHtml(row.emp_number || '')}</span>
+        <span>Rate: ${formatMoney(row.rate)}/day</span>
+        <span>Days: ${row.days ?? 0}</span>
+      </div>
+      <div class="review-preview-grid">
+        <span>Salary</span><strong>${formatMoney(row.salary)}</strong>
+        <span>Extra Pay</span><strong>${formatMoney(row.extra_payment_amount || 0)}</strong>
+        <span>Total Earnings</span><strong>${formatMoney(Number(row.salary || 0) + Number(row.extra_payment_amount || 0))}</strong>
+        <span>Paid</span><strong>${formatMoney(row.paid_amount)}</strong>
+        <span>Balance</span><strong>${formatMoney(row.balance)}</strong>
+        <span>C/A Balance</span><strong>${formatMoney(row.remaining_bale_balance)}</strong>
+        <span>Total C/A</span><strong>${formatMoney(row.total_bale)}</strong>
+        <span>Status</span><strong>${statusLabel(row)}</strong>
+      </div>
+    </div>`;
   return `
     <div class="modal-backdrop" id="payrollReviewModal">
-      <section class="modal confirm-modal">
+      <section class="modal wide-modal review-payroll-modal">
         <div class="modal-head">
           <div>
             <h2>Review & Accept Payroll</h2>
-            <p>${state.week} to ${addDays(state.week, pd - 1)} — verify the records below before enabling Bulk Print.</p>
+            <p>${state.week} to ${addDays(state.week, pd - 1)} — review each payslip below, then accept to release payment and enable Bulk Print.</p>
           </div>
           <button class="icon-btn" id="closePayrollReview" aria-label="Close">x</button>
         </div>
-        <div class="modal-body">
-          <div class="reg-info-grid">
-            <span>Employees</span><strong>${summary.employees ?? rows.length}</strong>
-            <span>Payslips Generated</span><strong>${generatedCount}/${totalCount}</strong>
-            <span>Total Salary</span><strong>${formatMoney(summary.totalSalary)}</strong>
-            <span>Total Paid</span><strong>${formatMoney(summary.totalPaidAmount)}</strong>
-            <span>Total Balance</span><strong>${formatMoney(summary.totalBalance)}</strong>
-            <span>Total C/A</span><strong>${formatMoney(summary.totalBaleBalance)}</strong>
-          </div>
-          ${review.accepted ? `<div class="review-banner review-banner-ok" style="margin:0 0 12px;"><span>Already accepted by ${escapeHtml(review.accepted_by_username || 'admin')} · ${formatShortDate(review.accepted_at)}.</span></div>` : ''}
-          ${!allGenerated ? `<div class="error-box" style="margin-bottom:12px;">Not all payslips are generated yet (${generatedCount}/${totalCount}). Generate every payslip first.</div>` : ''}
-          ${!isAdmin ? `<div class="error-box" style="margin-bottom:12px;">Only an admin can accept the payroll for bulk printing.</div>` : ''}
-          <div class="modal-actions">
-            <button class="ghost" type="button" id="cancelPayrollReview">Cancel</button>
-            <button class="primary" type="button" id="confirmPayrollReview" ${allGenerated && isAdmin ? '' : 'disabled'}>${review.accepted ? 'Re-accept Payroll' : 'Accept Payroll'}</button>
-          </div>
+        <div class="reg-info-grid">
+          <span>Employees</span><strong>${summary.employees ?? rows.length}</strong>
+          <span>Payslips Generated</span><strong>${generatedCount}/${totalCount}</strong>
+          <span>Total Salary</span><strong>${formatMoney(summary.totalSalary)}</strong>
+          <span>Total Paid</span><strong>${formatMoney(summary.totalPaidAmount)}</strong>
+          <span>Total Balance</span><strong>${formatMoney(summary.totalBalance)}</strong>
+          <span>Total C/A</span><strong>${formatMoney(summary.totalBaleBalance)}</strong>
+        </div>
+        ${review.accepted ? `<div class="review-banner review-banner-ok" style="margin:12px 0 0;"><span>Already accepted by ${escapeHtml(review.accepted_by_username || 'admin')} · ${formatShortDate(review.accepted_at)}.</span></div>` : ''}
+        ${!allGenerated ? `<div class="error-box" style="margin-top:12px;">Not all payslips are generated yet (${generatedCount}/${totalCount}). Generate every payslip first.</div>` : ''}
+        <div class="review-table-wrap">
+          <table class="payroll-table review-table">
+            <thead>
+              <tr>
+                <th>No.</th><th>Name</th><th>Days</th><th>Salary</th><th>Extra</th><th>Paid</th><th>Balance</th><th>C/A Bal.</th><th>Status</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(row => `
+                <tr class="review-row status-${row.payment_status}">
+                  <td>${escapeHtml(row.emp_number || '')}</td>
+                  <td>${escapeHtml(row.name)}</td>
+                  <td>${row.days ?? 0}</td>
+                  <td><strong>${formatMoney(row.salary)}</strong></td>
+                  <td>${formatMoney(row.extra_payment_amount || 0)}</td>
+                  <td>${formatMoney(row.paid_amount)}</td>
+                  <td>${formatMoney(row.balance)}</td>
+                  <td>${formatMoney(row.remaining_bale_balance)}</td>
+                  <td><span class="badge ${statusClass(row)} status-badge">${statusLabel(row)}</span></td>
+                  <td><button class="ghost review-preview-btn" type="button" data-review-preview="${row.employee_id}">Preview</button></td>
+                </tr>
+                <tr class="review-preview-row" data-review-preview-body="${row.employee_id}" hidden>
+                  <td colspan="10">${previewHTML(row)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-actions">
+          <button class="ghost" type="button" id="cancelPayrollReview">Cancel</button>
+          <button class="primary" type="button" id="confirmPayrollReview" ${allGenerated && isAdmin ? '' : 'disabled'}>${review.accepted ? 'Re-accept & Release Payments' : 'Accept All & Release Payments'}</button>
         </div>
       </section>
     </div>
@@ -1602,19 +1945,165 @@ function bindPayrollReviewModal() {
   document.querySelector('#closePayrollReview')?.addEventListener('click', close);
   document.querySelector('#cancelPayrollReview')?.addEventListener('click', close);
   modal.addEventListener('click', e => { if (e.target === modal) close(); });
+  modal.querySelectorAll('.review-preview-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.reviewPreview;
+      const body = modal.querySelector(`[data-review-preview-body="${id}"]`);
+      if (body) {
+        body.hidden = !body.hidden;
+        btn.textContent = body.hidden ? 'Preview' : 'Hide';
+      }
+    });
+  });
   document.querySelector('#confirmPayrollReview')?.addEventListener('click', async () => {
     const btn = document.querySelector('#confirmPayrollReview');
     loadingButton(btn, true);
     try {
-      await api('/api/payroll/review', {
+      const resp = await api('/api/payroll/review', {
         method: 'POST',
         body: JSON.stringify({ week: state.week, periodDays: state.payPeriodDays || 7 })
       });
       state._payrollReview = null;
       await refresh();
-      showToast('Payroll accepted — Bulk Print is now enabled.');
+      showToast(resp.auto_paid > 0
+        ? `Payroll accepted — ${resp.auto_paid} payslip${resp.auto_paid === 1 ? '' : 's'} paid, Bulk Print enabled.`
+        : 'Payroll accepted — Bulk Print is now enabled.');
     } catch (error) {
       showToast(error.message, 'error');
+      loadingButton(btn, false);
+    }
+  });
+}
+
+/* ── Edit Attendance Times (admin) ── */
+function editAttendanceModal(row) {
+  if (!row) return '';
+  return `
+    <div class="modal-backdrop" id="editAttendanceModal">
+      <section class="modal confirm-modal">
+        <div class="modal-head">
+          <div>
+            <h2>Edit Attendance Times</h2>
+            <p>${escapeHtml(row.employee)} — ${escapeHtml(row.workDate)}</p>
+          </div>
+          <button class="icon-btn" id="closeEditAttendance" aria-label="Close">x</button>
+        </div>
+        <div class="modal-body">
+          <label style="display:block;">Time In<input type="time" id="editAttendanceTimeIn" value="${escapeHtml(row.timeIn || '')}" style="margin-top:4px;"></label>
+          <label style="display:block;margin-top:12px;">Time Out<input type="time" id="editAttendanceTimeOut" value="${escapeHtml(row.timeOut || '')}" style="margin-top:4px;"></label>
+          <p class="muted" style="margin-top:10px;font-size:12px;">Leave a field empty to clear that time. Changes are synced to the employee app.</p>
+        </div>
+        <div class="modal-actions">
+          <button class="ghost" type="button" id="cancelEditAttendance">Cancel</button>
+          <button class="primary" type="button" id="saveEditAttendance">Save Times</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindEditAttendanceModal() {
+  const modal = document.querySelector('#editAttendanceModal');
+  if (!modal) return;
+
+  const close = () => {
+    state.editingAttendance = null;
+    reRenderCurrentView();
+  };
+
+  setupModalKeyboard('#editAttendanceModal', close);
+  document.querySelector('#closeEditAttendance').addEventListener('click', close);
+  document.querySelector('#cancelEditAttendance').addEventListener('click', close);
+  modal.addEventListener('click', event => {
+    if (event.target === modal) close();
+  });
+  document.querySelector('#saveEditAttendance').addEventListener('click', async () => {
+    const timeIn = document.querySelector('#editAttendanceTimeIn').value;
+    const timeOut = document.querySelector('#editAttendanceTimeOut').value;
+    const saveBtn = document.querySelector('#saveEditAttendance');
+    loadingButton(saveBtn, true);
+    try {
+      await api(`/api/attendance/${state.editingAttendance.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          work_date: state.editingAttendance.workDate,
+          time_in: timeIn,
+          time_out: timeOut
+        })
+      });
+      showToast('Attendance times updated.');
+      state.editingAttendance = null;
+      await partialRefresh(['attendance', 'payroll']);
+    } catch (error) {
+      showToast(error.message || 'Failed to update attendance times.', 'error');
+      loadingButton(saveBtn, false);
+    }
+  });
+}
+
+/* ── Broadcast Announcement (admin → all employees) ── */
+function broadcastModal() {
+  return `
+    <div class="modal-backdrop" id="broadcastModal">
+      <section class="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="broadcastTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="broadcastTitle">Send Announcement</h2>
+            <p>Broadcast a push notification to all employees with the app installed.</p>
+          </div>
+          <button class="icon-btn" id="closeBroadcastModal" aria-label="Close">x</button>
+        </div>
+        <div class="form-grid">
+          <label>Title<input id="broadcastTitleInput" maxlength="160" placeholder="e.g. Payday tomorrow"></label>
+          <label>Message<textarea id="broadcastMessage" rows="4" maxlength="2000" placeholder="Type your announcement..."></textarea></label>
+        </div>
+        <p class="field-hint" style="margin-top:14px;">Ito ay ipapadala bilang push notification sa lahat ng employees na may naka-install na app.</p>
+        <div class="modal-actions">
+          <button class="ghost" type="button" id="cancelBroadcast">Cancel</button>
+          <button class="primary" type="button" id="sendBroadcast">Send to All</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function bindBroadcastModal() {
+  const modal = document.querySelector('#broadcastModal');
+  if (!modal) return;
+
+  const close = () => {
+    state.showBroadcast = false;
+    reRenderCurrentView();
+  };
+
+  setupModalKeyboard('#broadcastModal', close);
+  document.querySelector('#closeBroadcastModal').addEventListener('click', close);
+  document.querySelector('#cancelBroadcast').addEventListener('click', close);
+  modal.addEventListener('click', event => {
+    if (event.target === modal) close();
+  });
+  document.querySelector('#sendBroadcast').addEventListener('click', async () => {
+    const title = document.querySelector('#broadcastTitleInput').value.trim();
+    const message = document.querySelector('#broadcastMessage').value.trim();
+    if (!title || !message) {
+      showToast('Title and message are required.', 'error');
+      return;
+    }
+    const btn = document.querySelector('#sendBroadcast');
+    loadingButton(btn, true);
+    try {
+      const resp = await api('/api/announcements', {
+        method: 'POST',
+        body: JSON.stringify({ title, message })
+      });
+      const sent = Number(resp.sent || 0);
+      showToast(sent > 0
+        ? `Announcement sent to ${sent} device${sent === 1 ? '' : 's'}.`
+        : 'Announcement saved (no devices online right now).');
+      state.showBroadcast = false;
+      await refresh();
+    } catch (error) {
+      showToast(error.message || 'Failed to send announcement.', 'error');
       loadingButton(btn, false);
     }
   });

@@ -52,10 +52,14 @@ async function loadData() {
     api(`/api/extra-payments?week=${state.payrollWeek}&periodDays=${pd}`),
     api(`/api/bale-payments?week=${state.payrollWeek}&periodDays=${pd}`),
     api(`/api/salary-payments?week=${state.payrollWeek}&periodDays=${pd}`),
-    api(`/api/registrations?${regQs}`)
+    api(`/api/registrations?${regQs}`),
+    api('/api/cash-advance-requests'),
+    api('/api/payslip-requests')
   ];
 
-  const [employees, payroll, attendance, advances, extraPayments, balePayments, salaryPayments, registrations] = await Promise.all(promises);
+  const [employees, payroll, attendance, advances, extraPayments, balePayments, salaryPayments, registrations, cashAdvanceRequests, payslipRequests] = await Promise.all(promises);
+  state.payslipRequests = payslipRequests?.rows || [];
+  state.payslipRequestCounts = payslipRequests?.counts || {};
   state.employees = employees;
   state.payroll = payroll;
   state.attendance = attendance;
@@ -65,6 +69,8 @@ async function loadData() {
   state.salaryPayments = salaryPayments;
   state.registrations = registrations.rows || registrations;
   state.registrationCounts = registrations.counts || {};
+  state.cashAdvanceRequests = cashAdvanceRequests.rows || [];
+  state.cashAdvanceRequestCounts = cashAdvanceRequests.counts || {};
 }
 
 async function loadRegistrations() {
@@ -72,6 +78,29 @@ async function loadRegistrations() {
   const data = await api(`/api/registrations?${regQs}`);
   state.registrations = data.rows || [];
   state.registrationCounts = data.counts || {};
+  syncNavBadge();
+}
+
+async function loadCashAdvanceRequests() {
+  const qs = new URLSearchParams({
+    status: state.cashAdvanceRequestStatus || '',
+    search: state._caRequestsSearch || ''
+  });
+  const data = await api(`/api/cash-advance-requests?${qs}`);
+  state.cashAdvanceRequests = data.rows || [];
+  state.cashAdvanceRequestCounts = data.counts || {};
+  syncNavBadge();
+}
+
+async function loadPayslipRequests() {
+  const qs = new URLSearchParams({
+    status: state.payslipRequestsStatus || '',
+    search: state._payslipRequestsSearch || ''
+  });
+  const data = await api(`/api/payslip-requests?${qs}`);
+  state.payslipRequests = data.rows || [];
+  state.payslipRequestCounts = data.counts || {};
+  syncNavBadge();
 }
 
 async function loadAuditLogs() {

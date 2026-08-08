@@ -110,7 +110,7 @@ function titleForView() {
     attendance: 'Attendance Logs',
     employees: 'Employee Module',
     cashAdvance: 'Cash Advance',
-    approvals: 'Registration Approvals',
+    approvals: 'Approvals',
     archive: 'Archive'
   }[state.view];
 }
@@ -265,6 +265,7 @@ function renderLogin(error = '') {
       if (data.csrfToken) setCsrfToken(data.csrfToken);
       showToast('Hello ' + username + '!');
       startDateWatcher();
+      startRealtimeWatcher();
       startSessionTimer();
       await refresh();
     } catch (err) {
@@ -276,8 +277,6 @@ function renderLogin(error = '') {
 
 /* ── Dashboard ── */
 function renderDashboard() {
-  const payroll = state.payroll;
-  const isAdmin = state.user.role === 'admin';
   const lastLoginStr = state.lastLogin ? new Date(state.lastLogin).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) : null;
   const empCount = state.employees.filter(e => e.active !== false).length;
   const attendanceToday = state.attendance ? state.attendance.rows.filter(r => r.work_date === state.currentDate).length : 0;
@@ -302,7 +301,7 @@ function renderDashboard() {
       </div>
       <div class="summary-card" style="border-left-color:#166534;">
         <span class="card-icon">P</span>
-        <span>Salary Payment</span>
+        <span>Total Paid</span>
         <strong>${summary ? formatMoney(summary.totalPaidAmount) : '₱0.00'}</strong>
       </div>
       <div class="summary-card" style="border-left-color:#c2410c;">
@@ -316,77 +315,34 @@ function renderDashboard() {
         <strong>${summary ? formatMoney(summary.totalBaleBalance) : '₱0.00'}</strong>
       </div>
     </section>
-    <section class="panel">
+    <section class="panel dashboard-analytics no-print">
       <div class="panel-header">
         <div>
-          <h2>Quick Actions</h2>
-          <p>${state.currentDate} | Week: ${payroll ? payroll.weekStart : state.week}</p>
+          <h2>Payroll Analytics</h2>
+          <p>Visual summary of attendance, salary, and balances for the selected period.</p>
         </div>
-        <span class="badge role-${state.user.role}">${isAdmin ? 'Admin' : 'HR'}</span>
       </div>
-      <div class="quick-actions">
-        <div class="quick-action-card" data-quick-view="payroll">
-          <span class="qa-icon">$</span>
-          <strong>Payroll</strong>
-          <span>View and manage payroll, payments, and payslips.</span>
-          <button class="primary">Go to Payroll</button>
+      <div class="analytics-grid">
+        <div class="chart-card">
+          <div class="chart-card-title"><span class="chart-dot" style="background:#0f766e;"></span>Payment Status</div>
+          <div class="chart-wrap"><canvas id="statusPieChart"></canvas></div>
         </div>
-        <div class="quick-action-card" data-quick-view="attendance">
-          <span class="qa-icon">A</span>
-          <strong>Attendance</strong>
-          <span>Record daily employee attendance logs.</span>
-          <button class="ghost">Take Attendance</button>
+        <div class="chart-card">
+          <div class="chart-card-title"><span class="chart-dot" style="background:#075985;"></span>Salary Trend (Last 8 Periods)</div>
+          <div class="chart-wrap"><canvas id="trendBarChart"></canvas></div>
         </div>
-        <div class="quick-action-card" data-quick-view="employees">
-          <span class="qa-icon">E</span>
-          <strong>Employees</strong>
-          <span>${isAdmin ? 'Add, edit, or archive employee profiles.' : 'Add and edit employee profiles.'}</span>
-          <button class="ghost">Manage Employees</button>
+        <div class="chart-card">
+          <div class="chart-card-title"><span class="chart-dot" style="background:#166534;"></span>Top Earners (This Period)</div>
+          <div class="chart-wrap"><canvas id="topEarnersChart"></canvas></div>
         </div>
-        <div class="quick-action-card" data-quick-view="archive">
-          <span class="qa-icon">A</span>
-          <strong>Archive</strong>
-          <span>${isAdmin ? 'View archived employees, restore, or permanently delete.' : 'View archived employees (read-only).'}</span>
-          <button class="ghost">${isAdmin ? 'Go to Archive' : 'View Archive'}</button>
+        <div class="chart-card">
+          <div class="chart-card-title"><span class="chart-dot" style="background:#92400e;"></span>Bale / Cash Advance Balances</div>
+          <div class="chart-wrap"><canvas id="baleChart"></canvas></div>
         </div>
-        ${isAdmin ? `
-        <div class="quick-action-card" id="auditTrailCard">
-          <span class="qa-icon">L</span>
-          <strong>System Logs</strong>
-          <span>View all system actions and changes (Admin only).</span>
-          <button class="ghost">Open System Logs</button>
-        </div>` : `
-        <div class="quick-action-card" style="opacity:0.6;cursor:default;">
-          <span class="qa-icon">L</span>
-          <strong>System Logs</strong>
-          <span>Admin-only feature. Request access from admin.</span>
-          <button class="ghost" disabled style="cursor:not-allowed;">Admin Only</button>
-        </div>`}
       </div>
+      <div id="analyticsFallback" class="analytics-fallback" hidden></div>
     </section>
   `);
-  document.querySelectorAll('.quick-action-card').forEach(card => {
-    card.addEventListener('click', async (e) => {
-      const view = card.dataset.quickView;
-      if (view === 'payroll') {
-        state.showManagePayroll = true;
-        reRenderCurrentView();
-        return;
-      }
-      if (view) {
-        state.searchPayroll = '';
-        state.searchEmployees = '';
-        state.searchAttendance = '';
-        state.view = view;
-        saveUiState();
-        await refresh();
-      }
-    });
-  });
-  document.querySelector('#auditTrailCard')?.addEventListener('click', () => {
-    state.showAudit = true;
-    refresh();
-  });
   document.querySelectorAll('.attention-action').forEach(btn => {
     btn.addEventListener('click', async () => {
       const view = btn.dataset.quickView;
@@ -434,6 +390,190 @@ function renderDashboard() {
       showToast(err.message, 'error');
     }
   });
+  initDashboardAnalytics();
+}
+
+/* ── Dashboard Analytics (Chart.js) ── */
+let _dashboardCharts = [];
+
+function destroyDashboardCharts() {
+  _dashboardCharts.forEach(chart => {
+    try { chart.destroy(); } catch (e) {}
+  });
+  _dashboardCharts = [];
+}
+
+async function initDashboardAnalytics() {
+  destroyDashboardCharts();
+  const fallback = document.querySelector('#analyticsFallback');
+  if (!fallback) return;
+  if (typeof window.Chart === 'undefined') {
+    fallback.hidden = false;
+    fallback.innerHTML = 'Analytics charts could not load (Chart.js unavailable). Please check your internet connection.';
+    return;
+  }
+
+  const isDark = document.body.classList.contains('dark-mode');
+  const gridColor = isDark ? 'rgba(148, 163, 184, 0.14)' : 'rgba(15, 23, 42, 0.08)';
+  const tickColor = isDark ? '#94a3b8' : '#64748b';
+  const fontFamily = "'Inter', sans-serif";
+
+  const baseOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { labels: { color: tickColor, font: { family: fontFamily, size: 11 }, usePointStyle: true, boxWidth: 8 } }
+    }
+  };
+  const barDefaults = {
+    ...baseOptions,
+    scales: {
+      x: { ticks: { color: tickColor, font: { family: fontFamily, size: 10 }, maxRotation: 0, autoSkip: true }, grid: { color: gridColor } },
+      y: { ticks: { color: tickColor, font: { family: fontFamily, size: 10 } }, grid: { color: gridColor } }
+    }
+  };
+
+  try {
+    /* 1. Payment status pie (from current payroll rows) */
+    const rows = state.payroll?.rows || [];
+    const statusCounts = { Paid: 0, Partial: 0, Unpaid: 0, Generated: 0 };
+    rows.forEach(row => {
+      const gen = row.payroll_status === 'generated';
+      if (gen) statusCounts.Generated += 1;
+      else if (row.payment_status === 'paid') statusCounts.Paid += 1;
+      else if (row.payment_status === 'partial') statusCounts.Partial += 1;
+      else statusCounts.Unpaid += 1;
+    });
+    const pieLabels = Object.keys(statusCounts).filter(k => statusCounts[k] > 0);
+    const pieData = pieLabels.map(k => statusCounts[k]);
+    const pieEl = document.querySelector('#statusPieChart');
+    if (pieEl && pieData.length) {
+      _dashboardCharts.push(new Chart(pieEl, {
+        type: 'doughnut',
+        data: {
+          labels: pieLabels,
+          datasets: [{
+            data: pieData,
+            backgroundColor: ['#0f766e', '#075985', '#c2410c', '#7c3aed'],
+            borderWidth: 2,
+            borderColor: isDark ? '#111318' : '#ffffff'
+          }]
+        },
+        options: {
+          ...baseOptions,
+          cutout: '62%',
+          plugins: {
+            ...baseOptions.plugins,
+            tooltip: {
+              callbacks: {
+                label: ctx => ` ${ctx.label}: ${ctx.raw} employee${ctx.raw === 1 ? '' : 's'}`
+              }
+            }
+          }
+        }
+      }));
+    } else if (pieEl) {
+      pieEl.closest('.chart-card').querySelector('.chart-wrap').innerHTML = '<div class="chart-empty">No payroll data yet</div>';
+    }
+
+    /* 2. Salary trend (server endpoint) */
+    const trendEl = document.querySelector('#trendBarChart');
+    if (trendEl) {
+      const trend = await api(`/api/payroll/trend?periodDays=${state.payPeriodDays || 7}&weeks=8`);
+      const trendRows = trend.rows || [];
+      if (trendRows.length) {
+        const labels = trendRows.map(r => {
+          const d = new Date(r.weekStart + 'T00:00:00');
+          return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        });
+        _dashboardCharts.push(new Chart(trendEl, {
+          type: 'bar',
+          data: {
+            labels,
+            datasets: [
+              { label: 'Salary', data: trendRows.map(r => r.salary), backgroundColor: '#0f766e', borderRadius: 6 },
+              { label: 'Paid', data: trendRows.map(r => r.paid), backgroundColor: '#166534', borderRadius: 6 },
+              { label: 'C/A (Bale)', data: trendRows.map(r => r.bale), backgroundColor: '#92400e', borderRadius: 6 }
+            ]
+          },
+          options: {
+            ...barDefaults,
+            scales: {
+              ...barDefaults.scales,
+              x: { ...barDefaults.scales.x, stacked: false }
+            },
+            plugins: {
+              ...barDefaults.plugins,
+              tooltip: {
+                callbacks: {
+                  label: ctx => ` ${ctx.dataset.label}: ${formatMoney(ctx.raw)}`
+                }
+              }
+            }
+          }
+        }));
+      } else {
+        trendEl.closest('.chart-card').querySelector('.chart-wrap').innerHTML = '<div class="chart-empty">No trend data yet</div>';
+      }
+    }
+
+    /* 3. Top earners (this period) */
+    const topEl = document.querySelector('#topEarnersChart');
+    if (topEl) {
+      const top = [...rows].filter(r => Number(r.salary || 0) > 0)
+        .sort((a, b) => Number(b.salary) - Number(a.salary))
+        .slice(0, 7);
+      if (top.length) {
+        _dashboardCharts.push(new Chart(topEl, {
+          type: 'bar',
+          data: {
+            labels: top.map(r => r.name.split(' ').slice(0, 2).join(' ')),
+            datasets: [{ label: 'Gross Salary', data: top.map(r => Number(r.salary)), backgroundColor: '#075985', borderRadius: 6 }]
+          },
+          options: {
+            ...barDefaults,
+            indexAxis: 'y',
+            plugins: {
+              ...barDefaults.plugins,
+              tooltip: { callbacks: { label: ctx => ` ${formatMoney(ctx.raw)}` } }
+            }
+          }
+        }));
+      } else {
+        topEl.closest('.chart-card').querySelector('.chart-wrap').innerHTML = '<div class="chart-empty">No salary data yet</div>';
+      }
+    }
+
+    /* 4. Bale / cash advance balances */
+    const baleEl = document.querySelector('#baleChart');
+    if (baleEl) {
+      const baleRows = [...rows].filter(r => Number(r.remaining_bale_balance || 0) > 0)
+        .sort((a, b) => Number(b.remaining_bale_balance) - Number(a.remaining_bale_balance))
+        .slice(0, 7);
+      if (baleRows.length) {
+        _dashboardCharts.push(new Chart(baleEl, {
+          type: 'bar',
+          data: {
+            labels: baleRows.map(r => r.name.split(' ').slice(0, 2).join(' ')),
+            datasets: [{ label: 'C/A Balance', data: baleRows.map(r => Number(r.remaining_bale_balance)), backgroundColor: '#92400e', borderRadius: 6 }]
+          },
+          options: {
+            ...barDefaults,
+            indexAxis: 'y',
+            plugins: {
+              ...barDefaults.plugins,
+              tooltip: { callbacks: { label: ctx => ` ${formatMoney(ctx.raw)}` } }
+            }
+          }
+        }));
+      } else {
+        baleEl.closest('.chart-card').querySelector('.chart-wrap').innerHTML = '<div class="chart-empty">No C/A balances yet</div>';
+      }
+    }
+  } catch (e) {
+    fallback.hidden = false;
+    fallback.textContent = 'Could not load analytics: ' + (e.message || 'unknown error');
+  }
 }
 
 /* ── Payroll ── */
@@ -462,12 +602,24 @@ async function renderPayroll() {
   const totalCount = state.payroll.rows.length;
   const review = state.payroll.review || { accepted: false };
   const allGenerated = totalCount > 0 && generatedCount === totalCount;
+  const isAdmin = state.user.role === 'admin';
   const canBulkPrint = allGenerated && !!review.accepted;
   const reviewHint = !allGenerated
     ? `Generate every payslip before using Bulk Print (${generatedCount}/${totalCount} generated)`
     : !review.accepted
-    ? 'Review the payroll below, then accept it to enable Bulk Print'
+    ? (isAdmin ? 'Review the payroll below, then accept it to release payments and enable Bulk Print' : 'Bulk Print is locked — waiting for admin approval')
     : `Accepted by ${review.accepted_by_username || 'admin'} on ${formatShortDate(review.accepted_at)}`;
+  const reviewBtnDisabled = !allGenerated || review.accepted || !isAdmin;
+  const reviewBtnLabel = review.accepted
+    ? '✓ Accepted'
+    : (!isAdmin
+        ? (allGenerated ? 'Pending Admin Approval' : 'Generate Payslips First')
+        : 'Review & Accept');
+  const reviewBtnTitle = review.accepted
+    ? `Accepted by ${review.accepted_by_username || 'admin'} on ${formatShortDate(review.accepted_at)}`
+    : (isAdmin
+        ? 'Review the payroll, then accept to release payments and enable Bulk Print'
+        : 'Bulk Print needs approval — only an admin can accept the payroll');
   const pg = paginateRows(allRows, state.pages.payroll || 1);
   const payrollCalDates = await fetchCalendarDates('/api/attendance/calendar', monthKeyFromDate(state.week));
   let transCalDates = new Set();
@@ -507,19 +659,22 @@ async function renderPayroll() {
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
           <label style="margin:0;"><input id="payrollSearch" value="${state.searchPayroll && !state.searchPayroll.startsWith('__') ? escapeHtml(state.searchPayroll) : ''}" placeholder="${state.searchPayroll === '__balance_only__' ? 'Filtered: With Balance' : state.searchPayroll === '__bale_only__' ? 'Filtered: With C/A' : state.searchPayroll === '__unpaid_only__' ? 'Filtered: Previous Unpaid' : 'Search by name or ID...'}" style="width:200px;"></label>
-          <button class="ghost no-print" id="reviewPayrollBtn" ${allGenerated ? '' : 'disabled'} title="${review.accepted ? 'Payroll already accepted for this period' : 'Review the payroll, then accept to enable Bulk Print'}">${review.accepted ? '✓ Accepted' : 'Review & Accept'}</button>
-          <button class="ghost no-print" id="bulkPrintBtn" ${canBulkPrint ? '' : 'disabled'} title="${reviewHint}">${canBulkPrint ? 'Bulk Print Payslips' : allGenerated ? `Bulk Print (needs accept)` : `Bulk Print (${generatedCount}/${totalCount})`}</button>
+          <button class="ghost no-print" id="reviewPayrollBtn" ${reviewBtnDisabled ? 'disabled' : ''} title="${reviewBtnTitle}">${reviewBtnLabel}</button>
+          <button class="ghost no-print" id="bulkPrintBtn" ${canBulkPrint ? '' : 'disabled'} title="${reviewHint}">${canBulkPrint ? 'Bulk Print Payslips' : allGenerated ? (isAdmin ? 'Bulk Print (needs accept)' : 'Bulk Print (needs admin approval)') : `Bulk Print (${generatedCount}/${totalCount})`}</button>
           <button class="ghost no-print" id="exportCSVBtn">Export CSV</button>
-          ${state.user.role === 'admin' ? `<button class="ghost no-print" id="openAuditTrail">System Logs</button>` : ''}
+          ${state.user.role === 'admin' ? `<button class="ghost no-print" id="openAuditTrail">System Logs</button>
+          <button class="ghost no-print" id="openBroadcast" title="Send a push notification to all employees">📣 Broadcast</button>` : ''}
           <button class="primary no-print" id="managePayrollBtn">Manage Payroll</button>
         </div>
       </div>
       ${allGenerated && !review.accepted ? `
         <div class="review-banner">
-          <span>All ${totalCount} payslips are generated. Review the records below, then click <strong>Review & Accept</strong> to enable Bulk Print.</span>
+          <span>${isAdmin
+            ? `All ${totalCount} payslips are generated. Review the records below, then click <strong>Review & Accept</strong> to release payments and enable Bulk Print.`
+            : `All ${totalCount} payslips are generated and submitted for review. Bulk Print will unlock once an admin accepts.`}</span>
         </div>` : review.accepted ? `
         <div class="review-banner review-banner-ok">
-          <span>Payroll accepted — Bulk Print is enabled. (${escapeHtml(review.accepted_by_username || '')} · ${formatShortDate(review.accepted_at)})</span>
+          <span>Payroll accepted — payments released and Bulk Print is enabled. (${escapeHtml(review.accepted_by_username || '')} · ${formatShortDate(review.accepted_at)})</span>
         </div>` : ''}
       <div class="table-wrap">
         <table class="payroll-table">
@@ -566,7 +721,7 @@ async function renderPayroll() {
       'Cash Advance': row.cash_advance,
       'Extra Payment': row.extra_payment_amount || 0,
       'Total Bale': row.total_bale,
-      'Salary Payment': row.paid_amount,
+      'Paid Amount': row.paid_amount,
       'Balance': row.balance,
       'Bale Balance': row.remaining_bale_balance,
       'Status': row.payment_status
@@ -575,6 +730,7 @@ async function renderPayroll() {
   });
   document.querySelector('#bulkPrintBtn')?.addEventListener('click', () => openBulkPayslipPrint(state.payroll.rows));
   document.querySelector('#reviewPayrollBtn')?.addEventListener('click', () => {
+    if (state.user.role !== 'admin') return;
     state._payrollReview = true;
     reRenderCurrentView();
   });
@@ -583,6 +739,10 @@ async function renderPayroll() {
   bindWeekToolbar();
   document.querySelector('#openAuditTrail')?.addEventListener('click', () => {
     state.showAudit = true;
+    renderPayroll();
+  });
+  document.querySelector('#openBroadcast')?.addEventListener('click', () => {
+    state.showBroadcast = true;
     renderPayroll();
   });
   /* Summary card click — filter payroll list */
@@ -699,6 +859,8 @@ async function renderAttendance() {
             'Type to search employee...'
           )}
         </label>
+        <label>Time In<input type="time" name="time_in" title="Optional time-in (e.g. 08:30)"></label>
+        <label>Time Out<input type="time" name="time_out" title="Optional time-out (e.g. 17:30)"></label>
         <button class="primary" ${availableEmployees.length ? '' : 'disabled'}>Add Attendance</button>
       </form>
       <div class="table-wrap">
@@ -708,10 +870,12 @@ async function renderAttendance() {
               <th title="Date of attendance">Date</th>
               <th title="Unique employee identification number">Emp Number</th>
               <th title="Full name of employee">Name</th>
+              <th title="Time-in for this attendance" class="r-col-time">Time In</th>
+              <th title="Time-out for this attendance" class="r-col-time">Time Out</th>
               <th title="Attendance status — always Present if recorded">Status</th>
               <th title="Daily rate at time of attendance" class="r-col-rate">Rate</th>
               <th title="Payroll period start and end for this employee" class="r-col-period">Payroll Period</th>
-              <th title="Delete this attendance record">Actions</th>
+              <th title="Edit times or delete this attendance record">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -720,17 +884,20 @@ async function renderAttendance() {
               const pStart = periodStartOf(row.work_date, pd);
               const pEnd = periodEndOf(row.work_date, pd);
               const isLocked = row.locked;
+              const appMarked = /biometric/i.test(row.notes || '');
               return `
               <tr class="${isLocked ? 'row-locked' : ''}">
                 <td>${row.work_date}</td>
                 <td>${highlight(row.emp_number)}</td>
                 <td>${highlight(row.name)}</td>
-                <td><span class="badge paid">Present</span></td>
+                <td class="r-col-time">${row.time_in ? `<span class="time-chip">${shortTime(row.time_in)}</span>` : '<span class="muted">—</span>'}</td>
+                <td class="r-col-time">${row.time_out ? `<span class="time-chip">${shortTime(row.time_out)}</span>` : '<span class="muted">—</span>'}</td>
+                <td><span class="badge paid">Present</span>${appMarked ? ' <span class="badge app-marked" title="Marked by the employee via the attendance app (biometric verification)">App/Biometric</span>' : ''}</td>
                 <td class="r-col-rate">${peso.format(row.rate_snapshot)}</td>
                 <td class="r-col-period"><span class="period-range">${formatShortDate(pStart)} – ${formatShortDate(pEnd)}</span>${isLocked ? ' <span class="badge badge-locked" title="Payroll generated for this period">Locked</span>' : ''}</td>
-                <td class="actions">${isLocked ? '<span class="muted" title="Cannot delete — payroll is locked" style="font-size:12px;">🔒 Locked</span>' : deleteButton('attendance', row.id)}</td>
+                <td class="actions">${isLocked ? '<span class="muted" title="Cannot modify — payroll is locked" style="font-size:12px;">🔒 Locked</span>' : `${editAttendanceButton(row)}${deleteButton('attendance', row.id, { appMarked })}`}</td>
               </tr>`;
-            }).join('') || `<tr><td colspan="7" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>Select an employee from the dropdown above and click "Add Attendance" to record their attendance for this date.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="9" class="empty-state"><span class="empty-icon">--</span><strong>No Attendance Records</strong><span>Select an employee from the dropdown above and click "Add Attendance" to record their attendance for this date.</span></td></tr>`}
           </tbody>
         </table>
       </div>
@@ -792,7 +959,9 @@ async function renderAttendance() {
         method: 'POST',
         body: JSON.stringify({
           employee_id: payload.employee_id,
-          work_date: state.attendanceDate
+          work_date: state.attendanceDate,
+          time_in: payload.time_in || null,
+          time_out: payload.time_out || null
         })
       });
       showToast('Attendance recorded.');
@@ -839,6 +1008,7 @@ async function renderAttendance() {
     await refresh();
   });
   bindDeletes();
+  bindAttendanceEditButtons();
 }
 
 /* ── Employees ── */
@@ -1053,6 +1223,34 @@ function renderArchive() {
   bindPagination('archive', refresh);
 }
 
+/* ── Approval module tabs ── */
+function approvalTabs() {
+  const valid = ['registrations', 'cashAdvance', 'payslip'];
+  const active = valid.includes(state.approvalsTab) ? state.approvalsTab : 'registrations';
+  return `
+    <div class="module-tabs">
+      <button type="button" class="module-tab${active === 'registrations' ? ' active' : ''}" data-approval-tab="registrations">
+        Registrations ${(state.registrationCounts?.pending || 0) > 0 ? `<span class="nav-badge">${state.registrationCounts.pending}</span>` : ''}
+      </button>
+      <button type="button" class="module-tab${active === 'cashAdvance' ? ' active' : ''}" data-approval-tab="cashAdvance">
+        Cash Advance Requests ${(state.cashAdvanceRequestCounts?.pending || 0) > 0 ? `<span class="nav-badge">${state.cashAdvanceRequestCounts.pending}</span>` : ''}
+      </button>
+      <button type="button" class="module-tab${active === 'payslip' ? ' active' : ''}" data-approval-tab="payslip">
+        Payslip Requests ${(state.payslipRequestCounts?.pending || 0) > 0 ? `<span class="nav-badge">${state.payslipRequestCounts.pending}</span>` : ''}
+      </button>
+    </div>`;
+}
+
+function bindApprovalTabs() {
+  document.querySelectorAll('[data-approval-tab]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.approvalsTab = btn.dataset.approvalTab;
+      saveUiState();
+      reRenderCurrentView();
+    });
+  });
+}
+
 /* ── Cash Advance standalone view ── */
 async function renderCashAdvance() {
   const editing = state.editingCashAdvance;
@@ -1187,6 +1385,255 @@ function bindCashAdvanceForm(selector) {
       showToast(error.message, 'error');
     }
     loadingButton(btn, false);
+  });
+}
+
+/* ── Cash Advance Requests (from the employee app) ── */
+function renderCashAdvanceRequests() {
+  const counts = state.cashAdvanceRequestCounts || {};
+  const rows = state.cashAdvanceRequests || [];
+  const pg = paginateRows(rows, state.pages.cashAdvanceRequests || 1, 25);
+  const statusOptions = [
+    { value: '', label: 'All Requests' },
+    { value: 'pending', label: 'Pending' },
+    { value: 'approved', label: 'Approved' },
+    { value: 'rejected', label: 'Rejected' }
+  ];
+  shell(`
+    ${approvalTabs()}
+    <div class="toolbar module-toolbar no-print toolbar-end">
+      <label>Search<input id="searchInput" value="${state._caRequestsSearch || ''}" placeholder="Type name or ID..."></label>
+      <label>Status<select id="caRequestsStatus">
+        ${statusOptions.map(o => `<option value="${o.value}" ${state.cashAdvanceRequestStatus === o.value ? 'selected' : ''}>${o.label}</option>`).join('')}
+      </select></label>
+      <button class="ghost" id="refreshCaRequests">Refresh</button>
+    </div>
+    <section class="summary">
+      <div class="summary-card" style="border-left-color:#dc2626;">
+        <span class="card-icon">P</span><span>Pending</span><strong>${counts.pending || 0}</strong>
+      </div>
+      <div class="summary-card" style="border-left-color:#166534;">
+        <span class="card-icon">✓</span><span>Approved</span><strong>${counts.approved || 0}</strong>
+      </div>
+      <div class="summary-card" style="border-left-color:#b91c1c;">
+        <span class="card-icon">✕</span><span>Rejected</span><strong>${counts.rejected || 0}</strong>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th title="When the employee requested the cash advance">Requested</th><th title="Unique employee identification number">Emp Number</th><th title="Full name of employee">Name</th><th title="Amount requested in Pesos">Amount</th><th title="When the employee wants to receive the cash advance">Pickup Date</th><th title="Reason for the request" class="r-col-notes">Reason</th><th title="Current status of the request">Status</th><th title="When an admin reviewed the request">Reviewed</th><th title="Approve or reject the request">Actions</th></tr></thead>
+          <tbody>
+            ${pg.rows.map(row => {
+              const statusBadge = row.status === 'pending'
+                ? '<span class="badge unpaid">Pending</span>'
+                : row.status === 'approved'
+                  ? '<span class="badge paid">Approved</span>'
+                  : '<span class="badge" style="color:var(--danger);background:var(--danger-soft);">Rejected</span>';
+              return `<tr>
+                <td>${row.requested_at}</td><td>${highlight(row.emp_number)}</td><td>${highlight(row.name)}</td>
+                <td><strong>${peso.format(row.amount)}</strong></td><td>${row.pickup_date || '-'}</td><td class="r-col-notes">${escapeHtml(row.reason || '-')}</td>
+                <td>${statusBadge}</td><td>${row.reviewed_at || '-'}</td>
+                <td class="actions">${row.status === 'pending'
+                  ? `<button class="ghost" data-approve-ca="${row.id}">Approve</button> <button class="danger" data-reject-ca="${row.id}">Reject</button>`
+                  : '<span class="muted" style="font-size:12px;">—</span>'}</td>
+              </tr>`;
+            }).join('') || '<tr><td colspan="9" class="empty-state"><span class="empty-icon">--</span><strong>No cash advance requests</strong><span>Requests from the employee app will appear here.</span></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      ${paginationHTML(pg, 'cashAdvanceRequests')}
+    </section>
+  `);
+
+  bindPagination('cashAdvanceRequests', async () => {
+    await loadCashAdvanceRequests();
+    reRenderCurrentView();
+  });
+  bindApprovalTabs();
+  document.querySelector('#searchInput')?.addEventListener('input', debounce(async event => {
+    state._caRequestsSearch = event.target.value;
+    state.pages.cashAdvanceRequests = 1;
+    await loadCashAdvanceRequests();
+    reRenderCurrentView();
+  }, 300));
+  document.querySelector('#caRequestsStatus')?.addEventListener('change', async event => {
+    state.cashAdvanceRequestStatus = event.target.value;
+    state.pages.cashAdvanceRequests = 1;
+    await loadCashAdvanceRequests();
+    reRenderCurrentView();
+  });
+  document.querySelector('#refreshCaRequests')?.addEventListener('click', async () => {
+    await loadCashAdvanceRequests();
+    reRenderCurrentView();
+  });
+
+  document.querySelectorAll('[data-approve-ca]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row = state.cashAdvanceRequests.find(r => String(r.id) === btn.dataset.approveCa);
+      if (!row) return;
+      const ok = await confirmDialog(
+        'Approve cash advance?',
+        `Approve <strong>${peso.format(row.amount)}</strong> for <strong>${escapeHtml(row.name)}</strong>?${row.pickup_date ? ` The employee wants to pick it up on <strong>${row.pickup_date}</strong>.` : ''} This creates a C/A record for today.`,
+        'Approve',
+        'primary'
+      );
+      if (!ok) return;
+      try {
+        await api(`/api/cash-advance-requests/${row.id}/approve`, { method: 'POST' });
+        showToast('Cash advance approved.');
+        await loadCashAdvanceRequests();
+        await partialRefresh(['payroll', 'advances']);
+        reRenderCurrentView();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+  });
+  document.querySelectorAll('[data-reject-ca]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row = state.cashAdvanceRequests.find(r => String(r.id) === btn.dataset.rejectCa);
+      if (!row) return;
+      const ok = await confirmDialog(
+        'Reject cash advance request?',
+        `Reject the <strong>${peso.format(row.amount)}</strong> request from <strong>${escapeHtml(row.name)}</strong>?`,
+        'Reject',
+        'danger'
+      );
+      if (!ok) return;
+      try {
+        await api(`/api/cash-advance-requests/${row.id}/reject`, { method: 'POST' });
+        showToast('Cash advance request rejected.');
+        await loadCashAdvanceRequests();
+        reRenderCurrentView();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+  });
+}
+
+/* ── Payslip Requests (from the employee app) ── */
+function renderPayslipRequests() {
+  const counts = state.payslipRequestCounts || {};
+  const rows = state.payslipRequests || [];
+  const pg = paginateRows(rows, state.pages.payslipRequests || 1, 25);
+  const statusOptions = [
+    { value: '', label: 'All Requests' },
+    { value: 'pending', label: 'Pending' },
+    { value: 'approved', label: 'Approved' },
+    { value: 'rejected', label: 'Rejected' }
+  ];
+  shell(`
+    ${approvalTabs()}
+    <div class="toolbar module-toolbar no-print toolbar-end">
+      <label>Search<input id="searchInput" value="${state._payslipRequestsSearch || ''}" placeholder="Type name or ID..."></label>
+      <label>Status<select id="payslipRequestsStatus">
+        ${statusOptions.map(o => `<option value="${o.value}" ${state.payslipRequestsStatus === o.value ? 'selected' : ''}>${o.label}</option>`).join('')}
+      </select></label>
+      <button class="ghost" id="refreshPayslipRequests">Refresh</button>
+    </div>
+    <section class="summary">
+      <div class="summary-card" style="border-left-color:#dc2626;">
+        <span class="card-icon">P</span><span>Pending</span><strong>${counts.pending || 0}</strong>
+      </div>
+      <div class="summary-card" style="border-left-color:#166534;">
+        <span class="card-icon">✓</span><span>Approved</span><strong>${counts.approved || 0}</strong>
+      </div>
+      <div class="summary-card" style="border-left-color:#b91c1c;">
+        <span class="card-icon">✕</span><span>Rejected</span><strong>${counts.rejected || 0}</strong>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th title="When the employee requested the payslip">Requested</th><th title="Unique employee identification number">Emp Number</th><th title="Full name of employee">Name</th><th title="Email the payslip will be sent to">Email</th><th title="Payroll period the payslip covers">Period</th><th title="Current status of the request">Status</th><th title="When an admin reviewed the request">Reviewed</th><th title="Approve or reject the request">Actions</th></tr></thead>
+          <tbody>
+            ${pg.rows.map(row => {
+              const statusBadge = row.status === 'pending'
+                ? '<span class="badge unpaid">Pending</span>'
+                : row.status === 'approved'
+                  ? '<span class="badge paid">Approved</span>'
+                  : '<span class="badge" style="color:var(--danger);background:var(--danger-soft);">Rejected</span>';
+              return `<tr>
+                <td>${row.requested_at}</td><td>${highlight(row.emp_number)}</td><td>${highlight(row.name)}</td>
+                <td>${escapeHtml(row.email || '-')}</td><td>${row.period_start || '-'} → ${row.period_end || '-'}</td>
+                <td>${statusBadge}</td><td>${row.reviewed_at || '-'}</td>
+                <td class="actions">${row.status === 'pending'
+                  ? `<button class="ghost" data-approve-payslip="${row.id}">Approve</button> <button class="danger" data-reject-payslip="${row.id}">Reject</button>`
+                  : '<span class="muted" style="font-size:12px;">—</span>'}</td>
+              </tr>`;
+            }).join('') || '<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No payslip requests</strong><span>Requests from the employee app will appear here.</span></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      ${paginationHTML(pg, 'payslipRequests')}
+    </section>
+  `);
+
+  bindPagination('payslipRequests', async () => {
+    await loadPayslipRequests();
+    reRenderCurrentView();
+  });
+  bindApprovalTabs();
+  document.querySelector('#searchInput')?.addEventListener('input', debounce(async event => {
+    state._payslipRequestsSearch = event.target.value;
+    state.pages.payslipRequests = 1;
+    await loadPayslipRequests();
+    reRenderCurrentView();
+  }, 300));
+  document.querySelector('#payslipRequestsStatus')?.addEventListener('change', async event => {
+    state.payslipRequestsStatus = event.target.value;
+    state.pages.payslipRequests = 1;
+    await loadPayslipRequests();
+    reRenderCurrentView();
+  });
+  document.querySelector('#refreshPayslipRequests')?.addEventListener('click', async () => {
+    await loadPayslipRequests();
+    reRenderCurrentView();
+  });
+
+  document.querySelectorAll('[data-approve-payslip]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row = state.payslipRequests.find(r => String(r.id) === btn.dataset.approvePayslip);
+      if (!row) return;
+      const ok = await confirmDialog(
+        'Approve payslip request?',
+        `Approve the payslip for <strong>${escapeHtml(row.name)}</strong> (${row.period_start} → ${row.period_end})? The payslip PDF will be emailed to <strong>${escapeHtml(row.email || '-')}</strong>.`,
+        'Approve & Email',
+        'primary'
+      );
+      if (!ok) return;
+      try {
+        const data = await api(`/api/payslip-requests/${row.id}/approve`, { method: 'POST' });
+        showToast(data.email_sent ? 'Payslip approved and emailed.' : 'Payslip approved (email could not be sent).');
+        await loadPayslipRequests();
+        reRenderCurrentView();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+  });
+  document.querySelectorAll('[data-reject-payslip]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row = state.payslipRequests.find(r => String(r.id) === btn.dataset.rejectPayslip);
+      if (!row) return;
+      const ok = await confirmDialog(
+        'Reject payslip request?',
+        `Reject the payslip request from <strong>${escapeHtml(row.name)}</strong> for ${row.period_start} → ${row.period_end}?`,
+        'Reject',
+        'danger'
+      );
+      if (!ok) return;
+      try {
+        await api(`/api/payslip-requests/${row.id}/reject`, { method: 'POST' });
+        showToast('Payslip request rejected.');
+        await loadPayslipRequests();
+        reRenderCurrentView();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
   });
 }
 
@@ -1660,6 +2107,7 @@ function renderApprovals() {
     { value: 'rejected', label: 'Rejected' }
   ];
   shell(`
+    ${approvalTabs()}
     <div class="toolbar module-toolbar no-print toolbar-end">
       <label>Search<input id="searchInput" value="${state._registrationsSearch}" placeholder="Type name, email, phone, or ID..."></label>
       <label>Status<select id="approvalsStatus">
@@ -1706,6 +2154,7 @@ function renderApprovals() {
               <th>Contact</th>
               <th>Government IDs</th>
               <th>Registered</th>
+              <th>Device</th>
               <th>Status</th>
               <th>Admin Notes</th>
               <th>Actions</th>
@@ -1735,22 +2184,32 @@ function renderApprovals() {
                     .join('') || '<span class="muted" style="font-size:12px;">—</span>'}
                 </td>
                 <td>${formatShortDate(row.registered_at)}</td>
+                <td>
+                  ${row.device_id
+                    ? `<span class="badge" style="background:#fef3c7;color:#92400e;">Bound</span><div class="muted" style="font-size:11px;">${escapeHtml(String(row.device_id).slice(0, 8))}…</div>`
+                    : '<span class="muted" style="font-size:12px;">Not bound</span>'}
+                </td>
                 <td><span class="badge reg-status-${row.status}">${row.status}</span></td>
                 <td class="muted" style="max-width:180px;font-size:12px;">${escapeHtml(row.admin_notes || '')}</td>
                 <td class="actions">
                   ${isPending
                     ? `<button class="ghost" data-approve-reg="${row.id}">Approve</button>
                        <button class="ghost" data-reject-reg="${row.id}">Reject</button>`
-                    : `<span class="muted" style="font-size:12px;">${row.payroll_employee_id ? 'Linked to payroll #' + row.payroll_employee_id : 'Reviewed'}</span>`}
+                    : `
+                      <span class="muted" style="font-size:12px;">${row.payroll_employee_id ? 'Linked to payroll #' + row.payroll_employee_id : 'Reviewed'}</span>
+                      ${state.user && state.user.role === 'admin' && row.device_id
+                          ? `<button class="ghost" data-reset-device="${row.id}" style="color:#b91c1c;border-color:#fecaca;margin-top:6px;" title="Clears the bound device so the employee can sign in from a new phone">Reset Device</button>`
+                          : ''}`}
                 </td>
               </tr>`;
-            }).join('') || `<tr><td colspan="8" class="empty-state"><span class="empty-icon">--</span><strong>No registrations</strong><span>Registrations made from the attendance app will appear here for approval.</span></td></tr>`}
+            }).join('') || `<tr><td colspan="9" class="empty-state"><span class="empty-icon">--</span><strong>No registrations</strong><span>Registrations made from the attendance app will appear here for approval.</span></td></tr>`}
           </tbody>
         </table>
       </div>
       ${paginationHTML(pg, 'approvals')}
     </section>
   `);
+  bindApprovalTabs();
   bindPagination('approvals', async () => {
     await loadRegistrations();
     reRenderCurrentView();
@@ -1787,6 +2246,17 @@ function renderApprovals() {
       reRenderCurrentView();
     });
   });
+  document.querySelectorAll('[data-reset-device]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = Number(btn.dataset.resetDevice);
+      state._resetDeviceRegistration = rows.find(r => Number(r.id) === id);
+      reRenderCurrentView();
+    });
+  });
+  if (state._resetDeviceRegistration) {
+    document.querySelector('#app')?.insertAdjacentHTML('beforeend', resetDeviceModal());
+    bindResetDeviceModal();
+  }
   if (state._approveRegistration) {
     document.querySelector('#app')?.insertAdjacentHTML('beforeend', approveRegistrationModal());
     bindApproveRegistrationModal();

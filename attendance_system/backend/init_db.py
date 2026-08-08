@@ -54,6 +54,8 @@ def _ensure_tables(cursor) -> None:
             email VARCHAR(255) NULL,
             phone VARCHAR(50) NULL,
             password_hash VARCHAR(255) NULL,
+            session_key VARCHAR(64) NOT NULL DEFAULT '',
+            device_id VARCHAR(64) NOT NULL DEFAULT '',
             daily_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
             face_image VARCHAR(255) NULL,
             face_left VARCHAR(255) NULL,
@@ -68,6 +70,8 @@ def _ensure_tables(cursor) -> None:
         """
     )
     cursor.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS government_id VARCHAR(50) NOT NULL DEFAULT ''")
+    cursor.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS session_key VARCHAR(64) NOT NULL DEFAULT ''")
+    cursor.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS device_id VARCHAR(64) NOT NULL DEFAULT ''")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_employees_status ON employees (status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_employees_email ON employees (email)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_employees_phone ON employees (phone)")
@@ -104,6 +108,32 @@ def _ensure_tables(cursor) -> None:
     )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created_at ON admin_audit_logs (created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON admin_audit_logs (action)")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS time_in_reminders (
+            id SERIAL PRIMARY KEY,
+            employee_id VARCHAR(50) NOT NULL,
+            remind_date DATE NOT NULL,
+            sent_count INT NOT NULL DEFAULT 1,
+            last_sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT uq_time_in_reminder_date UNIQUE (employee_id, remind_date)
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_time_in_reminders_employee_date ON time_in_reminders (employee_id, remind_date)")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS weekly_digests (
+            id SERIAL PRIMARY KEY,
+            employee_id VARCHAR(50) NOT NULL,
+            week_start DATE NOT NULL,
+            sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT uq_weekly_digest UNIQUE (employee_id, week_start)
+        )
+        """
+    )
 
     cursor.execute(
         """

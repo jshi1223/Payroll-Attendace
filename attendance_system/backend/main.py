@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -23,6 +23,9 @@ from passlib.context import CryptContext
 import jwt
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+import base64
 import random
 import string
 import urllib.error
@@ -210,6 +213,20 @@ def _audit(cursor, admin_user: str, action: str, target_type: str, target_id: st
             target_id or None,
             json.dumps(details or {}, default=str),
         ),
+    )
+
+
+def _log_payroll_audit(cursor, action: str, entity: str, entity_id=None, details: dict | None = None) -> None:
+    """Writes an entry into the payroll admin panel's audit trail
+    (public.audit_logs). user_id is NULL because the entry originates from the
+    attendance backend, not a logged-in panel user (the panel renders it as
+    'System')."""
+    cursor.execute(
+        """
+        INSERT INTO public.audit_logs (user_id, action, entity, entity_id, details)
+        VALUES (NULL, %s, %s, %s, %s::jsonb)
+        """,
+        (action, entity, entity_id, json.dumps(details or {}, default=str)),
     )
 
 
@@ -406,6 +423,15 @@ FCM_SERVICE_ACCOUNT_JSON = _get_env("FCM_SERVICE_ACCOUNT_JSON", "")
 TIME_OUT_REMINDER_AFTER_MINUTES = int(_get_env("TIME_OUT_REMINDER_AFTER_MINUTES", "480"))
 TIME_OUT_REMINDER_REPEAT_MINUTES = int(_get_env("TIME_OUT_REMINDER_REPEAT_MINUTES", "30"))
 TIME_OUT_REMINDER_SCAN_SECONDS = int(_get_env("TIME_OUT_REMINDER_SCAN_SECONDS", "300"))
+TIME_IN_REMINDER_START_HOUR = int(_get_env("TIME_IN_REMINDER_START_HOUR", "7"))
+TIME_IN_REMINDER_END_HOUR = int(_get_env("TIME_IN_REMINDER_END_HOUR", "11"))
+TIME_IN_REMINDER_SCAN_SECONDS = int(_get_env("TIME_IN_REMINDER_SCAN_SECONDS", "300"))
+WEEKLY_DIGEST_WEEKDAY = int(_get_env("WEEKLY_DIGEST_WEEKDAY", "0"))  # 0 = Monday
+WEEKLY_DIGEST_START_HOUR = int(_get_env("WEEKLY_DIGEST_START_HOUR", "8"))
+WEEKLY_DIGEST_END_HOUR = int(_get_env("WEEKLY_DIGEST_END_HOUR", "10"))
+WEEKLY_DIGEST_SCAN_SECONDS = int(_get_env("WEEKLY_DIGEST_SCAN_SECONDS", "600"))
+PAYROLL_NOTIFY_URL = _get_env("PAYROLL_NOTIFY_URL", "http://127.0.0.1:3001/internal/notify").strip()
+INTERNAL_NOTIFY_SECRET = _get_env("INTERNAL_NOTIFY_SECRET", "").strip()
 _FCM_ACCESS_TOKEN = ""
 _FCM_ACCESS_TOKEN_EXPIRES_AT = 0.0
 
@@ -585,6 +611,33 @@ def _send_fcm_to_employee(cursor, employee_id: str, title: str, body: str, data:
     return sent
 
 
+def _notify_payroll_panel(event: str, payload: dict | None = None) -> None:
+    """Tell the payroll admin server that data changed so open panels refresh
+    instantly instead of polling on a timer."""
+    if not PAYROLL_NOTIFY_URL:
+        return
+    try:
+        body = json.dumps({
+            "type": "data_changed",
+            "source": "attendance",
+            "event": event,
+            **(payload or {}),
+        }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if INTERNAL_NOTIFY_SECRET:
+            headers["X-Notify-Secret"] = INTERNAL_NOTIFY_SECRET
+        request = urllib.request.Request(
+            PAYROLL_NOTIFY_URL,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            response.read()
+    except Exception as exc:
+        logger.debug("Payroll panel notify failed (%s): %s", event, exc)
+
+
 def _send_due_time_out_reminders() -> int:
     now = _local_now()
     due_before = now - timedelta(minutes=TIME_OUT_REMINDER_AFTER_MINUTES)
@@ -671,9 +724,176 @@ async def _time_out_reminder_loop() -> None:
         await asyncio.sleep(max(TIME_OUT_REMINDER_SCAN_SECONDS, 60))
 
 
+def _send_due_time_in_reminders() -> int:
+    """Reminds approved employees who have not marked attendance yet, but only
+    within the configured morning window and on weekdays."""
+    now = _local_now()
+    if now.weekday() >= 5:
+        return 0
+    if now.hour < TIME_IN_REMINDER_START_HOUR or now.hour >= TIME_IN_REMINDER_END_HOUR:
+        return 0
+    db = get_db()
+    sent_count = 0
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT e.employee_id, e.name
+            FROM employees e
+            WHERE e.status = 'approved'
+              AND e.payroll_employee_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM attendance a
+                  WHERE a.employee_id = e.employee_id
+                    AND a.type IN ('present', 'time_in')
+                    AND DATE(a.timestamp) = %s
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM time_in_reminders r
+                  WHERE r.employee_id = e.employee_id AND r.remind_date = %s
+              )
+            LIMIT 50
+            """,
+            (now.date(), now.date()),
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            raw_name = str(row.get("name") or "").strip()
+            first_name = raw_name.split()[0] if raw_name else "there"
+            sent = _send_fcm_to_employee(
+                cursor,
+                row["employee_id"],
+                "Time in reminder",
+                f"Good morning {first_name}! Don't forget to mark your attendance today.",
+                {
+                    "type": "time_in_reminder",
+                    "employee_id": row["employee_id"],
+                    "screen": "attendance",
+                },
+            )
+            if not sent:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO time_in_reminders (employee_id, remind_date)
+                VALUES (%s, %s)
+                ON CONFLICT (employee_id, remind_date) DO NOTHING
+                """,
+                (row["employee_id"], now.date()),
+            )
+            sent_count += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return sent_count
+
+
+async def _time_in_reminder_loop() -> None:
+    while True:
+        try:
+            sent = await anyio.to_thread.run_sync(_send_due_time_in_reminders)
+            if sent:
+                logger.info("Sent %s time in reminder notification(s).", sent)
+        except Exception as exc:
+            logger.warning("Time in reminder scan failed: %s", exc)
+        await asyncio.sleep(max(TIME_IN_REMINDER_SCAN_SECONDS, 60))
+
+
+def _send_weekly_digests() -> int:
+    """Monday-morning summary of the previous calendar week's attendance and
+    earnings for each approved, payroll-linked employee."""
+    now = _local_now()
+    if now.weekday() != WEEKLY_DIGEST_WEEKDAY:
+        return 0
+    if now.hour < WEEKLY_DIGEST_START_HOUR or now.hour >= WEEKLY_DIGEST_END_HOUR:
+        return 0
+    this_monday = (now - timedelta(days=now.weekday())).date()
+    prev_monday = this_monday - timedelta(days=7)
+    prev_sunday = this_monday - timedelta(days=1)
+    db = get_db()
+    sent_count = 0
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT e.employee_id, e.name, e.payroll_employee_id
+            FROM employees e
+            WHERE e.status = 'approved' AND e.payroll_employee_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM weekly_digests d
+                  WHERE d.employee_id = e.employee_id AND d.week_start = %s
+              )
+            LIMIT 100
+            """,
+            (prev_monday,),
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS present_days,
+                       COALESCE(SUM(rate_snapshot), 0) AS earnings
+                FROM public.attendance_logs
+                WHERE employee_id = %s AND work_date BETWEEN %s AND %s
+                """,
+                (row["payroll_employee_id"], prev_monday, prev_sunday),
+            )
+            stats = cursor.fetchone()
+            present_days = int(stats["present_days"] or 0)
+            earnings = float(stats["earnings"] or 0)
+            if present_days == 0:
+                continue
+            sent = _send_fcm_to_employee(
+                cursor,
+                row["employee_id"],
+                "Weekly summary",
+                f"Last week you were present for {present_days} day(s) with attendance earnings of ₱{earnings:,.2f}.",
+                {
+                    "type": "weekly_digest",
+                    "employee_id": row["employee_id"],
+                    "screen": "payroll",
+                    "week_start": str(prev_monday),
+                },
+            )
+            if not sent:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO weekly_digests (employee_id, week_start)
+                VALUES (%s, %s)
+                ON CONFLICT (employee_id, week_start) DO NOTHING
+                """,
+                (row["employee_id"], prev_monday),
+            )
+            sent_count += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return sent_count
+
+
+async def _weekly_digest_loop() -> None:
+    while True:
+        try:
+            sent = await anyio.to_thread.run_sync(_send_weekly_digests)
+            if sent:
+                logger.info("Sent %s weekly digest notification(s).", sent)
+        except Exception as exc:
+            logger.warning("Weekly digest scan failed: %s", exc)
+        await asyncio.sleep(max(WEEKLY_DIGEST_SCAN_SECONDS, 60))
+
+
 @app.on_event("startup")
-async def start_time_out_reminders() -> None:
+async def start_background_notifications() -> None:
     asyncio.create_task(_time_out_reminder_loop())
+    asyncio.create_task(_time_in_reminder_loop())
+    asyncio.create_task(_weekly_digest_loop())
 
 
 def _notify_admin_registration(name: str, email: str, phone: str) -> None:
@@ -806,6 +1026,8 @@ def _ensure_attendance_schema() -> None:
             "pagibig_number": "VARCHAR(14) NOT NULL DEFAULT ''",
             "tin_number": "VARCHAR(15) NOT NULL DEFAULT ''",
             "payroll_employee_id": "INTEGER NULL",
+            "session_key": "VARCHAR(64) NOT NULL DEFAULT ''",
+            "device_id": "VARCHAR(64) NOT NULL DEFAULT ''",
         }.items():
             if not column_exists(cursor, "employees", col):
                 cursor.execute(f"ALTER TABLE employees ADD COLUMN {col} {definition}")
@@ -823,6 +1045,26 @@ def _ensure_attendance_schema() -> None:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created_at ON admin_audit_logs (created_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON admin_audit_logs (action)")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS time_in_reminders (
+                id SERIAL PRIMARY KEY,
+                employee_id VARCHAR(50) NOT NULL,
+                remind_date DATE NOT NULL,
+                sent_count INT NOT NULL DEFAULT 1,
+                last_sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_time_in_reminder_date UNIQUE (employee_id, remind_date)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_time_in_reminders_employee_date ON time_in_reminders (employee_id, remind_date)")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_digests (
+                id SERIAL PRIMARY KEY,
+                employee_id VARCHAR(50) NOT NULL,
+                week_start DATE NOT NULL,
+                sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_weekly_digest UNIQUE (employee_id, week_start)
+            )
+        """)
         db.commit()
     finally:
         db.close()
@@ -942,12 +1184,13 @@ MIN_WORK_MINUTES = int(_get_env("MIN_WORK_MINUTES", "30"))
 WORK_HOURS_PER_DAY = float(_get_env("WORK_HOURS_PER_DAY", "8"))
 MAX_UPLOAD_MB = int(_get_env("MAX_UPLOAD_MB", "10"))
 TOKEN_EXPIRE_HOURS = int(_get_env("TOKEN_EXPIRE_HOURS", "12"))
+OFFLINE_BACKFILL_MAX_DAYS = int(_get_env("OFFLINE_BACKFILL_MAX_DAYS", "7"))
 REGISTRATION_FACE_TOLERANCE = float(_get_env("REGISTRATION_FACE_TOLERANCE", "0.42"))
 FACE_MATCH_MIN_MARGIN = float(_get_env("FACE_MATCH_MIN_MARGIN", "0.08"))
 FACE_REVIEW_TOLERANCE = float(_get_env("FACE_REVIEW_TOLERANCE", "0.48"))
 MANUAL_REVIEW_EMPLOYEE_COUNT = int(_get_env("MANUAL_REVIEW_EMPLOYEE_COUNT", "20"))
 
-def create_token(subject: str, role: str):
+def create_token(subject: str, role: str, session_id: str | None = None):
     now = datetime.utcnow()
     payload = {
         "sub": subject,
@@ -955,6 +1198,8 @@ def create_token(subject: str, role: str):
         "iat": now,
         "exp": now + timedelta(hours=TOKEN_EXPIRE_HOURS),
     }
+    if session_id:
+        payload["sid"] = session_id
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 def _decode_token(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
@@ -996,7 +1241,7 @@ def verify_employee_token(payload: dict = Depends(_decode_token)):
     try:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            SELECT employee_id
+            SELECT employee_id, session_key
             FROM employees
             WHERE employee_id = %s AND status = 'approved'
             LIMIT 1
@@ -1004,6 +1249,17 @@ def verify_employee_token(payload: dict = Depends(_decode_token)):
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=403, detail="Employee access required")
+        # Single-active-session enforcement: the token's session id must match
+        # the session key currently on file. A mismatch (or a token issued
+        # before the latest login) means the employee signed in on another
+        # device, which ends this session immediately.
+        token_sid = str(payload.get("sid") or "").strip()
+        current_key = str(row.get("session_key") or "").strip()
+        if current_key and token_sid != current_key:
+            raise HTTPException(
+                status_code=403,
+                detail="Your session was ended because you signed in on another device. Please sign in again.",
+            )
         return row["employee_id"]
     finally:
         db.close()
@@ -1480,6 +1736,8 @@ async def register(
     philhealth_number: str = Form(""),
     pagibig_number: str = Form(""),
     tin_number: str = Form(""),
+    device_id: str = Form(""),
+    photo: UploadFile = File(None),
 ):
     db = get_db()
     
@@ -1490,6 +1748,8 @@ async def register(
             raise HTTPException(status_code=400, detail="Phone number is required.")
         if len(password.strip()) < 8:
             raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+        if not photo or not (photo.filename or "").strip():
+            raise HTTPException(status_code=400, detail="A face photo is required for registration.")
 
         first_name_clean = first_name.strip()
         last_name_clean = last_name.strip()
@@ -1580,14 +1840,21 @@ async def register(
             if len(matches) == 1:
                 payroll_employee_id = matches[0]["id"]
 
+        face_image = ""
+        if photo and (photo.filename or "").strip():
+            face_image, _ = await _save_face_upload(photo)
+            if not face_image:
+                raise HTTPException(status_code=400, detail="Photo upload failed. Please try again.")
+
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
             INSERT INTO employees (
                 name, first_name, last_name, email, phone, password_hash,
                 sss_number, philhealth_number, pagibig_number, tin_number,
-                government_id, status, payroll_employee_id
+                government_id, face_image, status, payroll_employee_id,
+                device_id
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
         """, (
             full_name,
             first_name_clean,
@@ -1600,10 +1867,17 @@ async def register(
             gov_ids.get("pagibig_number", ""),
             gov_ids.get("tin_number", ""),
             gov_ids.get("government_id", ""),
+            face_image,
             payroll_employee_id,
+            device_id.strip(),
         ))
         db.commit()
         background_tasks.add_task(_notify_admin_registration, full_name, email.strip(), phone.strip())
+        background_tasks.add_task(_notify_payroll_panel, "registration_pending", {
+            "name": full_name,
+            "email": email.strip(),
+            "phone": phone.strip(),
+        })
 
         return {
             "message": "Registration submitted. Waiting for admin approval.",
@@ -1724,14 +1998,51 @@ def register_status(email: str = "", phone: str = ""):
         db.close()
 
 
+def _parse_offline_timestamp(payload: dict | None) -> datetime | None:
+    """Parses an optional client-supplied timestamp for offline queue backfill.
+    Returns None when the payload has no timestamp (server time is used)."""
+    if not payload or not isinstance(payload, dict):
+        return None
+    raw = str(payload.get("timestamp") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format.")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(APP_TIMEZONE).replace(tzinfo=None)
+    now = _local_now()
+    if parsed > now + timedelta(minutes=5):
+        raise HTTPException(status_code=400, detail="Timestamp cannot be in the future.")
+    if (now - parsed).days > OFFLINE_BACKFILL_MAX_DAYS:
+        raise HTTPException(status_code=400, detail="Timestamp is too old to record offline attendance.")
+    return parsed
+
+
+def _validate_timeout_window(recorded: datetime, time_in_at: datetime, min_minutes: int) -> str | None:
+    """Returns an error message when the time-out is earlier than the time-in or
+    happens before the minimum work window, otherwise returns None."""
+    if recorded < time_in_at:
+        return "Time out cannot be earlier than your time in."
+    elapsed_minutes = (recorded - time_in_at).total_seconds() / 60
+    if elapsed_minutes < min_minutes:
+        return f"You need to work at least {min_minutes} minutes before timing out."
+    return None
+
+
 @app.post("/present")
 async def present(
+    payload: dict | None = Body(default=None),
     employee: str = Depends(verify_employee_token),
 ):
     """Single 'present' attendance marker that writes directly into the shared
     payroll database (public.attendance_logs) plus the attendance-schema log.
     Identity comes from the signed-in employee token; the on-device fingerprint
-    (biometrics) is the confirmation step."""
+    (biometrics) is the confirmation step.
+
+    An optional JSON body {"timestamp": "..."} is accepted so the Flutter app can
+    backfill an attendance that was queued while the device was offline."""
     db = get_db()
     try:
         cursor = db.cursor(dictionary=True)
@@ -1753,8 +2064,10 @@ async def present(
                 detail="Your account is not linked to payroll yet. Please ask the administrator to approve you.",
             )
 
+        requested = _parse_offline_timestamp(payload)
         now = _local_now()
-        today = now.date()
+        recorded = requested if requested is not None else now
+        today = recorded.date()
 
         cursor.execute("""
             SELECT rate FROM public.employees WHERE id = %s AND active = true
@@ -1767,12 +2080,23 @@ async def present(
             )
         rate = payroll_emp["rate"]
 
+        if requested is not None:
+            cursor.execute(
+                "SELECT id FROM public.deleted_attendance_marks WHERE employee_id = %s AND work_date = %s",
+                (payroll_employee_id, today),
+            )
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="This attendance was removed by the administrator and will not be re-uploaded.",
+                )
+
         cursor.execute("""
             INSERT INTO public.attendance_logs
                 (employee_id, work_date, time_in, time_out, rate_snapshot, notes, created_by)
             VALUES (%s, %s, %s, NULL, %s, 'Marked present via biometrics', NULL)
             ON CONFLICT (employee_id, work_date) DO NOTHING
-        """, (payroll_employee_id, today, now.time(), rate))
+        """, (payroll_employee_id, today, recorded.time(), rate))
         if cursor.rowcount == 0:
             raise HTTPException(
                 status_code=400,
@@ -1782,7 +2106,7 @@ async def present(
         cursor.execute("""
             INSERT INTO attendance (employee_id, type, rate_snapshot, timestamp)
             VALUES (%s, 'present', %s, %s)
-        """, (emp["employee_id"], rate, now))
+        """, (emp["employee_id"], rate, recorded))
         db.commit()
 
         try:
@@ -1793,18 +2117,178 @@ async def present(
                 f"You are marked present for {today.strftime('%B %d, %Y')}.",
                 {
                     "type": "present",
-                    "timestamp": now.isoformat(),
+                    "timestamp": recorded.isoformat(),
                     "employee_id": emp["employee_id"],
                 },
             )
         except Exception:
             logger.exception("FCM notification failed after attendance was saved")
+        _notify_payroll_panel("attendance_present", {"employee_id": emp["employee_id"], "name": emp["name"]})
         return {
             "matched": True,
             "employee_id": emp["employee_id"],
             "name": emp["name"],
             "type": "present",
-            "timestamp": now.isoformat(),
+            "timestamp": recorded.isoformat(),
+            "payroll_employee_id": payroll_employee_id,
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.post("/timeout")
+async def timeout(
+    payload: dict | None = Body(default=None),
+    employee: str = Depends(verify_employee_token),
+):
+    """Employee self-service time-out. Writes into the shared payroll database
+    (public.attendance_logs.time_out) plus an attendance-schema 'time_out' log
+    so the pairing logic can compute the session duration.
+
+    An optional JSON body {"timestamp": "..."} is accepted for offline backfill."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT employee_id, name, email, daily_rate, payroll_employee_id
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+        """, (employee,))
+        emp = cursor.fetchone()
+        if not emp:
+            raise HTTPException(status_code=403, detail="Employee access required")
+
+        payroll_employee_id = emp.get("payroll_employee_id")
+        if not payroll_employee_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Your account is not linked to payroll yet. Please ask the administrator to approve you.",
+            )
+
+        requested = _parse_offline_timestamp(payload)
+        now = _local_now()
+        recorded = requested if requested is not None else now
+        work_date = recorded.date()
+
+        _raise_if_payroll_locked(cursor, emp["employee_id"], work_date)
+
+        cursor.execute(
+            """
+            SELECT id, timestamp
+            FROM attendance
+            WHERE employee_id = %s
+              AND type IN ('present', 'time_in')
+              AND DATE(timestamp) = %s
+            ORDER BY timestamp ASC
+            LIMIT 1
+            """,
+            (emp["employee_id"], work_date),
+        )
+        time_in_record = cursor.fetchone()
+        if not time_in_record:
+            raise HTTPException(
+                status_code=400,
+                detail="You need to mark your attendance before you can time out.",
+            )
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM attendance
+            WHERE employee_id = %s
+              AND type = 'time_out'
+              AND DATE(timestamp) = %s
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (emp["employee_id"], work_date),
+        )
+        existing_time_out = cursor.fetchone()
+        if existing_time_out:
+            raise HTTPException(
+                status_code=400,
+                detail="You have already timed out for this day.",
+            )
+
+        # Anti-cheat rule: a time-out must be at least MIN_WORK_MINUTES after
+        # the time-in. Prevents employees from timing out immediately after
+        # marking present. Also rejects a time-out that precedes the time-in.
+        # Rejected attempts are written to the admin panel's audit trail.
+        time_in_at = time_in_record.get("timestamp")
+        if time_in_at is not None:
+            window_error = _validate_timeout_window(recorded, time_in_at, MIN_WORK_MINUTES)
+            if window_error:
+                _log_payroll_audit(
+                    cursor,
+                    "reject",
+                    "attendance",
+                    time_in_record.get("id"),
+                    {
+                        "employee_id": emp["employee_id"],
+                        "name": emp["name"],
+                        "work_date": str(work_date),
+                        "time_in": str(time_in_at.time()) if hasattr(time_in_at, "time") else str(time_in_at),
+                        "attempted_time_out": str(recorded.time()) if hasattr(recorded, "time") else str(recorded),
+                        "reason": window_error,
+                    },
+                )
+                db.commit()  # persist the audit entry before the 400 is raised
+                raise HTTPException(status_code=400, detail=window_error)
+
+        cursor.execute("SELECT rate FROM public.employees WHERE id = %s AND active = true", (payroll_employee_id,))
+        payroll_emp = cursor.fetchone()
+        if not payroll_emp:
+            raise HTTPException(
+                status_code=409,
+                detail="Your payroll account is inactive or missing. Please contact the administrator.",
+            )
+        rate = payroll_emp["rate"]
+
+        cursor.execute(
+            """
+            UPDATE public.attendance_logs
+            SET time_out = %s
+            WHERE employee_id = %s AND work_date = %s
+            """,
+            (recorded.time(), payroll_employee_id, work_date),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO attendance (employee_id, type, rate_snapshot, timestamp)
+            VALUES (%s, 'time_out', %s, %s)
+            """,
+            (emp["employee_id"], rate, recorded),
+        )
+        db.commit()
+
+        try:
+            _send_fcm_to_employee(
+                cursor,
+                emp["employee_id"],
+                "Attendance updated",
+                f"You timed out for {work_date.strftime('%B %d, %Y')}.",
+                {
+                    "type": "time_out",
+                    "timestamp": recorded.isoformat(),
+                    "employee_id": emp["employee_id"],
+                },
+            )
+        except Exception:
+            logger.exception("FCM notification failed after time-out was saved")
+        _notify_payroll_panel("attendance_timeout", {"employee_id": emp["employee_id"], "name": emp["name"]})
+        return {
+            "matched": True,
+            "employee_id": emp["employee_id"],
+            "name": emp["name"],
+            "type": "time_out",
+            "timestamp": recorded.isoformat(),
             "payroll_employee_id": payroll_employee_id,
         }
 
@@ -1860,23 +2344,100 @@ async def upload_employee_photo(
         db.close()
 
 
-@app.put("/employee/government-id")
-def update_government_id(
-    government_id: str = Form(...),
+@app.put("/employee/profile")
+def update_employee_profile(
+    phone: str = Form(""),
+    sss_number: str = Form(""),
+    philhealth_number: str = Form(""),
+    pagibig_number: str = Form(""),
+    tin_number: str = Form(""),
     employee: str = Depends(verify_employee_token),
 ):
-    if not government_id.strip():
-        raise HTTPException(status_code=400, detail="Government ID is required.")
+    """Employee self-service profile update: phone + government numbers.
+    Values are mirrored to the linked payroll record (public.employees) so the
+    payroll admin keeps the same contact and government-id details."""
+    clean_phone = phone.strip()
+    if not clean_phone:
+        raise HTTPException(status_code=400, detail="Phone number is required.")
+    if len(_normalize_phone_digits(clean_phone)) < 10:
+        raise HTTPException(status_code=400, detail="Enter a valid phone number.")
+
+    gov_fields = {
+        "sss_number": sss_number.strip(),
+        "philhealth_number": philhealth_number.strip(),
+        "pagibig_number": pagibig_number.strip(),
+        "tin_number": tin_number.strip(),
+    }
+    for field, value in gov_fields.items():
+        if not value:
+            continue
+        pattern, label, example = REGISTER_GOV_ID_VALIDATORS[field]
+        if not re.match(pattern, value):
+            raise HTTPException(status_code=400, detail=f"Invalid {label}. Expected format: {example}")
 
     db = get_db()
     try:
         cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT employee_id, name, payroll_employee_id
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+        """, (employee,))
+        emp = cursor.fetchone()
+        if not emp:
+            raise HTTPException(status_code=403, detail="Employee access required")
+
+        phone_check = _phone_candidates(clean_phone)
         cursor.execute(
-            "UPDATE employees SET government_id = %s WHERE employee_id = %s",
-            (government_id.strip(), employee),
+            "SELECT employee_id, phone FROM employees WHERE employee_id <> %s AND phone IS NOT NULL",
+            (employee,),
         )
+        for row in cursor.fetchall():
+            existing = _phone_candidates(row.get("phone") or "")
+            if existing and phone_check.intersection(existing):
+                raise HTTPException(status_code=409, detail="Phone number is already in use.")
+
+        payroll_employee_id = emp.get("payroll_employee_id")
+        if payroll_employee_id:
+            cursor.execute(
+                "SELECT id FROM public.employees WHERE id <> %s AND phone = %s",
+                (payroll_employee_id, clean_phone),
+            )
+            if cursor.fetchone():
+                raise HTTPException(status_code=409, detail="Phone number is already in use.")
+
+        cursor.execute("""
+            UPDATE employees SET
+                phone = %s,
+                sss_number = %s,
+                philhealth_number = %s,
+                pagibig_number = %s,
+                tin_number = %s
+            WHERE employee_id = %s
+        """, (clean_phone, gov_fields["sss_number"], gov_fields["philhealth_number"],
+              gov_fields["pagibig_number"], gov_fields["tin_number"], employee))
+
+        if payroll_employee_id:
+            cursor.execute("""
+                UPDATE public.employees SET
+                    phone = %s,
+                    sss_number = %s,
+                    philhealth_number = %s,
+                    pagibig_number = %s,
+                    tin_number = %s
+                WHERE id = %s
+            """, (clean_phone, gov_fields["sss_number"], gov_fields["philhealth_number"],
+                  gov_fields["pagibig_number"], gov_fields["tin_number"], payroll_employee_id))
         db.commit()
-        return {"message": "Government ID updated successfully.", "government_id": government_id.strip()}
+        return {
+            "message": "Profile updated successfully.",
+            "phone": clean_phone,
+            "sss_number": gov_fields["sss_number"],
+            "philhealth_number": gov_fields["philhealth_number"],
+            "pagibig_number": gov_fields["pagibig_number"],
+            "tin_number": gov_fields["tin_number"],
+        }
     except Exception:
         db.rollback()
         raise
@@ -1885,20 +2446,32 @@ def update_government_id(
 
 
 @app.post("/employee/login")
-def employee_login(email: str = Form(...), password: str = Form(...)):
+def employee_login(
+    email: str = Form(...),
+    password: str = Form(...),
+    device_id: str = Form(""),
+):
+    # 'email' accepts either a registered email or a phone number in any
+    # common Philippine format (09171234567, +639171234567, 639171234567).
     clean_email = email.strip()
     limiter_key = _rate_limit_storage_key("employee_login", clean_email or email or "unknown")
     db = get_db()
     try:
         cursor = db.cursor(dictionary=True)
         _enforce_rate_limit(cursor, limiter_key, "employee_login")
+        phone_candidates = sorted(_phone_candidates(clean_email))
         cursor.execute("""
-            SELECT employee_id, name, email, phone, government_id, password_hash, status, face_image
+            SELECT employee_id, name, email, phone, government_id, password_hash, status, face_image,
+                   sss_number, philhealth_number, pagibig_number, tin_number, device_id
             FROM employees
-            WHERE email = %s
+            WHERE LOWER(email) = LOWER(%s)
+               OR phone = ANY(%s)
+               OR REGEXP_REPLACE(phone, '[^0-9]', '', 'g') = ANY(%s)
+               OR REGEXP_REPLACE(REGEXP_REPLACE(phone, '[^0-9]', '', 'g'), '^63', '') = ANY(%s)
+               OR REGEXP_REPLACE(REGEXP_REPLACE(phone, '[^0-9]', '', 'g'), '^0', '') = ANY(%s)
             ORDER BY registered_at DESC
             LIMIT 1
-        """, (clean_email,))
+        """, (clean_email, phone_candidates, phone_candidates, phone_candidates, phone_candidates))
         emp = cursor.fetchone()
         if not emp:
             wait_seconds = _register_rate_limit_failure(cursor, limiter_key, "employee_login")
@@ -1931,17 +2504,85 @@ def employee_login(email: str = Form(...), password: str = Form(...)):
                 )
             raise HTTPException(status_code=401, detail="Invalid email or password")
         _clear_rate_limit(cursor, limiter_key, "employee_login")
+        # Device binding (GCash-style): the account is tied to the first device
+        # that registers or logs in. Signing in from a different phone is
+        # blocked until the administrator resets the device binding.
+        clean_device_id = device_id.strip()
+        if clean_device_id:
+            bound_device = (emp.get("device_id") or "").strip()
+            if bound_device and bound_device != clean_device_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "This account is bound to another device. "
+                        "Ask the administrator to approve your new device."
+                    ),
+                )
+            if not bound_device:
+                cursor.execute(
+                    "UPDATE employees SET device_id = %s WHERE employee_id = %s",
+                    (clean_device_id, emp["employee_id"]),
+                )
+        # Single active session: every successful login rotates the session key.
+        # Any previously issued token (e.g. the same account signed in on
+        # another phone) becomes invalid the moment this login is saved.
+        session_key = uuid.uuid4().hex
+        cursor.execute(
+            "UPDATE employees SET session_key = %s WHERE employee_id = %s",
+            (session_key, emp["employee_id"]),
+        )
         db.commit()
         return {
-            "token": create_token(emp["employee_id"] or emp["email"], "employee"),
+            "token": create_token(
+                emp["employee_id"] or emp["email"], "employee", session_id=session_key
+            ),
             "employee_id": emp["employee_id"],
             "name": emp["name"],
             "email": emp["email"],
             "phone": emp.get("phone") or "",
             "government_id": emp.get("government_id") or "",
+            "sss_number": emp.get("sss_number") or "",
+            "philhealth_number": emp.get("philhealth_number") or "",
+            "pagibig_number": emp.get("pagibig_number") or "",
+            "tin_number": emp.get("tin_number") or "",
             "status": emp["status"],
             "photo_url": f"/attendance-faces/{emp['face_image']}" if emp.get("face_image") else "",
             "message": "Login successful",
+        }
+    finally:
+        db.close()
+
+
+@app.get("/employee/session")
+def employee_session(employee: str = Depends(verify_employee_token)):
+    """Lightweight session validation for the Flutter app. The app calls this
+    before offering "Login with Fingerprint" so an expired or archived session
+    is detected up-front instead of failing after fingerprint verification."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT employee_id, name, email, phone, government_id, status, face_image,
+                   sss_number, philhealth_number, pagibig_number, tin_number
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+        """, (employee,))
+        emp = cursor.fetchone()
+        if not emp:
+            raise HTTPException(status_code=403, detail="Employee account not found or not approved")
+        return {
+            "employee_id": emp["employee_id"],
+            "name": emp["name"],
+            "email": emp["email"],
+            "phone": emp.get("phone") or "",
+            "government_id": emp.get("government_id") or "",
+            "sss_number": emp.get("sss_number") or "",
+            "philhealth_number": emp.get("philhealth_number") or "",
+            "pagibig_number": emp.get("pagibig_number") or "",
+            "tin_number": emp.get("tin_number") or "",
+            "status": emp["status"],
+            "photo_url": f"/attendance-faces/{emp['face_image']}" if emp.get("face_image") else "",
         }
     finally:
         db.close()
@@ -1986,6 +2627,99 @@ def save_employee_device_token(
         )
         db.commit()
         return {"message": "Device registered for notifications."}
+    finally:
+        db.close()
+
+
+@app.get("/employee/notifications")
+def employee_notifications(employee: str = Depends(verify_employee_token)):
+    """Latest admin announcements + the signed-in employee's payroll
+    notifications, for the in-app notification bell."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT payroll_employee_id FROM employees WHERE employee_id = %s AND status = 'approved' LIMIT 1",
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        payroll_employee_id = int(emp["payroll_employee_id"]) if emp and emp.get("payroll_employee_id") else None
+
+        cursor.execute(
+            """
+            SELECT 'announcement' AS type, title, message AS body,
+                   to_char(created_at AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at
+            FROM public.announcements
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
+        )
+        announcements = cursor.fetchall()
+
+        notifications = []
+        if payroll_employee_id:
+            cursor.execute(
+                """
+                SELECT id, type, title, body, data,
+                       read_at IS NOT NULL AS is_read,
+                       to_char(created_at AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at
+                FROM public.notifications
+                WHERE recipient_type = 'employee' AND recipient_id = %s
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (payroll_employee_id,),
+            )
+            notifications = cursor.fetchall()
+
+        return {
+            "announcements": announcements,
+            "notifications": notifications,
+            "unread": sum(1 for n in notifications if not n["is_read"]),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/employee/notifications/read")
+def employee_notifications_read(
+    employee: str = Depends(verify_employee_token),
+    payload: dict = Body(default=None),
+):
+    """Mark the signed-in employee's notifications as read. Optionally pass
+    {"ids": [...]} to mark only a subset; otherwise all are marked read."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT payroll_employee_id FROM employees WHERE employee_id = %s AND status = 'approved' LIMIT 1",
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        payroll_employee_id = int(emp["payroll_employee_id"]) if emp and emp.get("payroll_employee_id") else None
+        if not payroll_employee_id:
+            return {"ok": True}
+        ids = [int(i) for i in ((payload or {}).get("ids") or []) if str(i).isdigit()]
+        if ids:
+            cursor.execute(
+                """
+                UPDATE public.notifications
+                SET read_at = NOW()
+                WHERE recipient_type = 'employee' AND recipient_id = %s AND id = ANY(%s) AND read_at IS NULL
+                """,
+                (payroll_employee_id, ids),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE public.notifications
+                SET read_at = NOW()
+                WHERE recipient_type = 'employee' AND recipient_id = %s AND read_at IS NULL
+                """,
+                (payroll_employee_id,),
+            )
+        db.commit()
+        return {"ok": True}
     finally:
         db.close()
 
@@ -2174,13 +2908,52 @@ def employee_reset_password(email: str = Form(...), code: str = Form(...), new_p
         db.close()
 
 
+def _employee_daily_financials(cursor, payroll_employee_id) -> dict:
+    """Per-day salary / extra pay / cash-advance totals for the employee's
+    calendar day detail, keyed by 'YYYY-MM-DD'. Returns {} when the employee
+    is not linked to a payroll record yet."""
+    daily: dict[str, dict[str, float]] = {}
+    if not payroll_employee_id:
+        return daily
+
+    def _add(date_value, key: str, amount) -> None:
+        date_key = str(date_value)
+        bucket = daily.setdefault(date_key, {"salary": 0.0, "extra": 0.0, "cash_advance": 0.0})
+        bucket[key] = round(bucket[key] + float(amount or 0), 2)
+
+    cursor.execute(
+        "SELECT work_date, rate_snapshot FROM public.attendance_logs WHERE employee_id = %s",
+        (payroll_employee_id,),
+    )
+    for row in cursor.fetchall():
+        if row.get("rate_snapshot") is not None:
+            _add(row["work_date"], "salary", row["rate_snapshot"])
+
+    cursor.execute(
+        "SELECT extra_date, amount FROM public.extra_payments WHERE employee_id = %s",
+        (payroll_employee_id,),
+    )
+    for row in cursor.fetchall():
+        _add(row["extra_date"], "extra", row["amount"])
+
+    cursor.execute(
+        "SELECT advance_date, amount FROM public.cash_advances WHERE employee_id = %s",
+        (payroll_employee_id,),
+    )
+    for row in cursor.fetchall():
+        _add(row["advance_date"], "cash_advance", row["amount"])
+
+    return daily
+
+
 @app.get("/employee/logs")
 def employee_logs(employee: str = Depends(verify_employee_token)):
     db = get_db()
     try:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            SELECT employee_id, name, email, status, face_image
+            SELECT employee_id, name, email, phone, government_id, status, face_image,
+                   sss_number, philhealth_number, pagibig_number, tin_number, payroll_employee_id
             FROM employees
             WHERE employee_id = %s AND status = 'approved'
             LIMIT 1
@@ -2208,11 +2981,19 @@ def employee_logs(employee: str = Depends(verify_employee_token)):
         grouped = _pair_attendance_sessions(grouped_rows)
         payroll = employee_payroll(employee=employee)
 
+        daily = _employee_daily_financials(cursor, emp.get("payroll_employee_id"))
+
         return {
             "employee": {
                 "employee_id": emp["employee_id"],
                 "name": emp["name"],
                 "email": emp["email"],
+                "phone": emp.get("phone") or "",
+                "government_id": emp.get("government_id") or "",
+                "sss_number": emp.get("sss_number") or "",
+                "philhealth_number": emp.get("philhealth_number") or "",
+                "pagibig_number": emp.get("pagibig_number") or "",
+                "tin_number": emp.get("tin_number") or "",
                 "status": emp["status"],
                 "photo_url": f"/attendance-faces/{emp['face_image']}" if emp.get("face_image") else "",
             },
@@ -2225,6 +3006,7 @@ def employee_logs(employee: str = Depends(verify_employee_token)):
             } for row in grouped],
             "raw": raw,
             "payroll": payroll,
+            "daily": daily,
         }
     finally:
         db.close()
@@ -2374,7 +3156,12 @@ def _self_calc_week_state(
         take_home = max(salary, 0)
         current_unpaid = max(take_home - current_salary_paid, 0)
 
-    balance = max(previous_unpaid - payment_to_previous_unpaid, 0) + current_unpaid
+    # Any salary payment that exceeds salary goes towards extra pay
+    # (mirrors server.js calculatePayrollWeekState)
+    salary_excess_for_extra = max(salary_paid_amount - payment_to_previous_unpaid - current_salary_paid, 0)
+    effective_extra_pay = max(extra_payment - salary_excess_for_extra, 0)
+
+    balance = max(previous_unpaid - payment_to_previous_unpaid, 0) + current_unpaid + effective_extra_pay
     return {
         "total_bale": total_bale,
         "bale_deduction": bale_deduction,
@@ -2382,6 +3169,133 @@ def _self_calc_week_state(
         "take_home": take_home,
         "balance": balance,
     }
+
+
+def _period_type_label(period_days: int) -> str:
+    """Human label for the employee's pay frequency (weekly / semi-monthly)."""
+    return "weekly" if period_days <= 7 else "semi-monthly"
+
+
+def _employee_payroll_periods(cursor, payroll_employee_id: int, period_days: int) -> list:
+    """Computes every payroll period for an employee, bucketing salary,
+    cash advances, extra pay, bale payments and salary payments into periods
+    anchored by _self_period_start, then walking the running balance with
+    _self_calc_week_state (the Python port of server.js logic)."""
+    if not payroll_employee_id:
+        return []
+
+    def fetch_period_table(table: str, date_col: str, val_col: str) -> list:
+        cursor.execute(
+            f"SELECT {date_col} AS d, {val_col} AS v FROM public.{table} WHERE employee_id = %s ORDER BY {date_col}",
+            (payroll_employee_id,),
+        )
+        return cursor.fetchall()
+
+    attendance_rows = fetch_period_table("attendance_logs", "work_date", "rate_snapshot")
+    advance_rows = fetch_period_table("cash_advances", "advance_date", "amount")
+    extra_rows = fetch_period_table("extra_payments", "extra_date", "amount")
+    bale_pay_rows = fetch_period_table("bale_payments", "payment_date", "amount")
+    salary_pay_rows = fetch_period_table("salary_payments", "payment_date", "amount")
+    cursor.execute(
+        "SELECT week_start, paid_amount, bale_deducted, status FROM public.payroll_statuses WHERE employee_id = %s ORDER BY week_start",
+        (payroll_employee_id,),
+    )
+    status_rows = cursor.fetchall()
+
+    periods: dict = {}
+
+    def ensure(period_start):
+        if period_start not in periods:
+            periods[period_start] = {
+                "salary": 0.0,
+                "cash_advance": 0.0,
+                "extra": 0.0,
+                "paid": 0.0,
+                "bale_paid": 0.0,
+                "deduct_bale": False,
+                "generated": False,
+                "attendance": [],
+            }
+        return periods[period_start]
+
+    for row in attendance_rows:
+        ps = _self_period_start(row["d"], period_days)
+        bucket = ensure(ps)
+        bucket["salary"] += _to_float(row["v"])
+        bucket["attendance"].append({
+            "work_date": str(row["d"]),
+            "amount": round(_to_float(row["v"]), 2),
+        })
+    for row in advance_rows:
+        ensure(_self_period_start(row["d"], period_days))["cash_advance"] += _to_float(row["v"])
+    for row in extra_rows:
+        ensure(_self_period_start(row["d"], period_days))["extra"] += _to_float(row["v"])
+    for row in bale_pay_rows:
+        ensure(_self_period_start(row["d"], period_days))["bale_paid"] += _to_float(row["v"])
+    for row in salary_pay_rows:
+        ensure(_self_period_start(row["d"], period_days))["paid"] += _to_float(row["v"])
+    for row in status_rows:
+        bucket = ensure(row["week_start"])
+        bucket["paid"] = max(bucket["paid"], _to_float(row["paid_amount"]))
+        bucket["deduct_bale"] = bool(row.get("bale_deducted"))
+        if (row.get("status") or "").lower() == "generated":
+            bucket["generated"] = True
+
+    results = []
+    carryover = {"bale": 0.0, "unpaid": 0.0}
+    for period_start in sorted(periods.keys()):
+        bucket = periods[period_start]
+        state = _self_calc_week_state(
+            carryover["bale"],
+            carryover["unpaid"],
+            bucket["salary"],
+            bucket["cash_advance"],
+            bucket["paid"],
+            bucket["deduct_bale"],
+            bucket["bale_paid"],
+            bucket["extra"],
+        )
+        carryover["bale"] = state["remaining_bale_balance"]
+        carryover["unpaid"] = state["balance"]
+
+        if (bucket["salary"] <= 0 and bucket["cash_advance"] <= 0
+                and bucket["paid"] <= 0 and bucket["extra"] <= 0
+                and state["balance"] <= 0 and state["remaining_bale_balance"] <= 0):
+            continue
+
+        period_end = period_start + timedelta(days=period_days - 1)
+        payment_history = [
+            {"amount_paid": round(_to_float(row["v"]), 2), "created_at": str(row["d"])}
+            for row in salary_pay_rows
+            if _self_period_start(row["d"], period_days) == period_start
+        ]
+        payment_status = (
+            "paid"
+            if state["balance"] == 0 and state["remaining_bale_balance"] == 0
+            else "generated" if bucket["generated"]
+            else "partial" if bucket["paid"] > 0 else "unpaid"
+        )
+        results.append({
+            "employee_id": payroll_employee_id,
+            "period_key": str(period_start),
+            "start_date": str(period_start),
+            "end_date": str(period_end),
+            "period_type": _period_type_label(period_days),
+            "days": len(bucket["attendance"]),
+            "amount": round(bucket["salary"], 2),
+            "salary": round(bucket["salary"], 2),
+            "cash_advance": round(bucket["cash_advance"], 2),
+            "extra_payment": round(bucket["extra"], 2),
+            "paid_amount": round(bucket["paid"], 2),
+            "balance": round(state["balance"], 2),
+            "remaining_bale_balance": round(state["remaining_bale_balance"], 2),
+            "payment_status": payment_status,
+            "payment_history": payment_history,
+            "attendance": sorted(bucket["attendance"], key=lambda x: x["work_date"]),
+        })
+
+    results.sort(key=lambda row: row["period_key"], reverse=True)
+    return results
 
 
 @app.get("/employee/payroll")
@@ -2446,113 +3360,76 @@ def employee_payroll(
                 "linked": False,
             }
         period_days = max(1, int(payroll_emp.get("pay_period_days") or 7))
+        results = _employee_payroll_periods(cursor, payroll_employee_id, period_days)
 
-        def fetch_period_table(table: str, date_col: str, val_col: str) -> list:
-            cursor.execute(
-                f"SELECT {date_col} AS d, {val_col} AS v FROM public.{table} WHERE employee_id = %s ORDER BY {date_col}",
-                (payroll_employee_id,),
+        start_filter = None
+        end_filter = None
+        if start_date.strip():
+            try:
+                start_filter = datetime.fromisoformat(start_date.strip()).date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format.")
+        if end_date.strip():
+            try:
+                end_filter = datetime.fromisoformat(end_date.strip()).date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format.")
+
+        if start_filter or end_filter:
+            filtered = []
+            for row in results:
+                row_start = datetime.fromisoformat(row["period_key"]).date()
+                row_end = datetime.fromisoformat(row["end_date"]).date()
+                if start_filter and row_end < start_filter:
+                    continue
+                if end_filter and row_start > end_filter:
+                    continue
+                filtered.append(row)
+
+            empty_payload = {
+                "rows": [],
+                "totals": [],
+                "summary": {
+                    "total_amount": 0,
+                    "paid_amount": 0,
+                    "balance": 0,
+                    "days": 0,
+                    "salary": 0,
+                    "cash_advance": 0,
+                    "extra_payment": 0,
+                    "remaining_bale_balance": 0,
+                },
+                "period_key": None,
+                "linked": True,
+            }
+            if not filtered:
+                return empty_payload
+
+            rows = sorted(
+                (day for row in filtered for day in row["attendance"]
+                 if (not start_filter or day["work_date"] >= str(start_filter))
+                 and (not end_filter or day["work_date"] <= str(end_filter))),
+                key=lambda day: day["work_date"],
             )
-            return cursor.fetchall()
+            totals = [{key: value for key, value in row.items() if key != "attendance"} for row in filtered]
+            latest = filtered[0]
+            return {
+                "rows": rows,
+                "totals": totals,
+                "summary": {
+                    "total_amount": round(sum(row["amount"] for row in filtered), 2),
+                    "paid_amount": round(sum(row["paid_amount"] for row in filtered), 2),
+                    "balance": latest["balance"],
+                    "days": sum(row["days"] for row in filtered),
+                    "salary": round(sum(row["salary"] for row in filtered), 2),
+                    "cash_advance": round(sum(row["cash_advance"] for row in filtered), 2),
+                    "extra_payment": round(sum(row["extra_payment"] for row in filtered), 2),
+                    "remaining_bale_balance": latest["remaining_bale_balance"],
+                },
+                "period_key": None,
+                "linked": True,
+            }
 
-        attendance_rows = fetch_period_table("attendance_logs", "work_date", "rate_snapshot")
-        advance_rows = fetch_period_table("cash_advances", "advance_date", "amount")
-        extra_rows = fetch_period_table("extra_payments", "extra_date", "amount")
-        bale_pay_rows = fetch_period_table("bale_payments", "payment_date", "amount")
-        salary_pay_rows = fetch_period_table("salary_payments", "payment_date", "amount")
-        cursor.execute(
-            "SELECT week_start, paid_amount, bale_deducted FROM public.payroll_statuses WHERE employee_id = %s ORDER BY week_start",
-            (payroll_employee_id,),
-        )
-        status_rows = cursor.fetchall()
-
-        periods: dict = {}
-
-        def ensure(period_start):
-            if period_start not in periods:
-                periods[period_start] = {
-                    "salary": 0.0,
-                    "cash_advance": 0.0,
-                    "extra": 0.0,
-                    "paid": 0.0,
-                    "bale_paid": 0.0,
-                    "deduct_bale": False,
-                    "attendance": [],
-                }
-            return periods[period_start]
-
-        for row in attendance_rows:
-            ps = _self_period_start(row["d"], period_days)
-            bucket = ensure(ps)
-            bucket["salary"] += _to_float(row["v"])
-            bucket["attendance"].append({
-                "work_date": str(row["d"]),
-                "amount": round(_to_float(row["v"]), 2),
-            })
-        for row in advance_rows:
-            ensure(_self_period_start(row["d"], period_days))["cash_advance"] += _to_float(row["v"])
-        for row in extra_rows:
-            ensure(_self_period_start(row["d"], period_days))["extra"] += _to_float(row["v"])
-        for row in bale_pay_rows:
-            ensure(_self_period_start(row["d"], period_days))["bale_paid"] += _to_float(row["v"])
-        for row in salary_pay_rows:
-            ensure(_self_period_start(row["d"], period_days))["paid"] += _to_float(row["v"])
-        for row in status_rows:
-            bucket = ensure(row["week_start"])
-            bucket["paid"] = max(bucket["paid"], _to_float(row["paid_amount"]))
-            bucket["deduct_bale"] = bool(row.get("bale_deducted"))
-
-        results = []
-        carryover = {"bale": 0.0, "unpaid": 0.0}
-        for period_start in sorted(periods.keys()):
-            bucket = periods[period_start]
-            state = _self_calc_week_state(
-                carryover["bale"],
-                carryover["unpaid"],
-                bucket["salary"],
-                bucket["cash_advance"],
-                bucket["paid"],
-                bucket["deduct_bale"],
-                bucket["bale_paid"],
-                bucket["extra"],
-            )
-            carryover["bale"] = state["remaining_bale_balance"]
-            carryover["unpaid"] = state["balance"]
-
-            if (bucket["salary"] <= 0 and bucket["cash_advance"] <= 0
-                    and bucket["paid"] <= 0 and bucket["extra"] <= 0
-                    and state["balance"] <= 0 and state["remaining_bale_balance"] <= 0):
-                continue
-
-            period_end = period_start + timedelta(days=period_days - 1)
-            payment_history = [
-                {"amount_paid": round(_to_float(row["v"]), 2), "created_at": str(row["d"])}
-                for row in salary_pay_rows
-                if _self_period_start(row["d"], period_days) == period_start
-            ]
-            payment_status = (
-                "paid"
-                if state["balance"] == 0 and state["remaining_bale_balance"] == 0
-                else "partial" if bucket["paid"] > 0 else "unpaid"
-            )
-            results.append({
-                "employee_id": payroll_employee_id,
-                "period_key": str(period_start),
-                "start_date": str(period_start),
-                "end_date": str(period_end),
-                "days": len(bucket["attendance"]),
-                "amount": round(bucket["salary"], 2),
-                "salary": round(bucket["salary"], 2),
-                "cash_advance": round(bucket["cash_advance"], 2),
-                "extra_payment": round(bucket["extra"], 2),
-                "paid_amount": round(bucket["paid"], 2),
-                "balance": round(state["balance"], 2),
-                "remaining_bale_balance": round(state["remaining_bale_balance"], 2),
-                "payment_status": payment_status,
-                "payment_history": payment_history,
-                "attendance": sorted(bucket["attendance"], key=lambda x: x["work_date"]),
-            })
-
-        results.sort(key=lambda row: row["period_key"], reverse=True)
         today = _local_now().date()
         current_period_key = str(_self_period_start(today, period_days))
         current = next((row for row in results if row["period_key"] == current_period_key), None)
@@ -2592,6 +3469,672 @@ def employee_payroll(
             "period_key": current["period_key"],
             "linked": True,
         }
+    finally:
+        db.close()
+
+
+# ── PAYSLIP PDF + EMAIL HELPERS ────────────────────────────────────────────
+def _escape_pdf_text(text: str) -> str:
+    """Latin-1-safe text for the minimal PDF writer. Keeps printable ASCII plus
+    common Latin-1 accents (é, ñ, á...); anything else becomes '?'."""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch in '()\\':
+            out.append('\\' + ch)
+        elif 32 <= o <= 126 or 161 <= o <= 255:
+            out.append(ch)
+        else:
+            out.append('?')
+    return ''.join(out)
+
+
+def _build_payslip_pdf(
+    employee_name: str,
+    emp_number: str,
+    period_type: str,
+    period_start: str,
+    period_end: str,
+    days: int,
+    salary: float,
+    extra: float,
+    cash_advance: float,
+    paid: float,
+    balance: float,
+) -> bytes:
+    """Minimal dependency-free PDF payslip (Helvetica text layout)."""
+    total_earnings = salary + extra
+    net_pay = total_earnings - cash_advance
+    sections = [
+        ('PAYSLIP', True, 16),
+        ('', False, 8),
+        ('Employee: %s (%s)' % (employee_name, emp_number), False, 10),
+        ('Pay period: %s to %s' % (period_start, period_end), False, 10),
+        ('Pay frequency: %s' % period_type.upper(), False, 10),
+        ('', False, 8),
+        ('EARNINGS', True, 11),
+        ('  Days worked:  %d' % days, False, 10),
+        ('  Salary:       PHP %s' % format(salary, ',.2f'), False, 10),
+        ('  Extra pay:    PHP %s' % format(extra, ',.2f'), False, 10),
+        ('  Total earnings: PHP %s' % format(total_earnings, ',.2f'), True, 11),
+        ('', False, 8),
+        ('DEDUCTIONS', True, 11),
+        ('  Cash advance: PHP %s' % format(cash_advance, ',.2f'), False, 10),
+        ('', False, 8),
+        ('NET PAY:  PHP %s' % format(net_pay, ',.2f'), True, 14),
+        ('', False, 8),
+        ('Paid:     PHP %s' % format(paid, ',.2f'), False, 10),
+        ('Balance:  PHP %s' % format(balance, ',.2f'), False, 10),
+        ('', False, 8),
+        ('Generated by the Payroll System.', False, 9),
+    ]
+
+    stream_parts = ['BT']
+    y = 740
+    for text, bold, size in sections:
+        font = '/F2' if bold else '/F1'
+        stream_parts.append('%s %s Tf' % (font, size))
+        stream_parts.append('1 0 0 1 72 %s Tm' % y)
+        stream_parts.append('(%s) Tj' % _escape_pdf_text(text))
+        y -= size + 8
+    stream_parts.append('ET')
+    stream = '\n'.join(stream_parts)
+
+    objects = [
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
+        '/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>',
+        '<< /Length %d >>\nstream\n%s\nendstream' % (len(stream.encode('latin-1')), stream),
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>',
+    ]
+
+    pdf = bytearray(b'%PDF-1.4\n')
+    offsets = [0]
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(('%d 0 obj\n' % i).encode('latin-1'))
+        pdf.extend(obj.encode('latin-1'))
+        pdf.extend(b'\nendobj\n')
+    xref_pos = len(pdf)
+    pdf.extend(('xref\n0 %d\n' % (len(objects) + 1)).encode('latin-1'))
+    pdf.extend(b'0000000000 65535 f \n')
+    for off in offsets[1:]:
+        pdf.extend(('%010d 00000 n \n' % off).encode('latin-1'))
+    pdf.extend(('trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%EOF'
+                % (len(objects) + 1, xref_pos)).encode('latin-1'))
+    return bytes(pdf)
+
+
+def _send_email_with_pdf(recipient_email: str, subject: str, body: str,
+                         pdf_bytes: bytes, filename: str = "payslip.pdf") -> bool:
+    """Send an email with a PDF attachment via Resend or SMTP."""
+    if RESEND_API_KEY:
+        payload = json.dumps({
+            "from": RESEND_FROM,
+            "to": [recipient_email],
+            "subject": subject,
+            "text": body,
+            "attachments": [{
+                "filename": filename,
+                "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            }],
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            headers={
+                "Authorization": "Bearer %s" % RESEND_API_KEY,
+                "Content-Type": "application/json",
+                "User-Agent": "kvsk-attendance-system/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                if 200 <= response.status < 300:
+                    logger.info("Resend payslip email sent to %s", recipient_email)
+                    return True
+                logger.error("Resend payslip returned status %s", response.status)
+                return False
+        except Exception as exc:
+            logger.error("Resend payslip failed for %s: %s", recipient_email, exc)
+            return False
+
+    if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_SENDER_EMAIL]):
+        logger.error("Email configuration is incomplete. Cannot send payslip.")
+        return False
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = SMTP_SENDER_EMAIL
+    msg['To'] = recipient_email
+    msg.attach(MIMEText(body))
+    part = MIMEApplication(pdf_bytes, _subtype="pdf")
+    part.add_header('Content-Disposition', 'attachment', filename=filename)
+    msg.attach(part)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        logger.info("SMTP payslip email sent to %s", recipient_email)
+        return True
+    except Exception as exc:
+        logger.error("SMTP payslip failed for %s: %s", recipient_email, exc)
+        return False
+
+
+# ── EMPLOYEE: PAYROLL PERIODS + PAYSLIP REQUESTS ────────────────────────────
+@app.get("/employee/payroll/periods")
+def employee_payroll_periods(employee: str = Depends(verify_employee_token)):
+    """All payroll periods for the signed-in employee (weekly / semi-monthly),
+    newest first, each with its payment status so the app can render a paged
+    breakdown of paid periods only."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT payroll_employee_id FROM employees WHERE employee_id = %s AND status = 'approved' LIMIT 1",
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        if not emp or not emp.get("payroll_employee_id"):
+            return {"periods": [], "period_type": None, "linked": False}
+        payroll_employee_id = int(emp["payroll_employee_id"])
+        cursor.execute(
+            "SELECT pay_period_days FROM public.employees WHERE id = %s AND active = true",
+            (payroll_employee_id,),
+        )
+        payroll_emp = cursor.fetchone()
+        if not payroll_emp:
+            return {"periods": [], "period_type": None, "linked": True}
+        period_days = max(1, int(payroll_emp.get("pay_period_days") or 7))
+        rows = _employee_payroll_periods(cursor, payroll_employee_id, period_days)
+        periods = []
+        for row in rows:
+            periods.append({
+                "period_key": row["period_key"],
+                "start_date": row["start_date"],
+                "end_date": row["end_date"],
+                "period_type": row["period_type"],
+                "payment_status": row["payment_status"],
+                "days": row["days"],
+                "salary": row["salary"],
+                "extra_payment": row["extra_payment"],
+                "cash_advance": row["cash_advance"],
+                "paid_amount": row["paid_amount"],
+                "balance": row["balance"],
+                "remaining_bale_balance": row["remaining_bale_balance"],
+                "total_earnings": round(row["salary"] + row["extra_payment"], 2),
+                "net_pay": round(row["salary"] + row["extra_payment"], 2),
+                "attendance": row["attendance"],
+                "payment_history": row["payment_history"],
+            })
+        return {"periods": periods, "period_type": _period_type_label(period_days), "linked": True}
+    finally:
+        db.close()
+
+
+@app.get("/employee/payslip/periods")
+def employee_payslip_periods(employee: str = Depends(verify_employee_token)):
+    """Periods available for a payslip request: only periods the admin has
+    generated and the employee was fully paid for."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT payroll_employee_id FROM employees WHERE employee_id = %s AND status = 'approved' LIMIT 1",
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        if not emp or not emp.get("payroll_employee_id"):
+            return {"periods": []}
+        payroll_employee_id = int(emp["payroll_employee_id"])
+        cursor.execute(
+            "SELECT pay_period_days FROM public.employees WHERE id = %s AND active = true",
+            (payroll_employee_id,),
+        )
+        payroll_emp = cursor.fetchone()
+        if not payroll_emp:
+            return {"periods": []}
+        period_days = max(1, int(payroll_emp.get("pay_period_days") or 7))
+        rows = _employee_payroll_periods(cursor, payroll_employee_id, period_days)
+        periods = []
+        for row in rows:
+            if row["payment_status"] != "paid":
+                continue
+            periods.append({
+                "period_key": row["period_key"],
+                "start_date": row["start_date"],
+                "end_date": row["end_date"],
+                "period_type": row["period_type"],
+                "days": row["days"],
+                "salary": row["salary"],
+                "extra_payment": row["extra_payment"],
+                "cash_advance": row["cash_advance"],
+                "paid_amount": row["paid_amount"],
+                "net_pay": round(row["salary"] + row["extra_payment"] - row["cash_advance"], 2),
+            })
+        return {"periods": periods}
+    finally:
+        db.close()
+
+
+@app.post("/employee/payslip/request")
+def employee_payslip_request(
+    payload: dict | None = Body(default=None),
+    employee: str = Depends(verify_employee_token),
+):
+    """Employee requests a payslip for a specific paid period. The request
+    waits for admin approval; on approval the payslip PDF is emailed."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT employee_id, name, email, payroll_employee_id
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+            """,
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        if not emp:
+            raise HTTPException(status_code=403, detail="Employee access required")
+        payroll_employee_id = emp.get("payroll_employee_id")
+        if not payroll_employee_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Your account is not linked to payroll yet. Please ask the administrator to approve you.",
+            )
+        if not _email_delivery_configured():
+            raise HTTPException(
+                status_code=409,
+                detail="Payslip emailing is not configured yet. Please contact the administrator.",
+            )
+
+        body = payload or {}
+        period_start = str(body.get("period_start") or "").strip()
+        period_end = str(body.get("period_end") or "").strip()
+        if not period_start or not period_end:
+            raise HTTPException(status_code=400, detail="Period is required.")
+        try:
+            start_date = datetime.fromisoformat(period_start).date()
+            end_date = datetime.fromisoformat(period_end).date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid period dates.")
+        if end_date < start_date:
+            raise HTTPException(status_code=400, detail="Invalid period dates.")
+
+        cursor.execute(
+            "SELECT pay_period_days FROM public.employees WHERE id = %s AND active = true",
+            (payroll_employee_id,),
+        )
+        payroll_emp = cursor.fetchone()
+        if not payroll_emp:
+            raise HTTPException(status_code=409, detail="Payroll account is inactive or missing.")
+        period_days = max(1, int(payroll_emp.get("pay_period_days") or 7))
+        rows = _employee_payroll_periods(cursor, payroll_employee_id, period_days)
+        match = next(
+            (r for r in rows if r["start_date"] == str(start_date) and r["end_date"] == str(end_date)),
+            None,
+        )
+        if not match or match["payment_status"] != "paid":
+            raise HTTPException(
+                status_code=400,
+                detail="That period is not available for a payslip. Only generated and paid periods can be requested.",
+            )
+
+        cursor.execute(
+            "SELECT id FROM public.payslip_requests WHERE employee_id = %s AND status = 'pending' LIMIT 1",
+            (payroll_employee_id,),
+        )
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=409,
+                detail="You already have a pending payslip request. Wait for the administrator's decision.",
+            )
+
+        email = (emp.get("email") or "").strip()
+        cursor.execute(
+            """
+            INSERT INTO public.payslip_requests
+                (employee_id, attendance_employee_id, name, email, period_start, period_end)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, status, requested_at
+            """,
+            (payroll_employee_id, emp["employee_id"], emp["name"], email, start_date, end_date),
+        )
+        row = cursor.fetchone()
+        db.commit()
+        background_tasks.add_task(_notify_payroll_panel, "payslip_request", {
+            "name": emp.get("name") or "",
+            "period_start": str(start_date),
+            "period_end": str(end_date),
+        })
+        return {
+            "ok": True,
+            "request": {
+                "id": row["id"],
+                "status": row["status"],
+                "requested_at": str(row["requested_at"]),
+            },
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.get("/employee/payslip/requests")
+def employee_payslip_requests(employee: str = Depends(verify_employee_token)):
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT payroll_employee_id FROM employees WHERE employee_id = %s LIMIT 1",
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        payroll_employee_id = (emp or {}).get("payroll_employee_id")
+        if not payroll_employee_id:
+            return {"rows": []}
+        cursor.execute(
+            """
+            SELECT id, period_start, period_end, status, notes,
+                   to_char(requested_at, 'YYYY-MM-DD HH24:MI:SS') AS requested_at,
+                   to_char(reviewed_at, 'YYYY-MM-DD HH24:MI:SS') AS reviewed_at
+            FROM public.payslip_requests
+            WHERE employee_id = %s
+            ORDER BY requested_at DESC
+            LIMIT 10
+            """,
+            (payroll_employee_id,),
+        )
+        rows = cursor.fetchall()
+        return {"rows": rows}
+    finally:
+        db.close()
+
+
+@app.post("/internal/payslip-email")
+def internal_payslip_email(
+    payload: dict | None = Body(default=None),
+    x_internal_secret: str = Header(default="", alias="X-Internal-Secret"),
+):
+    """Called by the payroll admin panel after approving a payslip request.
+    Builds the payslip PDF from the shared payroll DB and emails it."""
+    if not INTERNAL_NOTIFY_SECRET or x_internal_secret != INTERNAL_NOTIFY_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = payload or {}
+    request_id = body.get("request_id")
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT pr.id, pr.employee_id, pr.name, pr.email,
+                   pr.period_start, pr.period_end, e.pay_period_days, e.emp_number
+            FROM public.payslip_requests pr
+            JOIN public.employees e ON e.id = pr.employee_id
+            WHERE pr.id = %s
+            """,
+            (int(request_id),),
+        )
+        req = cursor.fetchone()
+        if not req:
+            raise HTTPException(status_code=404, detail="Request not found")
+        period_days = max(1, int(req.get("pay_period_days") or 7))
+        rows = _employee_payroll_periods(cursor, req["employee_id"], period_days)
+        match = next(
+            (r for r in rows
+             if r["start_date"] == str(req["period_start"]) and r["end_date"] == str(req["period_end"])),
+            None,
+        )
+        if not match:
+            raise HTTPException(status_code=400, detail="Period data not found for this request.")
+
+        pdf = _build_payslip_pdf(
+            employee_name=req.get("name") or "",
+            emp_number=req.get("emp_number") or "",
+            period_type=match["period_type"],
+            period_start=match["start_date"],
+            period_end=match["end_date"],
+            days=match["days"],
+            salary=match["salary"],
+            extra=match["extra_payment"],
+            cash_advance=match["cash_advance"],
+            paid=match["paid_amount"],
+            balance=match["balance"],
+        )
+        subject = "Your Payslip for %s to %s" % (match["start_date"], match["end_date"])
+        net_pay = match["salary"] + match["extra_payment"] - match["cash_advance"]
+        email_body = (
+            "Hi %s,\n\nYour payslip for the period %s to %s (%s) is attached.\n\n"
+            "Net pay: PHP %s\nBalance: PHP %s\n\nThank you."
+            % (req.get("name") or "there", match["start_date"], match["end_date"],
+               match["period_type"], format(net_pay, ',.2f'), format(match["balance"], ',.2f'))
+        )
+        sent = _send_email_with_pdf(req.get("email") or "", subject, email_body, pdf)
+        return {"sent": sent, "email": req.get("email") or ""}
+    finally:
+        db.close()
+
+
+# ── EMPLOYEE: CASH ADVANCE REQUESTS ─────────────────────────────────────────
+@app.post("/employee/cash-advance-request")
+def employee_cash_advance_request(
+    payload: dict | None = Body(default=None),
+    employee: str = Depends(verify_employee_token),
+):
+    """Employee self-service cash advance request. The request lands in the
+    payroll admin panel for approval; approving creates the cash_advances
+    record automatically."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT employee_id, name, payroll_employee_id
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+            """,
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        if not emp:
+            raise HTTPException(status_code=403, detail="Employee access required")
+        payroll_employee_id = emp.get("payroll_employee_id")
+        if not payroll_employee_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Your account is not linked to payroll yet. Please ask the administrator to approve you.",
+            )
+
+        body = payload or {}
+        amount_raw = body.get("amount")
+        if amount_raw is None:
+            raise HTTPException(status_code=400, detail="Amount is required.")
+        try:
+            amount = round(float(amount_raw), 2)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid amount.")
+        if amount <= 0 or amount > 1000000:
+            raise HTTPException(
+                status_code=400,
+                detail="Amount must be between 0.01 and 1,000,000.",
+            )
+
+        reason = str(body.get("reason") or "").strip()[:500]
+
+        pickup_date = None
+        pickup_raw = str(body.get("pickup_date") or "").strip()
+        if pickup_raw:
+            try:
+                pickup_date = datetime.strptime(pickup_raw, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pickup date must use the format YYYY-MM-DD.",
+                )
+            if pickup_date < _local_now().date():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pickup date cannot be in the past.",
+                )
+
+        cursor.execute(
+            """
+            SELECT id FROM public.cash_advance_requests
+            WHERE employee_id = %s AND status = 'pending'
+            LIMIT 1
+            """,
+            (payroll_employee_id,),
+        )
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=409,
+                detail="You already have a pending cash advance request. Wait for the administrator's decision.",
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO public.cash_advance_requests (employee_id, amount, reason, pickup_date)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, amount, reason, pickup_date, status, created_at
+            """,
+            (payroll_employee_id, amount, reason, pickup_date),
+        )
+        row = cursor.fetchone()
+        db.commit()
+        _notify_payroll_panel("cash_advance_request", {
+            "employee_id": payroll_employee_id,
+            "name": emp.get("name") or "",
+            "amount": round(float(row["amount"]), 2),
+            "pickup_date": str(row.get("pickup_date")) if row.get("pickup_date") else None,
+        })
+        return {
+            "ok": True,
+            "request": {
+                "id": row["id"],
+                "amount": round(float(row["amount"]), 2),
+                "reason": row.get("reason") or "",
+                "pickup_date": str(row.get("pickup_date")) if row.get("pickup_date") else None,
+                "status": row["status"],
+                "created_at": str(row["created_at"]),
+            },
+        }
+    finally:
+        db.close()
+
+
+@app.get("/employee/cash-advance-requests")
+def employee_cash_advance_requests(
+    employee: str = Depends(verify_employee_token),
+):
+    """The employee's own cash advance request history."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT payroll_employee_id
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+            """,
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        payroll_employee_id = (emp or {}).get("payroll_employee_id")
+        if not payroll_employee_id:
+            return {"requests": []}
+        cursor.execute(
+            """
+            SELECT id, amount, reason, pickup_date, status, created_at, reviewed_at
+            FROM public.cash_advance_requests
+            WHERE employee_id = %s
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (payroll_employee_id,),
+        )
+        rows = cursor.fetchall()
+        return {"requests": [
+            {
+                "id": row["id"],
+                "amount": round(float(row["amount"]), 2),
+                "reason": row.get("reason") or "",
+                "pickup_date": str(row["pickup_date"]) if row.get("pickup_date") else None,
+                "status": row["status"],
+                "created_at": str(row["created_at"]),
+                "reviewed_at": str(row["reviewed_at"]) if row.get("reviewed_at") else None,
+            }
+            for row in rows
+        ]}
+    finally:
+        db.close()
+
+
+@app.post("/employee/cash-advance-request/{request_id}/cancel")
+def employee_cash_advance_request_cancel(
+    request_id: int,
+    employee: str = Depends(verify_employee_token),
+):
+    """Cancel (delete) the employee's own pending cash advance request."""
+    db = get_db()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT employee_id, name, payroll_employee_id
+            FROM employees
+            WHERE employee_id = %s AND status = 'approved'
+            LIMIT 1
+            """,
+            (employee,),
+        )
+        emp = cursor.fetchone()
+        if not emp:
+            raise HTTPException(status_code=403, detail="Employee access required")
+        payroll_employee_id = emp.get("payroll_employee_id")
+        if not payroll_employee_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Your account is not linked to payroll yet. Please ask the administrator to approve you.",
+            )
+
+        cursor.execute(
+            """
+            SELECT id, status FROM public.cash_advance_requests
+            WHERE id = %s AND employee_id = %s
+            """,
+            (request_id, payroll_employee_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Cash advance request not found.")
+        if row["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Only pending requests can be cancelled.",
+            )
+
+        cursor.execute(
+            """
+            DELETE FROM public.cash_advance_requests
+            WHERE id = %s AND employee_id = %s AND status = 'pending'
+            """,
+            (request_id, payroll_employee_id),
+        )
+        db.commit()
+        return {"ok": True}
     finally:
         db.close()
 
@@ -3202,4 +4745,3 @@ def get_attendance_grouped(
         return {"rows": grouped_logs[offset:offset + safe_limit], "page": safe_page, "limit": safe_limit, "total": total}
     finally:
         db.close()
-

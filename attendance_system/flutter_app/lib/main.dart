@@ -1,11 +1,16 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'dart:ui';
 import 'package:flutter/services.dart';
 import 'dart:async';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'screen/employee_login_screen.dart';
 import 'screen/registration_screen.dart';
 import 'constants.dart';
 import 'services/api_client.dart';
+import 'services/app_locale.dart';
+import 'services/app_lock_service.dart';
+import 'services/app_settings.dart';
 import 'services/app_update_service.dart';
 import 'services/push_notification_service.dart';
 import 'widgets/brand_logo.dart';
@@ -27,21 +32,53 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'KVSK CCTV & IT Solutions',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData.light().copyWith(
-        scaffoldBackgroundColor: BrandColors.bg,
-        colorScheme: const ColorScheme.light(
-          primary: BrandColors.cyan,
-          secondary: BrandColors.violet,
-          surface: BrandColors.surface,
-          onPrimary: Colors.white,
-          onSecondary: Colors.white,
-          onSurface: BrandColors.text,
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider<AppLocale>(
+          create: (_) => AppLocale()..load(),
         ),
+        ChangeNotifierProvider<AppLockService>(
+          create: (_) => AppLockService()..load(),
+        ),
+        ChangeNotifierProvider<AppSettings>(
+          create: (_) => AppSettings()..load(),
+        ),
+      ],
+      child: Consumer<AppSettings>(
+        builder: (context, settings, _) {
+          return MaterialApp(
+            title: 'KVSK CCTV & IT Solutions',
+            debugShowCheckedModeBanner: false,
+            theme: ThemeData.light().copyWith(
+              scaffoldBackgroundColor: BrandColors.bg,
+              colorScheme: const ColorScheme.light(
+                primary: BrandColors.cyan,
+                secondary: BrandColors.violet,
+                surface: BrandColors.surface,
+                onPrimary: Colors.white,
+                onSecondary: Colors.white,
+                onSurface: BrandColors.text,
+              ),
+            ),
+            builder: (context, child) {
+              final system = MediaQuery.textScalerOf(context);
+              final scaled = TextScaler.linear(
+                settings.textScaleFactor * system.scale(1.0),
+              );
+              return MediaQuery(
+                data: MediaQuery.of(context).copyWith(
+                  textScaler: scaled.clamp(
+                    minScaleFactor: 0.85,
+                    maxScaleFactor: 1.3,
+                  ),
+                ),
+                child: child!,
+              );
+            },
+            home: const HomeScreen(),
+          );
+        },
       ),
-      home: const HomeScreen(),
     );
   }
 }
@@ -84,8 +121,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
     _fadeController.forward();
     _checkServerStatus();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _checkForAppUpdate());
-    // Check status every 10 seconds
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkForAppUpdate();
+      _maybeShowTutorial();
+    });
     _statusTimer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => _checkServerStatus(),
@@ -113,6 +152,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         return;
       }
       final required = AppUpdateService.isRequired(info);
+      final locale = context.appLocale;
       await showDialog<void>(
         context: context,
         barrierDismissible: !required,
@@ -120,13 +160,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           return PopScope(
             canPop: !required,
             child: AlertDialog(
-              title: Text(required ? 'Update required' : 'Update available'),
+              title: Text(
+                required
+                    ? locale.t('Update required', 'Kinakailangan ang Update')
+                    : locale.t('Update available', 'May available na Update'),
+              ),
               content: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Current: ${AppConstants.appVersion}'),
-                  Text('Latest: ${info.latestVersion}'),
+                  Text('${locale.t('Current', 'Kasalukuyan')}: ${AppConstants.appVersion}'),
+                  Text('${locale.t('Latest', 'Pinakabago')}: ${info.latestVersion}'),
                   if (info.releaseNotes.trim().isNotEmpty) ...[
                     const SizedBox(height: 12),
                     Text(info.releaseNotes.trim()),
@@ -137,13 +181,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 if (!required)
                   TextButton(
                     onPressed: () => Navigator.of(dialogContext).pop(),
-                    child: const Text('Later'),
+                    child: Text(locale.t('Later', 'Mamaya')),
                   ),
                 FilledButton(
                   onPressed: info.apkUrl.trim().isEmpty
                       ? null
                       : () => AppUpdateService.openUpdateUrl(info.apkUrl),
-                  child: const Text('Update'),
+                  child: Text(locale.t('Update', 'I-update')),
                 ),
               ],
             ),
@@ -153,13 +197,245 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     } catch (_) {}
   }
 
-  void _openSystemStatus() {
-    Navigator.push(
-      context,
-      _slideRoute(
-        SystemStatusScreen(initialOnline: _isServerOnline),
+  Future<void> _maybeShowTutorial() async {
+    const prefKey = 'app_tutorial_seen_v1';
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(prefKey) ?? false) return;
+    await prefs.setBool(prefKey, true);
+    if (!mounted) return;
+    _showTutorial();
+  }
+
+  void _showTutorial() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: BrandColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-    ).then((_) => _checkServerStatus());
+      builder: (sheetContext) {
+        final locale = sheetContext.appLocale;
+        return SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      locale.t('Quick Guide', 'Mabilis na Gabay'),
+                      style: const TextStyle(
+                        color: BrandColors.text,
+                        fontSize: 20,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      onPressed: () => Navigator.of(sheetContext).pop(),
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        color: BrandColors.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                _TutorialStep(
+                  icon: Icons.person_add_alt_1_rounded,
+                  title: locale.t(
+                    'Register or sign in',
+                    'Mag-register o mag-sign in',
+                  ),
+                  subtitle: locale.t(
+                    'Tap "Register Employee" for a new account, or "Employee Login" if your account is already approved.',
+                    'Pindutin ang "Register Employee" para sa bagong account, o "Employee Login" kung naaprubahan na ang account mo.',
+                  ),
+                ),
+                const SizedBox(height: 14),
+                _TutorialStep(
+                  icon: Icons.wifi_rounded,
+                  title: locale.t(
+                    'Online / Offline indicator',
+                    'Indicator ng Online / Offline',
+                  ),
+                  subtitle: locale.t(
+                    'Green means the app is connected to the server. Red means you are offline.',
+                    'Berde ang ibig sabihin konektado ang app sa server. Pula ang ibig sabihin offline ka.',
+                  ),
+                ),
+                const SizedBox(height: 14),
+                _TutorialStep(
+                  icon: Icons.fingerprint_rounded,
+                  title: locale.t(
+                    'Fingerprint stays private',
+                    'Pribado ang fingerprint',
+                  ),
+                  subtitle: locale.t(
+                    'Fingerprints are only used on your phone. They are never uploaded to the server.',
+                    'Ang fingerprint ay ginagamit lang sa iyong telepono. Hindi ito ina-upload sa server.',
+                  ),
+                ),
+                const SizedBox(height: 14),
+                _TutorialStep(
+                  icon: Icons.language_rounded,
+                  title: locale.t(
+                    'Switch language',
+                    'Palitan ang wika',
+                  ),
+                  subtitle: locale.t(
+                    'Use the menu button at the top to switch between English and Filipino.',
+                    'Gamitin ang menu button sa taas para lumipat sa English o Filipino.',
+                  ),
+                ),
+                const SizedBox(height: 22),
+                SizedBox(
+                  height: 52,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(sheetContext).pop(),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: BrandColors.cyan,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    child: Text(
+                      locale.t('Got it', 'Sige, gets ko'),
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _openSettingsSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: BrandColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  sheetContext.tr('Settings', 'Mga Setting'),
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  sheetContext.tr('Language', 'Wika'),
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Consumer<AppLocale>(
+                  builder: (context, locale, _) {
+                    return SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(
+                          value: 'en',
+                          label: Text('English'),
+                        ),
+                        ButtonSegment(
+                          value: 'tl',
+                          label: Text('Filipino'),
+                        ),
+                      ],
+                      selected: {locale.language},
+                      onSelectionChanged: (selection) {
+                        locale.setLanguage(selection.first);
+                      },
+                    );
+                  },
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  sheetContext.tr('Text Size', 'Laki ng Letra'),
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Consumer<AppSettings>(
+                  builder: (context, settings, _) {
+                    return SegmentedButton<AppTextScale>(
+                      segments: [
+                        ButtonSegment(
+                          value: AppTextScale.small,
+                          label: Text(sheetContext.tr('Small', 'Maliit')),
+                        ),
+                        ButtonSegment(
+                          value: AppTextScale.normal,
+                          label: Text(sheetContext.tr('Normal', 'Normal')),
+                        ),
+                        ButtonSegment(
+                          value: AppTextScale.large,
+                          label: Text(sheetContext.tr('Large', 'Malaki')),
+                        ),
+                      ],
+                      selected: {settings.textScale},
+                      onSelectionChanged: (selection) {
+                        settings.setTextScale(selection.first);
+                      },
+                    );
+                  },
+                ),
+                const SizedBox(height: 22),
+                SizedBox(
+                  height: 52,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.of(sheetContext).pop();
+                      _showTutorial();
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: BrandColors.cyan,
+                      side: const BorderSide(color: BrandColors.cyan),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    icon: const Icon(Icons.help_rounded),
+                    label: Text(
+                      sheetContext.tr('Show Quick Guide', 'Ipakita ang Gabay'),
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -173,6 +449,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
+    final locale = context.watch<AppLocale>();
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(
@@ -215,7 +492,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  _getGreeting(),
+                                  _getGreeting(locale),
                                   style: TextStyle(
                                     color: BrandColors.textMuted,
                                     fontSize: 13,
@@ -229,62 +506,68 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                                 ),
                               ],
                             ),
-                            GestureDetector(
-                              onTap: _openSystemStatus,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 6,
-                                ),
-                                decoration: BoxDecoration(
-                                  color:
-                                      (_isServerOnline
-                                              ? const Color(0xFF00E676)
-                                              : Colors.red)
-                                          .withValues(alpha: 0.1),
-                                  borderRadius: BorderRadius.circular(20),
-                                  border: Border.all(
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 6,
+                                  ),
+                                  decoration: BoxDecoration(
                                     color:
                                         (_isServerOnline
                                                 ? const Color(0xFF00E676)
                                                 : Colors.red)
-                                            .withValues(alpha: 0.3),
+                                            .withValues(alpha: 0.1),
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(
+                                      color:
+                                          (_isServerOnline
+                                                  ? const Color(0xFF00E676)
+                                                  : Colors.red)
+                                              .withValues(alpha: 0.3),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Container(
+                                        width: 8,
+                                        height: 8,
+                                        decoration: BoxDecoration(
+                                          color: _isServerOnline
+                                              ? const Color(0xFF00E676)
+                                              : Colors.red,
+                                          shape: BoxShape.circle,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        _isServerOnline
+                                            ? locale.t('Online', 'Online')
+                                            : locale.t('Offline', 'Offline'),
+                                        style: TextStyle(
+                                          color: _isServerOnline
+                                              ? const Color(0xFF00E676)
+                                              : Colors.red,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
-                                child: Row(
-                                  children: [
-                                    Container(
-                                      width: 8,
-                                      height: 8,
-                                      decoration: BoxDecoration(
-                                        color: _isServerOnline
-                                            ? const Color(0xFF00E676)
-                                            : Colors.red,
-                                        shape: BoxShape.circle,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Text(
-                                      _isServerOnline ? 'Online' : 'Offline',
-                                      style: TextStyle(
-                                        color: _isServerOnline
-                                            ? const Color(0xFF00E676)
-                                            : Colors.red,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Icon(
-                                      Icons.settings_rounded,
-                                      color: _isServerOnline
-                                          ? const Color(0xFF00E676)
-                                          : Colors.red,
-                                      size: 14,
-                                    ),
-                                  ],
+                                const SizedBox(width: 6),
+                                IconButton(
+                                  onPressed: _openSettingsSheet,
+                                  tooltip: 'Settings',
+                                  icon: const Icon(
+                                    Icons.settings_rounded,
+                                    color: BrandColors.textMuted,
+                                  ),
                                 ),
-                              ),
+                              ],
                             ),
                           ],
                         ),
@@ -325,9 +608,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
                         const SizedBox(height: 24),
 
-                        const Text(
-                          'Attendance Monitoring',
-                          style: TextStyle(
+                        Text(
+                          locale.t(
+                            'Attendance Monitoring',
+                            'Pagmomonitor ng Attendance',
+                          ),
+                          style: const TextStyle(
                             color: Color(0xFF111111),
                             fontSize: 26,
                             fontWeight: FontWeight.bold,
@@ -336,7 +622,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Secure & Fast Attendance Tracking',
+                          locale.t(
+                            'Secure & Fast Attendance Tracking',
+                            'Mabilis at Ligtas na Pagtala ng Attendance',
+                          ),
                           style: TextStyle(
                             color: BrandColors.textMuted,
                             fontSize: 14,
@@ -345,15 +634,21 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
                         const SizedBox(height: 48),
 
-                        // ── DATE & TIME ──
+                        // â”€â”€ DATE & TIME â”€â”€
                         _DateTimeCard(),
 
                         const SizedBox(height: 32),
 
-                        // ── BUTTONS ──
+                        // â”€â”€ BUTTONS â”€â”€
                         _ActionButton(
-                          label: 'Register Employee',
-                          subtitle: 'New employee registration',
+                          label: locale.t(
+                            'Register Employee',
+                            'Mag-register ng Empleyado',
+                          ),
+                          subtitle: locale.t(
+                            'New employee registration',
+                            'Para sa bagong empleyado',
+                          ),
                           icon: Icons.person_add_alt_1,
                           gradient: const LinearGradient(
                             colors: [Color(0xFF2B2B2B), Color(0xFF1E1E1E)],
@@ -367,8 +662,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         const SizedBox(height: 16),
 
                         _ActionButton(
-                          label: 'Employee Login',
-                          subtitle: 'Approved account access',
+                          label: locale.t(
+                            'Employee Login',
+                            'Login ng Empleyado',
+                          ),
+                          subtitle: locale.t(
+                            'Approved account access',
+                            'Para sa naaprubahang account',
+                          ),
                           icon: Icons.person_rounded,
                           gradient: const LinearGradient(
                             colors: [Color(0xFF1E1E1E), Color(0xFF0F0F0F)],
@@ -379,25 +680,16 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                           ),
                         ),
 
-                        const SizedBox(height: 16),
-
-                        _ActionButton(
-                          label: 'Server & Registration Status',
-                          subtitle: 'Check connection and approval result',
-                          icon: Icons.fact_check_rounded,
-                          gradient: const LinearGradient(
-                            colors: [Color(0xFFB31D18), Color(0xFF73120F)],
-                          ),
-                          onTap: _openSystemStatus,
-                        ),
-
                         const Spacer(),
 
-                        // ── FOOTER ──
+                        // â”€â”€ FOOTER â”€â”€
                         Padding(
                           padding: const EdgeInsets.only(top: 24, bottom: 12),
                           child: Text(
-                            'Powered by KVSK CCTV & IT Solutions',
+                            locale.t(
+                              'Powered by KVSK CCTV & IT Solutions',
+                              'Pinatatakbo ng KVSK CCTV & IT Solutions',
+                            ),
                             style: TextStyle(
                               color: Colors.white.withValues(alpha: 0.25),
                               fontSize: 12,
@@ -416,11 +708,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     );
   }
 
-  String _getGreeting() {
+  String _getGreeting(AppLocale locale) {
     final hour = DateTime.now().hour;
-    if (hour < 12) return 'Good Morning';
-    if (hour < 17) return 'Good Afternoon';
-    return 'Good Evening';
+    if (hour < 12) return locale.t('Good Morning', 'Magandang Umaga');
+    if (hour < 17) return locale.t('Good Afternoon', 'Magandang Hapon');
+    return locale.t('Good Evening', 'Magandang Gabi');
   }
 
   PageRouteBuilder _slideRoute(Widget page) {
@@ -440,420 +732,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 }
 
-class SystemStatusScreen extends StatefulWidget {
-  final bool initialOnline;
-
-  const SystemStatusScreen({super.key, required this.initialOnline});
-
-  @override
-  State<SystemStatusScreen> createState() => _SystemStatusScreenState();
-}
-
-class _SystemStatusScreenState extends State<SystemStatusScreen> {
-  final _emailController = TextEditingController();
-  final _phoneController = TextEditingController();
-  bool _checkingServer = false;
-  bool _checkingRegistration = false;
-  bool _serverOnline = false;
-  String _serverMessage = 'Not checked yet.';
-  Map<String, dynamic>? _registration;
-
-  @override
-  void initState() {
-    super.initState();
-    _serverOnline = widget.initialOnline;
-    _serverMessage = widget.initialOnline
-        ? 'Server is online.'
-        : 'Server is offline or unreachable.';
-    _testConnection();
-  }
-
-  @override
-  void dispose() {
-    _emailController.dispose();
-    _phoneController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _testConnection() async {
-    setState(() {
-      _checkingServer = true;
-      _serverMessage = 'Checking server...';
-    });
-    try {
-      final response = await ApiClient.get(
-        '/status',
-        timeout: const Duration(seconds: 6),
-      );
-      final parsed = ApiClient.jsonObject(response.body);
-      setState(() {
-        _serverOnline = response.statusCode == 200;
-        _serverMessage = _serverOnline
-            ? 'Connected to ${parsed?['service'] ?? 'attendance system'}.'
-            : ApiClient.messageFromBody(
-                response.body,
-                fallback: 'Server returned ${response.statusCode}.',
-              );
-      });
-    } catch (error) {
-      setState(() {
-        _serverOnline = false;
-        _serverMessage = ApiClient.friendlyNetworkError(error);
-      });
-    } finally {
-      if (mounted) setState(() => _checkingServer = false);
-    }
-  }
-
-  Future<void> _checkRegistration() async {
-    final email = _emailController.text.trim();
-    final phone = _phoneController.text.trim();
-    if (email.isEmpty || phone.isEmpty) {
-      setState(() {
-        _registration = {
-          'status': 'missing',
-          'message': 'Enter the email and phone used during registration.',
-        };
-      });
-      return;
-    }
-
-    setState(() {
-      _checkingRegistration = true;
-      _registration = null;
-    });
-    final path =
-        '/register/status?email=${Uri.encodeQueryComponent(email)}&phone=${Uri.encodeQueryComponent(phone)}';
-    try {
-      final response = await ApiClient.get(
-        path,
-        timeout: const Duration(seconds: 10),
-      );
-      final parsed = ApiClient.jsonObject(response.body);
-      setState(() {
-        if (response.statusCode == 200 && parsed != null) {
-          _registration = parsed;
-        } else {
-          _registration = {
-            'status': 'error',
-            'message': ApiClient.messageFromBody(response.body),
-          };
-        }
-      });
-    } catch (error) {
-      setState(() {
-        _registration = {
-          'status': 'error',
-          'message': ApiClient.friendlyNetworkError(error),
-        };
-      });
-    } finally {
-      if (mounted) setState(() => _checkingRegistration = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final statusColor =
-        _serverOnline ? const Color(0xFF159947) : const Color(0xFFB31D18);
-    return Scaffold(
-      backgroundColor: BrandColors.bg,
-      appBar: AppBar(
-        backgroundColor: BrandColors.bg,
-        foregroundColor: BrandColors.text,
-        elevation: 0,
-        title: const Text('Server & Status'),
-      ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
-          children: [
-            _StatusPanel(
-              icon: Icons.cloud_done_rounded,
-              title: 'Connection',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        width: 10,
-                        height: 10,
-                        decoration: BoxDecoration(
-                          color: statusColor,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          _serverOnline ? 'Online' : 'Offline',
-                          style: TextStyle(
-                            color: statusColor,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                      ),
-                      IconButton(
-                        onPressed: _checkingServer ? null : _testConnection,
-                        icon: _checkingServer
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.refresh_rounded),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _serverMessage,
-                    style: const TextStyle(color: BrandColors.textMuted),
-                  ),
-                  const SizedBox(height: 12),
-                  _InfoLine(label: 'API URL', value: AppConstants.baseUrl),
-                  _InfoLine(label: 'App Version', value: AppConstants.appVersion),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            _StatusPanel(
-              icon: Icons.verified_user_rounded,
-              title: 'Registration Approval',
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _emailController,
-                    keyboardType: TextInputType.emailAddress,
-                    decoration: const InputDecoration(
-                      labelText: 'Email',
-                      prefixIcon: Icon(Icons.email_outlined),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _phoneController,
-                    keyboardType: TextInputType.phone,
-                    decoration: const InputDecoration(
-                      labelText: 'Phone',
-                      prefixIcon: Icon(Icons.phone_outlined),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 48,
-                    child: ElevatedButton.icon(
-                      onPressed:
-                          _checkingRegistration ? null : _checkRegistration,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFB31D18),
-                        foregroundColor: Colors.white,
-                      ),
-                      icon: _checkingRegistration
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
-                              ),
-                            )
-                          : const Icon(Icons.search_rounded),
-                      label: const Text('Check Status'),
-                    ),
-                  ),
-                  if (_registration != null) ...[
-                    const SizedBox(height: 14),
-                    _RegistrationResult(data: _registration!),
-                  ],
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _StatusPanel extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final Widget child;
-
-  const _StatusPanel({
-    required this.icon,
-    required this.title,
-    required this.child,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFE7E1DF)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.05),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, color: const Color(0xFFB31D18)),
-              const SizedBox(width: 10),
-              Text(
-                title,
-                style: const TextStyle(
-                  color: BrandColors.text,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          child,
-        ],
-      ),
-    );
-  }
-}
-
-class _InfoLine extends StatelessWidget {
-  final String label;
-  final String value;
-
-  const _InfoLine({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 92,
-            child: Text(
-              label,
-              style: const TextStyle(color: BrandColors.textMuted),
-            ),
-          ),
-          Expanded(
-            child: SelectableText(
-              value,
-              style: const TextStyle(
-                color: BrandColors.text,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _RegistrationResult extends StatelessWidget {
-  final Map<String, dynamic> data;
-
-  const _RegistrationResult({required this.data});
-
-  @override
-  Widget build(BuildContext context) {
-    final status = (data['status'] ?? 'unknown').toString().toLowerCase();
-    final color = _statusColor(status);
-    final title = _statusTitle(status);
-    final message = data['message']?.toString() ??
-        (status == 'approved'
-            ? 'You can now login using your registered email and password.'
-            : status == 'pending' || status == 'review'
-                ? 'Please wait for admin approval. You will receive an email update.'
-                : status == 'rejected'
-                    ? 'Please contact admin for the next step.'
-                    : 'No status details available.');
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withValues(alpha: 0.22)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: TextStyle(
-              color: color,
-              fontWeight: FontWeight.w800,
-              fontSize: 16,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(message, style: const TextStyle(color: BrandColors.textMuted)),
-          if (data['employee_id'] != null) ...[
-            const SizedBox(height: 10),
-            _InfoLine(label: 'Employee ID', value: data['employee_id'].toString()),
-          ],
-          if (data['registered_at'] != null)
-            _InfoLine(label: 'Submitted', value: data['registered_at'].toString()),
-          if (data['approved_at'] != null)
-            _InfoLine(label: 'Approved', value: data['approved_at'].toString()),
-          if (data['admin_notes'] != null)
-            _InfoLine(label: 'Admin Note', value: data['admin_notes'].toString()),
-        ],
-      ),
-    );
-  }
-
-  Color _statusColor(String status) {
-    switch (status) {
-      case 'approved':
-        return const Color(0xFF159947);
-      case 'pending':
-      case 'review':
-        return const Color(0xFFC47A11);
-      case 'rejected':
-      case 'error':
-        return const Color(0xFFB31D18);
-      default:
-        return BrandColors.textMuted;
-    }
-  }
-
-  String _statusTitle(String status) {
-    switch (status) {
-      case 'approved':
-        return 'Approved';
-      case 'pending':
-        return 'Pending Approval';
-      case 'review':
-        return 'For Manual Review';
-      case 'rejected':
-        return 'Rejected';
-      default:
-        return 'Status';
-    }
-  }
-}
-
-// ── DATE TIME CARD ──
+// â”€â”€ DATE TIME CARD â”€â”€
 class _DateTimeCard extends StatefulWidget {
   @override
   State<_DateTimeCard> createState() => _DateTimeCardState();
@@ -970,7 +849,7 @@ class _DateTimeCardState extends State<_DateTimeCard> {
   }
 }
 
-// ── ACTION BUTTON ──
+// â”€â”€ ACTION BUTTON â”€â”€
 class _ActionButton extends StatelessWidget {
   final String label;
   final String subtitle;
@@ -1060,6 +939,69 @@ class _ActionButton extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _TutorialStep extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+
+  const _TutorialStep({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: BrandColors.bg,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: BrandColors.border),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: BrandColors.cyan.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: BrandColors.cyan, size: 22),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    color: BrandColors.textMuted,
+                    fontSize: 12.5,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

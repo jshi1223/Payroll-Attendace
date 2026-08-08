@@ -1,4 +1,6 @@
-/* ── Date Watcher ── */
+/* ── Realtime Data Watcher ── */
+let realtimeWatcher = null;
+let eventSource = null;
 let dateWatcher = null;
 
 function startDateWatcher() {
@@ -21,6 +23,270 @@ function startDateWatcher() {
       await refresh();
     }
   }, 60000);
+}
+
+/* ── Realtime Data Watcher ── */
+function startRealtimeWatcher() {
+  if (eventSource) return;
+
+  const dataByView = {
+    dashboard: ['employees', 'payroll', 'attendance', 'advances', 'extraPayments', 'balePayments', 'salaryPayments', 'registrations', 'cashAdvanceRequests', 'payslipRequests'],
+    employees: ['employees'],
+    archive: ['employees'],
+    attendance: ['employees', 'attendance'],
+    payroll: ['employees', 'payroll', 'advances', 'extraPayments', 'balePayments', 'salaryPayments'],
+    cashAdvance: ['employees', 'advances'],
+    approvals: ['registrations', 'cashAdvanceRequests', 'payslipRequests']
+  };
+
+  const scheduleRefresh = debounce(() => {
+    if (!state.user || isModalOpen() || document.hidden) return;
+    const activeTag = document.activeElement?.tagName;
+    if (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') return;
+    const types = dataByView[state.view];
+    if (!types) return;
+    partialRefresh(types).catch(() => {
+      // A later refresh will retry; do not interrupt an admin who is working.
+    });
+  }, 150);
+
+  const connect = () => {
+    const es = new EventSource('/api/events');
+    eventSource = es;
+    es.onmessage = (event) => {
+      let data = null;
+      try { data = JSON.parse(event.data); } catch (_) { /* ignore malformed frames */ }
+      if (data && data.event) handleSseEvent(data);
+      scheduleRefresh();
+    };
+    es.onerror = () => {
+      es.close();
+      if (eventSource === es) eventSource = null;
+      if (state.user) realtimeWatcher = setTimeout(connect, 3000);
+    };
+  };
+  connect();
+}
+
+/* ── Notification center (bell + popup toasts) ── */
+const NOTIF_STORAGE_KEY = 'payrollNotifications';
+let payrollNotifications = loadNotifications();
+let notifPanelOpen = false;
+let notifToastTimer = null;
+
+function loadNotifications() {
+  try {
+    const list = JSON.parse(localStorage.getItem(NOTIF_STORAGE_KEY));
+    return Array.isArray(list) ? list.slice(0, 30) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveNotifications() {
+  try {
+    localStorage.setItem(NOTIF_STORAGE_KEY, JSON.stringify(payrollNotifications.slice(0, 30)));
+  } catch (_) { /* storage unavailable */ }
+}
+
+function unreadNotificationCount() {
+  return payrollNotifications.filter(n => !n.read).length;
+}
+
+function notifTimeAgo(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+  return `${Math.floor(diff / 86400000)}d ago`;
+}
+
+const NOTIFICATION_EVENTS = {
+  cash_advance_request: {
+    title: 'Cash advance request',
+    view: 'approvals',
+    tab: 'cashAdvance',
+    toast: true,
+    message: d => {
+      const amount = d.amount ? formatMoney(d.amount) : '';
+      const pickup = d.pickup_date ? ` (pickup ${d.pickup_date})` : '';
+      return `${d.name || 'An employee'} requested ${amount || 'a cash advance'}${pickup}.`;
+    }
+  },
+  attendance_present: {
+    title: 'Employee time in',
+    view: 'attendance',
+    toast: true,
+    message: d => `${d.name || 'An employee'} clocked in.`
+  },
+  attendance_timeout: {
+    title: 'Employee time out',
+    view: 'attendance',
+    toast: true,
+    message: d => `${d.name || 'An employee'} clocked out.`
+  },
+  registration_pending: {
+    title: 'New registration',
+    view: 'approvals',
+    tab: 'registrations',
+    toast: true,
+    message: d => `${d.name || 'An employee'} registered for approval.`
+  },
+  payslip_request: {
+    title: 'Payslip request',
+    view: 'approvals',
+    tab: 'payslip',
+    toast: true,
+    message: d => {
+      const period = d.period_start && d.period_end ? ` for ${d.period_start} → ${d.period_end}` : '';
+      return `${d.name || 'An employee'} requested a payslip${period}.`;
+    }
+  }
+};
+
+function handleSseEvent(data) {
+  if (!data || !data.event) return;
+  const meta = NOTIFICATION_EVENTS[data.event];
+  if (!meta) return;
+  const message = typeof meta.message === 'function' ? meta.message(data) : meta.message;
+  payrollNotifications.unshift({
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+    event: data.event,
+    title: meta.title,
+    message,
+    view: meta.view,
+    tab: meta.tab || '',
+    ts: Date.now(),
+    read: false
+  });
+  payrollNotifications = payrollNotifications.slice(0, 30);
+  saveNotifications();
+  updateNotifBell();
+  if (meta.toast) showNotifToast(data.event, meta.title, message);
+  // Keep the sidebar Approvals badge fresh no matter which view is open.
+  if (data.event === 'registration_pending') loadRegistrations().catch(() => {});
+  else if (data.event === 'cash_advance_request') loadCashAdvanceRequests().catch(() => {});
+  else if (data.event === 'payslip_request') loadPayslipRequests().catch(() => {});
+}
+
+function showNotifToast(event, title, message) {
+  document.querySelectorAll('.notif-toast').forEach(t => t.remove());
+  const toast = document.createElement('div');
+  toast.className = 'notif-toast';
+  toast.innerHTML = `
+    <div class="notif-toast-title">${escapeHtml(title)}</div>
+    <div class="notif-toast-msg">${escapeHtml(message)}</div>
+    <button class="notif-toast-close" title="Dismiss" aria-label="Dismiss">×</button>`;
+  document.body.appendChild(toast);
+  const close = () => toast.remove();
+  toast.querySelector('.notif-toast-close').addEventListener('click', (e) => {
+    e.stopPropagation();
+    close();
+  });
+  if (notifToastTimer) clearTimeout(notifToastTimer);
+  notifToastTimer = setTimeout(close, 6000);
+  requestAnimationFrame(() => toast.classList.add('visible'));
+  const meta = NOTIFICATION_EVENTS[event];
+  if (meta && meta.view) {
+    toast.addEventListener('click', () => {
+      if (meta.tab) state.approvalsTab = meta.tab;
+      navigateToView(meta.view);
+      close();
+    });
+  }
+}
+
+function navigateToView(view) {
+  const btn = document.querySelector(`.sidebar-nav button[data-view="${view}"]`);
+  if (btn) {
+    btn.click();
+    return;
+  }
+  state.view = view;
+  state.pages[view] = 1;
+  saveUiState();
+  refresh();
+}
+
+function updateNotifBell() {
+  const slot = document.querySelector('#notifBellSlot');
+  if (!slot) return;
+  const count = unreadNotificationCount();
+  slot.innerHTML = `
+    <button class="notif-bell" id="notifBell" title="Notifications" aria-label="Notifications">
+      <span class="notif-bell-icon">${count > 0 ? '🔔' : '🔕'}</span>
+      ${count > 0 ? `<span class="notif-bell-badge">${count > 99 ? '99+' : count}</span>` : ''}
+    </button>`;
+  const bell = document.querySelector('#notifBell');
+  if (bell) bell.addEventListener('click', toggleNotifPanel);
+}
+
+function renderNotifPanel() {
+  let panel = document.querySelector('#notifPanel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'notifPanel';
+    panel.className = 'notif-panel';
+    const slot = document.querySelector('#notifBellSlot');
+    (slot || document.body).appendChild(panel);
+    document.addEventListener('click', (e) => {
+      if (notifPanelOpen && !e.target.closest('#notifPanel') && !e.target.closest('#notifBell')) {
+        notifPanelOpen = false;
+        panel.classList.remove('open');
+      }
+    });
+  }
+  if (!notifPanelOpen) return;
+  const list = payrollNotifications.slice(0, 15);
+  panel.innerHTML = `
+    <div class="notif-panel-head">
+      <strong>Notifications</strong>
+      ${payrollNotifications.length ? '<button class="ghost" id="notifClearAll">Clear all</button>' : ''}
+    </div>
+    <div class="notif-panel-list">
+      ${list.length ? list.map(n => `
+        <div class="notif-item${n.read ? '' : ' unread'}" data-notif-id="${n.id}" data-view="${n.view}" data-tab="${n.tab || ''}">
+          <span class="notif-dot"></span>
+          <div>
+            <div class="notif-item-title">${escapeHtml(n.title)}</div>
+            <div class="notif-item-msg">${escapeHtml(n.message)}</div>
+            <div class="notif-item-time">${notifTimeAgo(n.ts)}</div>
+          </div>
+        </div>`).join('')
+      : '<div class="notif-empty">No notifications yet.</div>'}
+    </div>`;
+  document.querySelector('#notifClearAll')?.addEventListener('click', () => {
+    payrollNotifications = [];
+    saveNotifications();
+    renderNotifPanel();
+    updateNotifBell();
+  });
+  panel.querySelectorAll('.notif-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const notif = payrollNotifications.find(n => n.id === item.dataset.notifId);
+      if (notif) notif.read = true;
+      saveNotifications();
+      notifPanelOpen = false;
+      panel.classList.remove('open');
+      updateNotifBell();
+      if (item.dataset.view) {
+        if (item.dataset.view === 'approvals' && item.dataset.tab) state.approvalsTab = item.dataset.tab;
+        navigateToView(item.dataset.view);
+      }
+    });
+  });
+}
+
+function toggleNotifPanel() {
+  notifPanelOpen = !notifPanelOpen;
+  if (notifPanelOpen) renderNotifPanel();
+  const panel = document.querySelector('#notifPanel');
+  if (!panel) return;
+  panel.classList.toggle('open', notifPanelOpen);
+}
+
+function renderNotificationBell() {
+  updateNotifBell();
 }
 
 /* ── Shell ── */
@@ -126,6 +392,7 @@ function skeletonViewHTML(view) {
       ${tableSkeleton(4)}`,
     cashAdvance: `
       ${toolbarSkeleton()}
+      ${summaryCards3()}
       ${tableSkeleton(4)}`,
     approvals: `
       ${toolbarSkeleton()}
@@ -207,12 +474,19 @@ function shell(content) {
         </div>
         <nav class="sidebar-nav">
           <div class="nav-section-label">Main Menu</div>
-          ${navItems.map(({ id, label, icon }) => `
+          ${navItems.map(({ id, label, icon }) => {
+            const pending = id === 'approvals'
+              ? (state.cashAdvanceRequestCounts?.pending || 0) + (state.payslipRequestCounts?.pending || 0) + (state.registrationCounts?.pending || 0) + (state.registrationCounts?.review || 0)
+              : 0;
+            const badge = pending > 0
+              ? `<span class="nav-badge">${pending > 99 ? '99+' : pending}</span>` : '';
+            return `
             <button class="${state.view === id ? 'active' : ''}" data-view="${id}" title="${label}">
               ${icon ? `<span class="nav-icon">${icon}</span>` : ''}
               <span class="nav-label">${label}</span>
-            </button>
-          `).join('')}
+              ${badge}
+            </button>`;
+          }).join('')}
         </nav>
         <div class="sidebar-user">
           <div class="sidebar-user-info">
@@ -238,20 +512,21 @@ function shell(content) {
       </aside>
       <section class="content${activeSearch ? ' search-active' : ''}">
         <div class="topbar">
+          <button class="mobile-action-btn mobile-menu-btn" id="mobileMenuBtn" type="button" title="Open menu" aria-label="Open menu">☰</button>
           <div class="page-title">
             <span class="page-kicker">${state.view.toUpperCase()}</span>
             <h1>${titleForView()}</h1>
             <p>Today: ${state.currentDate} | Week: ${state.week} to ${addDays(state.week, (state.payPeriodDays || 7) - 1)}</p>
           </div>
-          <span class="badge role-${state.user.role}">
+          <span class="badge role-${state.user.role} topbar-role-badge">
             ${state.user.role === 'admin' ? 'Admin' : 'HR'}
           </span>
           <div class="mobile-actions">
-            <button class="mobile-action-btn menu-btn" id="mobileMenuBtn" title="Menu">M</button>
             <button class="mobile-action-btn" id="mobileSettingsBtn" title="Settings">Set</button>
             <button class="mobile-action-btn" id="mobileSwitchUser" title="Switch user">Usr</button>
             <button class="mobile-action-btn" id="mobileLogoutBtn" title="Logout">X</button>
           </div>
+          <span id="notifBellSlot" class="notif-bell-slot"></span>
         </div>
         ${content}
 ${state.showSettings ? settingsModal() : ''}
@@ -260,16 +535,11 @@ ${state.showLogoutConfirm ? logoutConfirmModal() : ''}
 ${state.showChangePassword ? changePasswordModal() : ''}
 ${state.showCloseConfirm ? closeConfirmModal() : ''}
         ${state.pendingDelete ? confirmDeleteModal() : ''}
-        ${state.showAudit ? auditTrailModal() : ''}
+${state.editingAttendance ? editAttendanceModal(state.editingAttendance) : ''}
+${state.showBroadcast ? broadcastModal() : ''}
+${state.showAudit ? auditTrailModal() : ''}
+${state._generatedPayslip ? payslipGeneratedModal() : ''}
       </section>
-      <nav class="bottom-nav">
-        ${navItems.map(({ id, label, icon }) => `
-          <button class="bottom-nav-item${state.view === id ? ' active' : ''}" data-view="${id}">
-            ${icon ? `<span class="bottom-nav-icon">${icon === '📦' ? '📦' : icon}</span>` : ''}
-            <span class="bottom-nav-label">${label}</span>
-          </button>
-        `).join('')}
-      </nav>
     </section>
   `;
   state._flash = null;
@@ -278,6 +548,8 @@ ${state.showCloseConfirm ? closeConfirmModal() : ''}
       state.view = button.dataset.view;
       state.editingEmployee = null;
       state.editingCashAdvance = null;
+      state.editingAttendance = null;
+      state.showBroadcast = false;
       state.searchPayroll = '';
       state.searchEmployees = '';
       state.searchAttendance = '';
@@ -317,6 +589,9 @@ ${state.showCloseConfirm ? closeConfirmModal() : ''}
   });
   bindLogoutConfirmModal();
   bindConfirmDeleteModal();
+  bindAttendanceEditButtons();
+  if (state.editingAttendance) bindEditAttendanceModal();
+  if (state.showBroadcast) bindBroadcastModal();
   bindChangePasswordModal();
   bindCloseConfirmModal();
   bindUserSwitcher();
@@ -324,6 +599,8 @@ ${state.showCloseConfirm ? closeConfirmModal() : ''}
   bindManagePayrollModal();
   startSessionTimer();
   if (state.showAudit) bindAuditTrailModal();
+  if (state._generatedPayslip) bindPayslipGeneratedModal();
+  renderNotificationBell();
 
   /* Mobile action buttons */
   document.querySelector('#mobileSettingsBtn')?.addEventListener('click', () => {
@@ -430,6 +707,7 @@ async function refresh() {
   saveUiState();
   await withLoading(loadData);
   await reRenderCurrentView();
+  syncNavBadge();
 }
 
 /* ── Targeted Partial Refresh (only reload what changed) ── */
@@ -448,7 +726,9 @@ async function partialRefresh(types) {
     extraPayments: api(`/api/extra-payments?week=${state.payrollWeek}&periodDays=${pd}`),
     balePayments: api(`/api/bale-payments?week=${state.payrollWeek}&periodDays=${pd}`),
     salaryPayments: api(`/api/salary-payments?week=${state.payrollWeek}&periodDays=${pd}`),
-    registrations: api(`/api/registrations?${new URLSearchParams({ status: state.registrationsStatus || 'pending', search: state._registrationsSearch })}`)
+    registrations: api(`/api/registrations?${new URLSearchParams({ status: state.registrationsStatus || 'pending', search: state._registrationsSearch })}`),
+    cashAdvanceRequests: api(`/api/cash-advance-requests`),
+    payslipRequests: api('/api/payslip-requests')
   };
 
   const promises = types.map(t => fetchers[t]);
@@ -459,6 +739,12 @@ async function partialRefresh(types) {
       if (t === 'registrations') {
         state.registrations = results[i].value.rows || results[i].value || [];
         state.registrationCounts = results[i].value.counts || {};
+      } else if (t === 'cashAdvanceRequests') {
+        state.cashAdvanceRequests = results[i].value.rows || results[i].value || [];
+        state.cashAdvanceRequestCounts = results[i].value.counts || {};
+      } else if (t === 'payslipRequests') {
+        state.payslipRequests = results[i].value.rows || results[i].value || [];
+        state.payslipRequestCounts = results[i].value.counts || {};
       } else {
         state[t] = results[i].value;
       }
@@ -466,9 +752,31 @@ async function partialRefresh(types) {
   });
 
   reRenderCurrentView();
+  syncNavBadge();
 }
 
 /* ── Re-render current view ── */
+function syncNavBadge() {
+  const views = [
+    { view: 'approvals', pending: (state.cashAdvanceRequestCounts?.pending || 0) + (state.payslipRequestCounts?.pending || 0) + (state.registrationCounts?.pending || 0) + (state.registrationCounts?.review || 0) }
+  ];
+  for (const { view, pending } of views) {
+    const btn = document.querySelector(`.sidebar-nav button[data-view="${view}"]`);
+    if (!btn) continue;
+    let badge = btn.querySelector('.nav-badge');
+    if (pending > 0) {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'nav-badge';
+        btn.appendChild(badge);
+      }
+      badge.textContent = pending > 99 ? '99+' : String(pending);
+    } else if (badge) {
+      badge.remove();
+    }
+  }
+}
+
 async function reRenderCurrentView() {
   const payrollRows = state.payroll?.rows || [];
   if (state.payrollModalEmployee) {
@@ -480,8 +788,12 @@ async function reRenderCurrentView() {
   if (state.view === 'attendance') await renderAttendance();
   if (state.view === 'employees') renderEmployees();
   if (state.view === 'cashAdvance') await renderCashAdvance();
+  if (state.view === 'approvals') {
+    if (state.approvalsTab === 'cashAdvance') renderCashAdvanceRequests();
+    else if (state.approvalsTab === 'payslip') renderPayslipRequests();
+    else renderApprovals();
+  }
   if (state.view === 'archive') renderArchive();
-  if (state.view === 'approvals') renderApprovals();
 }
 
 /* ── Keyboard Shortcuts Help Modal ── */
@@ -620,6 +932,7 @@ async function boot() {
   await new Promise(r => setTimeout(r, 100));
   if (splashWrapper) splashWrapper.classList.add('fade-out');
   startDateWatcher();
+  startRealtimeWatcher();
 }
 
 boot().catch(error => {

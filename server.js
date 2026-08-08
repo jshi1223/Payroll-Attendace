@@ -13,6 +13,22 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const net = require('net');
+const http = require('http');
+
+/* Fall back to the attendance backend's .env so FCM + schema config is shared */
+(function loadAttendanceEnv() {
+  const envPath = path.join(__dirname, 'attendance_system', 'backend', '.env');
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+    const idx = trimmed.indexOf('=');
+    const key = trimmed.slice(0, idx).trim();
+    if (key in process.env) continue;
+    const value = trimmed.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    process.env[key] = value;
+  }
+})();
 
 if (!process.env.DATABASE_URL) {
   console.error('FATAL: DATABASE_URL environment variable is required.');
@@ -28,6 +44,24 @@ const app = express();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
+
+/* Anti-cheat rule shared with the attendance backend: a time-out must be at
+   least MIN_WORK_MINUTES after the time-in. Loaded from the attendance .env
+   (loadAttendanceEnv above) so one value controls both apps. */
+const MIN_WORK_MINUTES = Number(process.env.MIN_WORK_MINUTES || 30);
+
+function validateTimeRange(timeIn, timeOut) {
+  if (!timeIn || !timeOut) return null;
+  const inParts = String(timeIn).split(':').map(Number);
+  const outParts = String(timeOut).split(':').map(Number);
+  if (inParts.length < 2 || outParts.length < 2 || isNaN(inParts[0]) || isNaN(outParts[0])) return null;
+  const inMinutes = inParts[0] * 60 + (inParts[1] || 0);
+  const outMinutes = outParts[0] * 60 + (outParts[1] || 0);
+  const diff = outMinutes - inMinutes;
+  if (diff < 0) return 'Time out cannot be earlier than time in.';
+  if (diff < MIN_WORK_MINUTES) return `Time out must be at least ${MIN_WORK_MINUTES} minutes after time in.`;
+  return null;
+}
 
 const PORT = process.env.PORT || 3001;
 
@@ -123,6 +157,57 @@ function csrfProtection(req, res, next) {
 
 app.use(csrfProtection);
 
+/* Broadcast to connected admin panels whenever data changes (only on success) */
+const MUTATION_PATTERNS = [
+  { method: 'POST', pattern: /^\/api\/employees$/ },
+  { method: 'PUT', pattern: /^\/api\/employees\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/api\/employees\/\d+$/ },
+  { method: 'POST', pattern: /^\/api\/employees\/\d+\/photo$/ },
+  { method: 'DELETE', pattern: /^\/api\/employees\/\d+\/photo$/ },
+  { method: 'PUT', pattern: /^\/api\/employees\/\d+\/restore$/ },
+  { method: 'DELETE', pattern: /^\/api\/employees\/\d+\/permanent$/ },
+  { method: 'POST', pattern: /^\/api\/attendance$/ },
+  { method: 'POST', pattern: /^\/api\/attendance\/bulk$/ },
+  { method: 'POST', pattern: /^\/api\/attendance\/mark-all$/ },
+  { method: 'PUT', pattern: /^\/api\/attendance\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/api\/attendance\/\d+$/ },
+  { method: 'POST', pattern: /^\/api\/extra-payments$/ },
+  { method: 'PUT', pattern: /^\/api\/extra-payments\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/api\/extra-payments\/\d+$/ },
+  { method: 'POST', pattern: /^\/api\/salary-payments$/ },
+  { method: 'PUT', pattern: /^\/api\/salary-payments\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/api\/salary-payments\/\d+$/ },
+  { method: 'POST', pattern: /^\/api\/bale-payments$/ },
+  { method: 'PUT', pattern: /^\/api\/bale-payments\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/api\/bale-payments\/\d+$/ },
+  { method: 'POST', pattern: /^\/api\/cash-advances$/ },
+  { method: 'PUT', pattern: /^\/api\/cash-advances\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/api\/cash-advances\/\d+$/ },
+  { method: 'POST', pattern: /^\/api\/cash-advance-requests\/\d+\/(approve|reject)$/ },
+  { method: 'POST', pattern: /^\/api\/payslip-requests\/\d+\/(approve|reject)$/ },
+  { method: 'POST', pattern: /^\/api\/payroll\/review$/ },
+  { method: 'POST', pattern: /^\/api\/payroll\/submit-review$/ },
+  { method: 'POST', pattern: /^\/api\/payroll\/\d+\/generate$/ },
+  { method: 'POST', pattern: /^\/api\/payroll\/\d+\/unlock$/ },
+  { method: 'PUT', pattern: /^\/api\/payroll\/payment$/ },
+  { method: 'DELETE', pattern: /^\/api\/payroll\/payment$/ },
+  { method: 'POST', pattern: /^\/api\/registrations\/\d+\/approve$/ },
+  { method: 'POST', pattern: /^\/api\/registrations\/\d+\/reject$/ }
+];
+
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    if (res.statusCode < 200 || res.statusCode >= 300) return;
+    for (const rule of MUTATION_PATTERNS) {
+      if (rule.method === req.method && rule.pattern.test(req.path)) {
+        notifyDataChanged({ type: 'data_changed' });
+        break;
+      }
+    }
+  });
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'attendance_system', 'public')));
 
 function requireAuth(req, res, next) {
@@ -174,6 +259,20 @@ function formatDateOnly(date) {
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
   const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+/* PostgreSQL DATE values can arrive through node-postgres as a JavaScript Date.
+   Do not read those with UTC getters: a Manila midnight can then become the
+   previous calendar day. This is used only for database date values that must
+   stay aligned with the employee app's Manila calendar. */
+function databaseDateOnly(value) {
+  if (typeof value === 'string') return value.slice(0, 10);
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) return String(value || '').slice(0, 10);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(value);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
 }
 
 function todayInManila() {
@@ -234,6 +333,316 @@ function getPeriodDays(periodDays) {
 function money(value) {
   return Number(value || 0);
 }
+
+/* ── Realtime: server-sent events broadcast to connected admin panels ── */
+const sseClients = new Set();
+
+function notifyDataChanged(payload = {}) {
+  const message = JSON.stringify({ ...payload, ts: Date.now() });
+  for (const client of sseClients) {
+    try { client.write(`data: ${message}\n\n`); } catch (_) { sseClients.delete(client); }
+  }
+}
+
+/* ── FCM push notifications to employee devices ── */
+let _fcmAccessToken = '';
+let _fcmAccessTokenExpiresAt = 0;
+
+function fcmServiceAccount() {
+  const raw = process.env.FCM_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_CREDENTIALS || '';
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    if (!data.client_email || !data.private_key || !data.project_id) return null;
+    return data;
+  } catch (_) { return null; }
+}
+
+async function getFcmAccessToken() {
+  const account = fcmServiceAccount();
+  if (!account) return null;
+  const now = Math.floor(Date.now() / 1000);
+  if (_fcmAccessToken && now < _fcmAccessTokenExpiresAt - 60) return _fcmAccessToken;
+  const tokenUri = account.token_uri || 'https://oauth2.googleapis.com/token';
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    iss: account.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: tokenUri,
+    iat: now,
+    exp: now + 3600
+  })).toString('base64url');
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(`${header}.${payload}`);
+  signer.end();
+  const assertion = `${header}.${payload}.${signer.sign(account.private_key, 'base64url')}`;
+  try {
+    const resp = await fetch(tokenUri, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion
+      }).toString()
+    });
+    const data = await resp.json();
+    if (!data.access_token) return null;
+    _fcmAccessToken = data.access_token;
+    _fcmAccessTokenExpiresAt = now + (data.expires_in || 3600);
+    return _fcmAccessToken;
+  } catch (_) { return null; }
+}
+
+function attendanceSchemaName() {
+  const schema = (process.env.DB_SCHEMA || 'attendance').trim();
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(schema) ? schema : 'attendance';
+}
+
+async function sendFcmToEmployee(payrollEmployeeId, title, body, data = {}) {
+  if (!payrollEmployeeId) return false;
+  const token = await getFcmAccessToken();
+  const account = fcmServiceAccount();
+  if (!token || !account) return false;
+  try {
+    const schema = attendanceSchemaName();
+    const result = await pool.query(
+      `SELECT edt.device_token
+       FROM ${schema}.employee_device_tokens edt
+       JOIN ${schema}.employees e ON e.employee_id = edt.employee_id
+       WHERE e.payroll_employee_id = $1
+       ORDER BY edt.updated_at DESC
+       LIMIT 5`,
+      [Number(payrollEmployeeId)]
+    );
+    const deviceTokens = result.rows.map(r => r.device_token).filter(Boolean);
+    if (!deviceTokens.length) return false;
+    let sent = false;
+    const endpoint = `https://fcm.googleapis.com/v1/projects/${account.project_id}/messages:send`;
+    for (const deviceToken of deviceTokens) {
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json; charset=utf-8'
+          },
+          body: JSON.stringify({
+            message: {
+              token: deviceToken,
+              notification: { title, body },
+              data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+              android: { priority: 'high' }
+            }
+          })
+        });
+        if (resp.ok) sent = true;
+      } catch (_) { /* fire and forget */ }
+    }
+    return sent;
+  } catch (_) { return false; }
+}
+
+async function sendFcmBroadcast(title, body, data = {}) {
+  const token = await getFcmAccessToken();
+  const account = fcmServiceAccount();
+  if (!token || !account) return 0;
+  try {
+    const schema = attendanceSchemaName();
+    const result = await pool.query(
+      `SELECT DISTINCT edt.device_token
+       FROM ${schema}.employee_device_tokens edt
+       JOIN ${schema}.employees e ON e.employee_id = edt.employee_id
+       WHERE e.status = 'approved' AND edt.device_token IS NOT NULL AND edt.device_token <> ''`
+    );
+    const deviceTokens = result.rows.map(r => r.device_token).filter(Boolean);
+    if (!deviceTokens.length) return 0;
+    const endpoint = `https://fcm.googleapis.com/v1/projects/${account.project_id}/messages:send`;
+    let sent = 0;
+    for (const deviceToken of deviceTokens) {
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json; charset=utf-8'
+          },
+          body: JSON.stringify({
+            message: {
+              token: deviceToken,
+              notification: { title, body },
+              data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+              android: { priority: 'high' }
+            }
+          })
+        });
+        if (resp.ok) sent++;
+      } catch (_) { /* fire and forget */ }
+    }
+    return sent;
+  } catch (_) { return 0; }
+}
+
+async function sendPayrollUpdatedPush(employeeId, label = '') {
+  await sendFcmToEmployee(employeeId, 'Payroll updated', label
+    ? `Your payroll record was updated (${label}).`
+    : 'Your payroll record was updated.', { type: 'payroll_updated', employee_id: String(employeeId), screen: 'payroll' });
+}
+
+/* Money-informing push notifications for payroll transactions */
+async function sendBalePaymentPush(employeeId, amount) {
+  try {
+    const ca = await pool.query('SELECT COALESCE(SUM(amount),0)::numeric(12,2) AS total FROM cash_advances WHERE employee_id = $1', [employeeId]);
+    const bp = await pool.query('SELECT COALESCE(SUM(amount),0)::numeric(12,2) AS total FROM bale_payments WHERE employee_id = $1', [employeeId]);
+    const balance = Math.max(Number(ca.rows[0].total) - Number(bp.rows[0].total), 0);
+    await createNotification({ recipientType: 'employee', recipientId: employeeId, type: 'bale_payment',
+      title: 'Cash advance payment',
+      body: 'A cash advance payment was recorded for you. View the details in your Payroll tab.',
+      data: { amount: money(amount), balance } });
+    await sendFcmToEmployee(employeeId, 'Cash advance payment',
+      'A cash advance payment was recorded for you. View the details in your Payroll tab.',
+      { type: 'bale_payment', screen: 'payroll', employee_id: String(employeeId) });
+  } catch (_) { /* fire and forget */ }
+}
+
+async function sendExtraPayPush(employeeId, amount, date) {
+  await createNotification({ recipientType: 'employee', recipientId: employeeId, type: 'extra_pay_added',
+    title: 'Extra pay added',
+    body: 'Extra pay was added to your payroll. View the details in your Payroll tab.',
+    data: { amount: money(amount), date } });
+  await sendFcmToEmployee(employeeId, 'Extra pay added',
+    'Extra pay was added to your payroll. View the details in your Payroll tab.',
+    { type: 'extra_pay_added', screen: 'payroll', employee_id: String(employeeId) });
+}
+
+async function sendSalaryPaidPush(employeeId, amount) {
+  await createNotification({ recipientType: 'employee', recipientId: employeeId, type: 'salary_paid',
+    title: 'Salary paid',
+    body: 'Your salary payment was recorded. View the details in your Payroll tab.',
+    data: { amount: money(amount) } });
+  await sendFcmToEmployee(employeeId, 'Salary paid',
+    'Your salary payment was recorded. View the details in your Payroll tab.',
+    { type: 'salary_paid', screen: 'payroll', employee_id: String(employeeId) });
+}
+
+/* In-app notification rows (works without FCM so the bell always shows
+   announcements and payroll events). recipientType 'all-employees' fans out
+   one row per approved attendance employee that has a payroll record. */
+async function createNotification({ recipientType = 'employee', recipientId = null, type, title, body = '', data = {} }) {
+  try {
+    if (recipientType === 'all-employees') {
+      const schema = attendanceSchemaName();
+      const result = await pool.query(
+        `SELECT e.payroll_employee_id
+         FROM ${schema}.employees e
+         WHERE e.status = 'approved' AND e.payroll_employee_id IS NOT NULL`
+      );
+      for (const r of result.rows) {
+        await pool.query(
+          `INSERT INTO notifications (recipient_type, recipient_id, type, title, body, data)
+           VALUES ('employee', $1, $2, $3, $4, $5)`,
+          [r.payroll_employee_id, type, title, body, JSON.stringify(data)]
+        );
+      }
+      return result.rowCount;
+    }
+    const r = await pool.query(
+      `INSERT INTO notifications (recipient_type, recipient_id, type, title, body, data)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [recipientType, recipientId, type, title, body, JSON.stringify(data)]
+    );
+    return r.rowCount;
+  } catch (_) { return 0; }
+}
+
+/* ── Scheduled reminder notifications (payday + overdue cash advance) ── */
+let _lastReminderDate = '';
+
+function manilaTomorrow() {
+  const today = todayInManila();
+  const d = parseDateOnly(today);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return formatDateOnly(d);
+}
+
+/* Deduplicate scheduled reminders so a server restart does not re-send the
+   same reminder twice on the same calendar day. */
+async function reminderAlreadySentToday(type) {
+  try {
+    const r = await pool.query(
+      `SELECT 1 FROM notifications
+       WHERE type = $1 AND created_at::date = CURRENT_DATE
+       LIMIT 1`,
+      [type]
+    );
+    return r.rowCount > 0;
+  } catch (_) { return true; }
+}
+
+async function runScheduledReminders() {
+  const today = todayInManila();
+  if (_lastReminderDate === today) return;
+  try {
+    const tomorrow = manilaTomorrow();
+    const periodDaysResult = await pool.query(
+      `SELECT DISTINCT COALESCE(pay_period_days, 7) AS pd FROM employees WHERE active`
+    );
+    let paydayTomorrow = false;
+    for (const row of periodDaysResult.rows) {
+      const pd = getPeriodDays(row.pd);
+      if (periodEndOf(tomorrow, pd) === tomorrow) { paydayTomorrow = true; break; }
+    }
+    if (paydayTomorrow && !(await reminderAlreadySentToday('payday_reminder'))) {
+      const upcoming = periodStartOf(tomorrow, 7);
+      await createNotification({
+        recipientType: 'all-employees', type: 'payday_reminder',
+        title: 'Payday tomorrow',
+        body: 'Your salary will be available tomorrow. Check your Payroll tab for the updated payslip.',
+        data: { period: upcoming }
+      });
+      await sendFcmBroadcast('Payday tomorrow',
+        'Your salary will be available tomorrow. Check your Payroll tab for the updated payslip.',
+        { type: 'payday_reminder', screen: 'payroll', period: upcoming });
+    }
+    /* Cash advance overdue reminder: weekly (skip if one was sent in the last 7 days). */
+    const weekly = await pool.query(
+      `SELECT 1 FROM notifications
+       WHERE type = 'ca_overdue_reminder' AND created_at > CURRENT_DATE - INTERVAL '7 days'
+       LIMIT 1`
+    );
+    if (weekly.rowCount > 0) { _lastReminderDate = today; return; }
+    const overdueResult = await pool.query(
+      `SELECT e.id,
+              COALESCE((SELECT SUM(amount) FROM cash_advances ca WHERE ca.employee_id = e.id), 0) AS ca_total,
+              COALESCE((SELECT SUM(amount) FROM bale_payments bp WHERE bp.employee_id = e.id), 0) AS bp_total
+       FROM employees e
+       WHERE e.active`
+    );
+    const schema = attendanceSchemaName();
+    for (const row of overdueResult.rows) {
+      const balance = Math.max(money(row.ca_total) - money(row.bp_total), 0);
+      if (balance <= 0) continue;
+      const link = await pool.query(
+        `SELECT payroll_employee_id FROM ${schema}.employees WHERE employee_id = $1 LIMIT 1`,
+        [row.id]
+      );
+      const payrollEmployeeId = link.rows[0]?.payroll_employee_id;
+      if (!payrollEmployeeId) continue;
+      await createNotification({
+        recipientType: 'employee', recipientId: payrollEmployeeId, type: 'ca_overdue_reminder',
+        title: 'Cash advance balance',
+        body: 'You still have a pending cash advance balance. Check your Payroll tab for details.',
+        data: { balance }
+      });
+      await sendFcmToEmployee(payrollEmployeeId, 'Cash advance balance',
+        'You still have a pending cash advance balance. Check your Payroll tab for details.',
+        { type: 'ca_overdue_reminder', screen: 'payroll', employee_id: String(payrollEmployeeId) });
+    }
+    _lastReminderDate = today;
+  } catch (_) { /* reminders are best-effort */ }
+}
+
+/* Check hourly; each type is only sent once per calendar day. */
+setInterval(runScheduledReminders, 60 * 60 * 1000);
 
 /* Government ID format validation */
 const GOV_ID_VALIDATORS = {
@@ -296,7 +705,7 @@ function calculatePayrollWeekState({ previousBaleBalance = 0, previousUnpaidBala
   const salaryExcessForExtra = Math.max(salaryPaidAmount - paymentToPreviousUnpaid - currentSalaryPaidAmount, 0);
   const effectiveExtraPay = Math.max(extraPayment - salaryExcessForExtra, 0);
 
-  const balance = Math.max(previousUnpaidBalance - paymentToPreviousUnpaid, 0) + currentUnpaidBalance;
+  const balance = Math.max(previousUnpaidBalance - paymentToPreviousUnpaid, 0) + currentUnpaidBalance + effectiveExtraPay;
   const paymentLimit = Math.max(0, previousUnpaidBalance + Math.max(salary, 0) + extraPayment) + (deductBale && salary === 0 ? totalBale : 0);
 
   return {
@@ -666,6 +1075,26 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity, entity_id);
+    CREATE TABLE IF NOT EXISTS announcements (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(160) NOT NULL,
+      message TEXT NOT NULL,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      recipient_type VARCHAR(20) NOT NULL DEFAULT 'employee' CHECK (recipient_type IN ('employee', 'admin')),
+      recipient_id INTEGER,
+      type VARCHAR(50) NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      read_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_recipient
+      ON notifications(recipient_type, recipient_id, created_at DESC);
     CREATE TABLE IF NOT EXISTS extra_payments (
       id SERIAL PRIMARY KEY,
       employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
@@ -696,8 +1125,46 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_salary_payments_date ON salary_payments(payment_date);
+    CREATE TABLE IF NOT EXISTS cash_advance_requests (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+      reason TEXT NOT NULL DEFAULT '',
+      pickup_date DATE,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_cash_advance_requests_status ON cash_advance_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_cash_advance_requests_employee ON cash_advance_requests(employee_id);
+    CREATE TABLE IF NOT EXISTS deleted_attendance_marks (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      work_date DATE NOT NULL,
+      deleted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (employee_id, work_date)
+    );
+    CREATE TABLE IF NOT EXISTS payslip_requests (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      attendance_employee_id VARCHAR(50),
+      name VARCHAR(255) NOT NULL DEFAULT '',
+      email VARCHAR(255) NOT NULL DEFAULT '',
+      period_start DATE NOT NULL,
+      period_end DATE NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+      notes TEXT DEFAULT '',
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_payslip_requests_status ON payslip_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_payslip_requests_employee ON payslip_requests(employee_id);
   `);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS phone VARCHAR(20) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE cash_advance_requests ADD COLUMN IF NOT EXISTS pickup_date DATE`);
   /* Ensure no duplicates before adding unique constraint on phone */
   await pool.query(`
     UPDATE employees SET phone = CONCAT('0000000000', id)
@@ -859,6 +1326,20 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE attendance.employees ADD COLUMN IF NOT EXISTS tin_number VARCHAR(15) NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS email VARCHAR(255) NULL`);
 
+  /* Mirror government IDs from the payroll table into the attendance/mobile
+     accounts so the employee's app profile shows the same SSS, PhilHealth,
+     Pag-IBIG, and TIN the admin sees in the web app. This is idempotent and
+     also backfills any accounts created before the mirror was added. */
+  await pool.query(`
+    UPDATE attendance.employees a
+    SET sss_number = e.sss_number,
+        philhealth_number = e.philhealth_number,
+        pagibig_number = e.pagibig_number,
+        tin_number = e.tin_number
+    FROM employees e
+    WHERE a.payroll_employee_id = e.id
+  `);
+
   /* Payroll review/acceptance step before bulk printing */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payroll_reviews (
@@ -868,32 +1349,9 @@ async function initDatabase() {
       accepted_by INTEGER NULL REFERENCES users(id) ON DELETE SET NULL
     )
   `);
-
-  const defaultUsers = [];
-  const bootstrapAdmin = { username: process.env.BOOTSTRAP_USERNAME || 'admin', password: process.env.BOOTSTRAP_PASSWORD, role: process.env.BOOTSTRAP_ROLE || 'admin' };
-  const bootstrapHr = { username: process.env.BOOTSTRAP_HR_USERNAME || 'hr', password: process.env.BOOTSTRAP_HR_PASSWORD, role: process.env.BOOTSTRAP_HR_ROLE || 'hr' };
-  if (bootstrapAdmin.password) defaultUsers.push(bootstrapAdmin);
-  else console.log('  Skip creating admin: BOOTSTRAP_PASSWORD is not set.');
-  if (bootstrapHr.password) defaultUsers.push(bootstrapHr);
-  else console.log('  Skip creating HR user: BOOTSTRAP_HR_PASSWORD is not set.');
-
-  for (const u of defaultUsers) {
-    const exists = await pool.query('SELECT id, role, must_change_password FROM users WHERE username = $1', [u.username]);
-    if (!exists.rowCount) {
-      const hash = await bcrypt.hash(u.password, 10);
-      await pool.query(
-        'INSERT INTO users (username, password_hash, role, must_change_password) VALUES ($1, $2, $3, false)',
-        [u.username, hash, u.role]
-      );
-      console.log(`  Created user: ${u.username} (${u.role})`);
-    } else {
-      const existing = exists.rows[0];
-      if (existing.role !== u.role || existing.must_change_password) {
-        await pool.query('UPDATE users SET role = $1, must_change_password = false, updated_at = NOW() WHERE id = $2', [u.role, existing.id]);
-        console.log(`  Updated user: ${u.username} (${u.role})`);
-      }
-    }
-  }
+  /* HR "submit for review" step (optional) before admin acceptance */
+  await pool.query(`ALTER TABLE payroll_reviews ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE payroll_reviews ADD COLUMN IF NOT EXISTS submitted_by INTEGER NULL REFERENCES users(id) ON DELETE SET NULL`);
 
 }
 
@@ -975,6 +1433,7 @@ app.get('/api/employees', requireAuth, async (req, res) => {
 
 app.post('/api/employees', requireAuth, async (req, res) => {
   const { first_name, last_name, name, phone, rate, active = true, pay_period_days = 7 } = req.body;
+  const isActive = active !== false && String(active).toLowerCase() !== 'false';
   const empFirstName = (first_name || '').trim();
   const empLastName = (last_name || '').trim();
   const empName = empFirstName && empLastName ? `${empFirstName} ${empLastName}` : (name || '').trim();
@@ -1048,30 +1507,45 @@ app.post('/api/employees', requireAuth, async (req, res) => {
       `INSERT INTO employees (emp_number, first_name, last_name, name, phone, email, rate, pay_period_days, active, sss_number, philhealth_number, pagibig_number, tin_number)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
-      [empNumber.rows[0].emp_number, empFirstName, empLastName, empName, phone.trim(), email, rate, periodDays, active,
+      [empNumber.rows[0].emp_number, empFirstName, empLastName, empName, phone.trim(), email, rate, periodDays, isActive,
        req.body.sss_number || '', req.body.philhealth_number || '', req.body.pagibig_number || '', req.body.tin_number || '']
     );
     const newEmployeeId = result.rows[0].id;
 
-    let attendanceAccount = null;
-    if (email && tempPassword) {
-      const attendanceEmpId = await client.query(
-        `SELECT (
-           'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
-           LPAD(COALESCE(MAX(NULLIF(split_part(employee_id, '-', 4), '')::int), 0) + 1, 4, '0')
-         ) AS emp_id
-         FROM attendance.employees
-         WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
-      );
-      const passwordHash = await bcrypt.hash(tempPassword, 10);
-      await client.query(
-        `INSERT INTO attendance.employees
-           (employee_id, name, email, phone, password_hash, daily_rate, status, approved_at, payroll_employee_id)
-         VALUES ($1, $2, $3, $4, $5, $6, 'approved', NOW(), $7)`,
-        [attendanceEmpId.rows[0].emp_id, empName, email, phone.trim(), passwordHash, Number(rate), newEmployeeId]
-      );
-      attendanceAccount = attendanceEmpId.rows[0].emp_id;
-    }
+    // Every payroll employee has a matching attendance/mobile record.  An
+    // account without credentials remains archived until an admin assigns an
+    // email and temporary password through Edit Employee.
+    const attendanceEmpId = await client.query(
+      `SELECT (
+         'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
+         LPAD((COALESCE(MAX(NULLIF(split_part(employee_id, '-', 3), '')::int), 0) + 1)::text, 4, '0')
+       ) AS emp_id
+       FROM attendance.employees
+       WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
+    );
+    const attendanceAccount = attendanceEmpId.rows[0].emp_id;
+    const mobileIsReady = Boolean(email && tempPassword && isActive);
+    const passwordHash = mobileIsReady ? await bcrypt.hash(tempPassword, 10) : null;
+    await client.query(
+      `INSERT INTO attendance.employees
+         (employee_id, name, email, phone, password_hash, daily_rate, status, approved_at, payroll_employee_id,
+          sss_number, philhealth_number, pagibig_number, tin_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $7 = 'approved' THEN NOW() ELSE NULL END, $8, $9, $10, $11, $12)`,
+      [
+        attendanceAccount,
+        empName,
+        email || null,
+        phone.trim(),
+        passwordHash,
+        Number(rate),
+        mobileIsReady ? 'approved' : 'archived',
+        newEmployeeId,
+        req.body.sss_number || '',
+        req.body.philhealth_number || '',
+        req.body.pagibig_number || '',
+        req.body.tin_number || ''
+      ]
+    );
 
     await client.query('COMMIT');
     await logAudit(req.session.user.id, 'create', 'employee', newEmployeeId, {
@@ -1106,6 +1580,20 @@ app.put('/api/employees/:id', requireAuth, validateIdParam, async (req, res) => 
     return res.status(400).json({ error: 'Daily rate must be at least ₱500.00.' });
   }
 
+  const before = await pool.query('SELECT * FROM employees WHERE id = $1', [req.params.id]);
+  if (!before.rowCount) return res.status(404).json({ error: 'Employee not found.' });
+
+  /* Government identification numbers are sensitive payroll data. HR staff
+     may keep editing regular employee details, but only an admin can change
+     any of these IDs. */
+  const protectedGovIdFields = ['sss_number', 'philhealth_number', 'pagibig_number', 'tin_number'];
+  const governmentIdChanged = protectedGovIdFields.some(field =>
+    String(req.body[field] || '').trim() !== String(before.rows[0][field] || '').trim()
+  );
+  if (governmentIdChanged && req.session.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Only an admin can change SSS, PhilHealth, Pag-IBIG, or TIN details.' });
+  }
+
   /* Validate government ID formats */
   const govIdResult = validateGovIds(req.body);
   if (!govIdResult.valid) {
@@ -1136,7 +1624,6 @@ app.put('/api/employees/:id', requireAuth, validateIdParam, async (req, res) => 
     return res.status(409).json({ error: 'Phone number is already in use by another employee.' });
   }
 
-  const before = await pool.query('SELECT * FROM employees WHERE id = $1', [req.params.id]);
   const result = await pool.query(
     `UPDATE employees
      SET first_name = $1, last_name = $2, name = $3, phone = $4, rate = $5, pay_period_days = $6, active = $7,
@@ -1169,16 +1656,19 @@ app.put('/api/employees/:id', requireAuth, validateIdParam, async (req, res) => 
     if (existingAccount.rowCount > 0) {
       await pool.query(
         `UPDATE attendance.employees
-         SET email = $1, password_hash = $2, name = $3, phone = $4, daily_rate = $5, status = 'approved'
-         WHERE id = $6`,
-        [email, passwordHash, empName, phone.trim(), rate, existingAccount.rows[0].id]
+         SET email = $1, password_hash = $2, name = $3, phone = $4, daily_rate = $5, status = 'approved',
+             sss_number = $6, philhealth_number = $7, pagibig_number = $8, tin_number = $9
+         WHERE id = $10`,
+        [email, passwordHash, empName, phone.trim(), rate,
+         req.body.sss_number || '', req.body.philhealth_number || '', req.body.pagibig_number || '', req.body.tin_number || '',
+         existingAccount.rows[0].id]
       );
       mobileAccount = existingAccount.rows[0].employee_id;
     } else {
       const attendanceEmpId = await pool.query(
         `SELECT (
            'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
-           LPAD(COALESCE(MAX(NULLIF(split_part(employee_id, '-', 4), '')::int), 0) + 1, 4, '0')
+       LPAD((COALESCE(MAX(NULLIF(split_part(employee_id, '-', 3), '')::int), 0) + 1)::text, 4, '0')
          ) AS emp_id
          FROM attendance.employees
          WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
@@ -1193,6 +1683,26 @@ app.put('/api/employees/:id', requireAuth, validateIdParam, async (req, res) => 
     }
   }
 
+  // Keep manual Active/Inactive edits in sync with the separate mobile account.
+  // This also prevents a password reset from re-enabling an archived account.
+  await pool.query(
+    `UPDATE attendance.employees
+     SET status = CASE WHEN $2::boolean THEN 'approved' ELSE 'archived' END
+     WHERE payroll_employee_id = $1 AND status IN ('approved', 'archived')`,
+    [req.params.id, result.rows[0].active]
+  );
+
+  // Mirror government IDs into the mobile account (any status) so the
+  // employee's app profile always shows the same SSS / PhilHealth / Pag-IBIG /
+  // TIN the admin sees in the web app.
+  await pool.query(
+    `UPDATE attendance.employees
+     SET sss_number = $2, philhealth_number = $3, pagibig_number = $4, tin_number = $5
+     WHERE payroll_employee_id = $1`,
+    [req.params.id,
+     req.body.sss_number || '', req.body.philhealth_number || '', req.body.pagibig_number || '', req.body.tin_number || '']
+  );
+
   await logAudit(req.session.user.id, 'update', 'employee', Number(req.params.id), {
     before: before.rows[0] || null,
     after: result.rows[0],
@@ -1202,54 +1712,167 @@ app.put('/api/employees/:id', requireAuth, validateIdParam, async (req, res) => 
 });
 
 app.delete('/api/employees/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
-  await pool.query('UPDATE employees SET active = false WHERE id = $1', [req.params.id]);
-  await logAudit(req.session.user.id, 'archive', 'employee', Number(req.params.id), {});
-  res.json({ ok: true });
+  const employeeId = Number(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const employee = await client.query(
+      'UPDATE employees SET active = false WHERE id = $1 RETURNING id, name',
+      [employeeId]
+    );
+    if (!employee.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+
+    // The mobile attendance account is separate from the payroll employee.
+    // Archive it too so it cannot log in or use an existing app session.
+    const mobileAccount = await client.query(
+      `UPDATE attendance.employees
+       SET status = 'archived'
+       WHERE payroll_employee_id = $1`,
+      [employeeId]
+    );
+    await client.query('COMMIT');
+    await logAudit(req.session.user.id, 'archive', 'employee', employeeId, {
+      name: employee.rows[0].name,
+      mobile_account_archived: mobileAccount.rowCount > 0
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 app.post('/api/employees/:id/photo', requireAuth, validateIdParam, upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
   const photoUrl = '/attendance-faces/' + req.file.filename;
-  const result = await pool.query(
-    'UPDATE employees SET photo_url = $1 WHERE id = $2 RETURNING photo_url',
-    [photoUrl, req.params.id]
-  );
-  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
-  res.json({ photo_url: result.rows[0].photo_url });
+  const employeeId = Number(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      'UPDATE employees SET photo_url = $1 WHERE id = $2 RETURNING photo_url',
+      [photoUrl, employeeId]
+    );
+    if (!result.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+    await client.query(
+      'UPDATE attendance.employees SET face_image = $1 WHERE payroll_employee_id = $2',
+      [req.file.filename, employeeId]
+    );
+    await client.query('COMMIT');
+    res.json({ photo_url: result.rows[0].photo_url });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 app.delete('/api/employees/:id/photo', requireAuth, validateIdParam, async (req, res) => {
-  const result = await pool.query(
-    `UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING photo_url`,
-    [req.params.id]
-  );
-  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
-  res.json({ photo_url: null });
+  const employeeId = Number(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING photo_url`,
+      [employeeId]
+    );
+    if (!result.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+    await client.query(
+      'UPDATE attendance.employees SET face_image = NULL WHERE payroll_employee_id = $1',
+      [employeeId]
+    );
+    await client.query('COMMIT');
+    res.json({ photo_url: null });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 app.put('/api/employees/:id/restore', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
-  const result = await pool.query(
-    'UPDATE employees SET active = true WHERE id = $1 RETURNING *',
-    [req.params.id]
-  );
-  if (!result.rowCount) return res.status(404).json({ error: 'Employee not found.' });
-  await logAudit(req.session.user.id, 'restore', 'employee', Number(req.params.id), {});
-  res.json(result.rows[0]);
+  const employeeId = Number(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      'UPDATE employees SET active = true WHERE id = $1 RETURNING *',
+      [employeeId]
+    );
+    if (!result.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+
+    // Only re-enable accounts that this archive action previously archived.
+    const mobileAccount = await client.query(
+      `UPDATE attendance.employees
+       SET status = 'approved'
+       WHERE payroll_employee_id = $1 AND status = 'archived'`,
+      [employeeId]
+    );
+    await client.query('COMMIT');
+    await logAudit(req.session.user.id, 'restore', 'employee', employeeId, {
+      mobile_account_restored: mobileAccount.rowCount > 0
+    });
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 app.delete('/api/employees/:id/permanent', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
   const empId = Number(req.params.id);
-  const existing = await pool.query('SELECT * FROM employees WHERE id = $1', [empId]);
-  if (!existing.rowCount) return res.status(404).json({ error: 'Employee not found.' });
-  const employee = existing.rows[0];
-  await pool.query('DELETE FROM payroll_statuses WHERE employee_id = $1', [empId]);
-  // attendance_logs & cash_advances are auto-deleted via ON DELETE CASCADE
-  await pool.query('DELETE FROM employees WHERE id = $1', [empId]);
-  await logAudit(req.session.user.id, 'permanent_delete', 'employee', empId, {
-    name: employee.name,
-    emp_number: employee.emp_number
-  });
-  res.json({ ok: true });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const existing = await client.query('SELECT * FROM employees WHERE id = $1', [empId]);
+    if (!existing.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+    const employee = existing.rows[0];
+
+    // The mobile account lives in a separate schema and has no foreign key to
+    // public.employees, so explicitly delete it before removing payroll data.
+    // Its attendance logs, device tokens, and reminders cascade from this row.
+    const mobileAccount = await client.query(
+      'DELETE FROM attendance.employees WHERE payroll_employee_id = $1 RETURNING employee_id',
+      [empId]
+    );
+    await client.query('DELETE FROM payroll_statuses WHERE employee_id = $1', [empId]);
+    // attendance_logs & cash_advances are auto-deleted via ON DELETE CASCADE
+    await client.query('DELETE FROM employees WHERE id = $1', [empId]);
+    await client.query('COMMIT');
+
+    await logAudit(req.session.user.id, 'permanent_delete', 'employee', empId, {
+      name: employee.name,
+      emp_number: employee.emp_number,
+      mobile_accounts_deleted: mobileAccount.rowCount
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/attendance', requireAuth, async (req, res) => {
@@ -1368,8 +1991,87 @@ app.get('/api/transactions/calendar', requireAuth, async (req, res) => {
   })});
 });
 
+/* ── Mobile (Flutter) attendance history mirror ─────────────────────────────
+   Admin web edits live in public.attendance_logs, while the employee's app
+   history is built from events in attendance.attendance.  These helpers keep
+   the two in sync so whatever the admin records also shows up in the app.
+   Payroll employees without a linked mobile account are skipped. */
+
+async function clearMobileAttendanceLog(executor, payrollEmployeeId, workDate) {
+  const mobile = await executor.query(
+    'SELECT employee_id FROM attendance.employees WHERE payroll_employee_id = $1',
+    [payrollEmployeeId]
+  );
+  if (!mobile.rowCount) return;
+  await executor.query(
+    `DELETE FROM attendance.attendance
+     WHERE employee_id = $1 AND DATE(timestamp) = $2::date`,
+    [mobile.rows[0].employee_id, workDate]
+  );
+}
+
+async function syncMobileAttendanceLog(executor, payrollEmployeeId, workDate, { timeIn = null, timeOut = null, rate = null } = {}) {
+  const mobile = await executor.query(
+    'SELECT employee_id FROM attendance.employees WHERE payroll_employee_id = $1',
+    [payrollEmployeeId]
+  );
+  if (!mobile.rowCount) return;
+  const mobileEmployeeId = mobile.rows[0].employee_id;
+
+  /* Replace whatever the app had for that date so admin edits stay authoritative. */
+  await executor.query(
+    `DELETE FROM attendance.attendance
+     WHERE employee_id = $1 AND DATE(timestamp) = $2::date`,
+    [mobileEmployeeId, workDate]
+  );
+
+  if (timeIn || timeOut) {
+    if (timeIn) {
+      await executor.query(
+        `INSERT INTO attendance.attendance (employee_id, type, rate_snapshot, timestamp)
+         VALUES ($1, 'present', $2, ($3::date + $4::time))`,
+        [mobileEmployeeId, rate, workDate, timeIn]
+      );
+    }
+    if (timeOut) {
+      await executor.query(
+        `INSERT INTO attendance.attendance (employee_id, type, rate_snapshot, timestamp)
+         VALUES ($1, 'time_out', $2, ($3::date + $4::time))`,
+        [mobileEmployeeId, rate, workDate, timeOut]
+      );
+    }
+  } else {
+    /* Presence-only mark (no clock times, e.g. bulk / mark-all): use the
+       current Manila time-of-day so the day still registers as Present. */
+    const timeNow = new Intl.DateTimeFormat('en-US', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false, timeZone: 'Asia/Manila',
+    }).format(new Date());
+    await executor.query(
+      `INSERT INTO attendance.attendance (employee_id, type, rate_snapshot, timestamp)
+       VALUES ($1, 'present', $2, ($3::date + $4::time))`,
+      [mobileEmployeeId, rate, workDate, timeNow]
+    );
+  }
+}
+
+/* Records that an admin removed an attendance day.  The employee app replays
+   offline-queued marks through /present; the guard in main.py uses this so a
+   deleted day is not resurrected by a stale offline replay. */
+async function tombstoneAttendanceDeletion(executor, payrollEmployeeId, workDate, deletedBy = null) {
+  const wd = databaseDateOnly(workDate);
+  await executor.query(
+    `INSERT INTO deleted_attendance_marks (employee_id, work_date, deleted_by)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (employee_id, work_date) DO NOTHING`,
+    [payrollEmployeeId, wd, deletedBy]
+  );
+}
+
 app.post('/api/attendance', requireAuth, async (req, res) => {
   const { employee_id, work_date, time_in = null, time_out = null, notes = '' } = req.body;
+  const timeRangeError = validateTimeRange(time_in, time_out);
+  if (timeRangeError) return res.status(400).json({ error: timeRangeError });
   const employee = await pool.query('SELECT rate FROM employees WHERE id = $1', [employee_id]);
   if (!employee.rowCount) return res.status(404).json({ error: 'Employee not found.' });
   if (await isDateLockedForEmployee(employee_id, work_date)) {
@@ -1387,20 +2089,50 @@ app.post('/api/attendance', requireAuth, async (req, res) => {
      RETURNING *`,
     [employee_id, work_date, time_in, time_out || null, employee.rows[0].rate, notes, req.session.user.id]
   );
+  await syncMobileAttendanceLog(pool, employee_id, work_date, {
+    timeIn: result.rows[0].time_in,
+    timeOut: result.rows[0].time_out,
+    rate: result.rows[0].rate_snapshot,
+  });
+  sendFcmToEmployee(employee_id, 'Attendance updated', 'Your attendance record was updated.', { type: 'attendance_updated', employee_id: String(employee_id) });
   res.status(201).json(result.rows[0]);
 });
 
 app.post('/api/attendance/bulk', requireAuth, async (req, res) => {
-  const { weekStart, employeeIds = [], present = [] } = req.body;
+  const { weekStart, employeeIds = [], present = [], deleteConfirmation, deleteReason } = req.body;
   const start = payrollWeekStartOf(weekStart || todayInManila());
   const end = addDays(start, 6);
   const presentSet = new Set(present.map(item => `${item.employee_id}:${item.work_date}`));
+  const existingRows = employeeIds.length
+    ? await pool.query(
+      `SELECT id, employee_id, work_date, to_char(work_date, 'YYYY-MM-DD') AS work_date_text, notes
+       FROM attendance_logs
+       WHERE employee_id = ANY($1) AND work_date BETWEEN $2 AND $3`,
+      [employeeIds, start, end]
+    )
+    : { rows: [] };
+  const recordsToDelete = existingRows.rows.filter(row =>
+    !presentSet.has(`${row.employee_id}:${row.work_date_text}`)
+  );
+  const bulkDeleteReason = String(deleteReason || '').trim();
+  if (recordsToDelete.length) {
+    if (req.session.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Only an admin can remove attendance records.' });
+    }
+    if (String(deleteConfirmation || '').trim().toUpperCase() !== 'DELETE') {
+      return res.status(400).json({ error: 'Type DELETE to confirm bulk attendance deletion.' });
+    }
+    if (!bulkDeleteReason || bulkDeleteReason.length > 500) {
+      return res.status(400).json({ error: 'A deletion reason of 500 characters or fewer is required.' });
+    }
+  }
   for (const employeeId of employeeIds) {
     if (await isDateLockedForEmployee(employeeId, start)) {
       return res.status(403).json({ error: `Cannot modify attendance: payroll period is locked for employee ${employeeId}. Unlock the payslip first.` });
     }
   }
   const client = await pool.connect();
+  const deletedRecords = [];
 
   try {
     await client.query('BEGIN');
@@ -1412,22 +2144,45 @@ app.post('/api/attendance/bulk', requireAuth, async (req, res) => {
         const workDate = addDays(start, day);
         const key = `${employeeId}:${workDate}`;
         if (presentSet.has(key)) {
-          await client.query(
+          const ins = await client.query(
             `INSERT INTO attendance_logs (employee_id, work_date, rate_snapshot, notes, created_by)
              VALUES ($1, $2, $3, 'Present', $4)
              ON CONFLICT (employee_id, work_date) DO NOTHING`,
             [employeeId, workDate, employee.rows[0].rate, req.session.user.id]
           );
+          /* Mirror newly-created records into the app history.  Days the
+             employee already marked from the app keep their real times. */
+          if (ins.rowCount > 0) {
+            await syncMobileAttendanceLog(client, employeeId, workDate, { rate: employee.rows[0].rate });
+          }
         } else {
-          await client.query(
+          const deleted = await client.query(
             `DELETE FROM attendance_logs
              WHERE employee_id = $1 AND work_date = $2 AND work_date BETWEEN $3 AND $4`,
             [employeeId, workDate, start, end]
           );
+          if (deleted.rowCount > 0) {
+            const rec = recordsToDelete.find(row =>
+              Number(row.employee_id) === Number(employeeId) && row.work_date_text === workDate
+            );
+            deletedRecords.push({ employeeId, workDate, notes: rec?.notes || '' });
+            await clearMobileAttendanceLog(client, employeeId, workDate);
+            await tombstoneAttendanceDeletion(client, employeeId, workDate, req.session.user.id);
+          }
         }
       }
     }
     await client.query('COMMIT');
+    for (const rec of deletedRecords) {
+      await logAudit(req.session.user.id, 'delete', 'attendance', null, {
+        employee_id: rec.employeeId,
+        work_date: rec.workDate,
+        notes: rec.notes,
+        source: /biometric|app/i.test(rec.notes) ? 'employee_app' : 'admin_web',
+        reason: bulkDeleteReason,
+        bulk: true
+      });
+    }
     res.json({ ok: true });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1448,12 +2203,15 @@ app.post('/api/attendance/mark-all', requireAuth, async (req, res) => {
       if (await isDateLockedForEmployee(employeeId, work_date)) continue;
       const emp = await client.query('SELECT rate FROM employees WHERE id = $1 AND active = true', [employeeId]);
       if (!emp.rowCount) continue;
-      await client.query(
+      const ins = await client.query(
         `INSERT INTO attendance_logs (employee_id, work_date, rate_snapshot, notes, created_by)
          VALUES ($1, $2, $3, 'Present', $4)
          ON CONFLICT (employee_id, work_date) DO NOTHING`,
         [employeeId, work_date, emp.rows[0].rate, req.session.user.id]
       );
+      if (ins.rowCount > 0) {
+        await syncMobileAttendanceLog(client, employeeId, work_date, { rate: emp.rows[0].rate });
+      }
       count++;
     }
     await client.query('COMMIT');
@@ -1468,9 +2226,20 @@ app.post('/api/attendance/mark-all', requireAuth, async (req, res) => {
 
 app.put('/api/attendance/:id', requireAuth, validateIdParam, async (req, res) => {
   const { work_date, time_in = null, time_out = null, notes = '' } = req.body;
-  const existing = await pool.query('SELECT employee_id, work_date FROM attendance_logs WHERE id = $1', [req.params.id]);
-  if (existing.rowCount && await isDateLockedForEmployee(existing.rows[0].employee_id, existing.rows[0].work_date)) {
-    return res.status(403).json({ error: 'Cannot modify: payroll period is locked. Unlock the payslip first.' });
+  const timeRangeError = validateTimeRange(time_in, time_out);
+  if (timeRangeError) return res.status(400).json({ error: timeRangeError });
+  const existing = await pool.query('SELECT employee_id, work_date, rate_snapshot FROM attendance_logs WHERE id = $1', [req.params.id]);
+  if (existing.rowCount) {
+    const employeeId = existing.rows[0].employee_id;
+    const oldWorkDate = databaseDateOnly(existing.rows[0].work_date);
+    if (await isDateLockedForEmployee(employeeId, oldWorkDate)) {
+      return res.status(403).json({ error: 'Cannot modify: the current payroll period is locked. Unlock the payslip first.' });
+    }
+    /* A record can be moved to another date. Check the destination too so a
+       generated period cannot be modified indirectly by moving attendance in. */
+    if (work_date && work_date !== oldWorkDate && await isDateLockedForEmployee(employeeId, work_date)) {
+      return res.status(403).json({ error: 'Cannot move attendance into a locked payroll period. Unlock the payslip first.' });
+    }
   }
   const result = await pool.query(
     `UPDATE attendance_logs
@@ -1480,18 +2249,59 @@ app.put('/api/attendance/:id', requireAuth, validateIdParam, async (req, res) =>
     [work_date, time_in, time_out || null, notes, req.params.id]
   );
   if (!result.rowCount) return res.status(404).json({ error: 'Attendance log not found.' });
+  /* If the record moved to a new date, clear the old date's mobile events. */
+  if (existing.rowCount) {
+    const oldDate = databaseDateOnly(existing.rows[0].work_date);
+    if (oldDate !== work_date) {
+      await clearMobileAttendanceLog(pool, existing.rows[0].employee_id, oldDate);
+      await tombstoneAttendanceDeletion(pool, existing.rows[0].employee_id, oldDate, req.session.user.id);
+    }
+  }
+  await syncMobileAttendanceLog(pool, existing.rows[0].employee_id, work_date, {
+    timeIn: result.rows[0].time_in,
+    timeOut: result.rows[0].time_out,
+    rate: result.rows[0].rate_snapshot,
+  });
+  sendFcmToEmployee(existing.rows[0].employee_id, 'Attendance updated', 'Your attendance record was updated.', { type: 'attendance_updated', employee_id: String(existing.rows[0].employee_id) });
   res.json(result.rows[0]);
 });
 
 app.delete('/api/attendance/:id', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
-  const existing = await pool.query('SELECT * FROM attendance_logs WHERE id = $1', [req.params.id]);
+  const { confirmation, reason } = req.body || {};
+  const deleteReason = String(reason || '').trim();
+  if (String(confirmation || '').trim().toUpperCase() !== 'DELETE') {
+    return res.status(400).json({ error: 'Type DELETE to confirm attendance deletion.' });
+  }
+  if (!deleteReason) {
+    return res.status(400).json({ error: 'A reason is required before deleting attendance.' });
+  }
+  if (deleteReason.length > 500) {
+    return res.status(400).json({ error: 'Deletion reason must be 500 characters or fewer.' });
+  }
+  /* Request the date as text from PostgreSQL. A DATE parsed as JavaScript Date
+     can cross a timezone boundary and target the previous Flutter calendar day. */
+  const existing = await pool.query(
+    `SELECT *, to_char(work_date, 'YYYY-MM-DD') AS work_date_text
+     FROM attendance_logs WHERE id = $1`,
+    [req.params.id]
+  );
   if (!existing.rowCount) return res.status(404).json({ error: 'Attendance record not found.' });
   const rec = existing.rows[0];
-  const weekOf = payrollWeekStartOf(rec.work_date);
-  if (await isWeekLocked(rec.employee_id, weekOf)) {
-    return res.status(403).json({ error: 'Cannot delete: payroll week is locked.' });
+  const workDate = rec.work_date_text;
+  if (await isDateLockedForEmployee(rec.employee_id, workDate)) {
+    return res.status(403).json({ error: 'Cannot delete: payroll period is locked.' });
   }
   await pool.query('DELETE FROM attendance_logs WHERE id = $1', [req.params.id]);
+  await clearMobileAttendanceLog(pool, rec.employee_id, workDate);
+  await tombstoneAttendanceDeletion(pool, rec.employee_id, workDate, req.session.user.id);
+  await logAudit(req.session.user.id, 'delete', 'attendance', rec.id, {
+    employee_id: rec.employee_id,
+    work_date: workDate,
+    notes: rec.notes || '',
+    source: /biometric|app/i.test(rec.notes || '') ? 'employee_app' : 'admin_web',
+    reason: deleteReason
+  });
+  sendFcmToEmployee(rec.employee_id, 'Attendance updated', 'Your attendance record was updated.', { type: 'attendance_updated', employee_id: String(rec.employee_id) });
   res.json({ ok: true });
 });
 
@@ -1504,6 +2314,7 @@ app.delete('/api/cash-advances/:id', requireAuth, requireAdmin, validateIdParam,
   }
   await pool.query('DELETE FROM cash_advances WHERE id = $1', [req.params.id]);
   await logAudit(req.session.user.id, 'delete', 'cash_advance', req.params.id, rec);
+  sendPayrollUpdatedPush(rec.employee_id, 'cash advance');
   res.json({ ok: true });
 });
 
@@ -1560,6 +2371,7 @@ app.post('/api/extra-payments', requireAuth, async (req, res) => {
     extra_date,
     notes
   });
+  sendExtraPayPush(employee_id, amount, extra_date);
   res.status(201).json(result.rows[0]);
 });
 
@@ -1585,6 +2397,7 @@ app.put('/api/extra-payments/:id', requireAuth, validateIdParam, async (req, res
     before: before.rows[0] || null,
     after: result.rows[0]
   });
+  sendExtraPayPush(employee_id, amount, extra_date);
   res.json(result.rows[0]);
 });
 
@@ -1597,6 +2410,7 @@ app.delete('/api/extra-payments/:id', requireAuth, requireAdmin, validateIdParam
   }
   await pool.query('DELETE FROM extra_payments WHERE id = $1', [req.params.id]);
   await logAudit(req.session.user.id, 'delete', 'extra_payment', req.params.id, rec);
+  sendExtraPayPush(rec.employee_id, rec.amount, rec.extra_date);
   res.json({ ok: true });
 });
 
@@ -1633,9 +2447,9 @@ app.post('/api/salary-payments', requireAuth, async (req, res) => {
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than zero.' });
   }
-  if (await isDateLockedForEmployee(employee_id, payment_date || todayInManila())) {
-    return res.status(403).json({ error: 'Cannot add salary payment: payroll period is locked. Unlock the payslip first.' });
-  }
+  /* Salary payments are recorded whenever the admin actually pays the employee,
+     so they are allowed even after the payslip is generated (locked). The
+     balance check below still prevents overpayment. */
   try {
     await assertPaymentWithinBalance(employee_id, payment_date || todayInManila(), amount, 'salary');
   } catch (err) {
@@ -1653,6 +2467,7 @@ app.post('/api/salary-payments', requireAuth, async (req, res) => {
     payment_date,
     notes
   });
+  sendSalaryPaidPush(employee_id, amount);
   res.status(201).json(result.rows[0]);
 });
 
@@ -1661,9 +2476,6 @@ app.put('/api/salary-payments/:id', requireAuth, validateIdParam, async (req, re
   if (!employee_id) return res.status(400).json({ error: 'Employee is required.' });
   if (amount === undefined || amount === '' || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than zero.' });
-  }
-  if (await isDateLockedForEmployee(employee_id, payment_date || todayInManila())) {
-    return res.status(403).json({ error: 'Cannot modify salary payment: payroll period is locked. Unlock the payslip first.' });
   }
   const before = await pool.query('SELECT * FROM salary_payments WHERE id = $1', [req.params.id]);
   if (!before.rowCount) return res.status(404).json({ error: 'Salary payment not found.' });
@@ -1680,6 +2492,7 @@ app.put('/api/salary-payments/:id', requireAuth, validateIdParam, async (req, re
     before: before.rows[0] || null,
     after: result.rows[0]
   });
+  sendSalaryPaidPush(employee_id, amount);
   res.json(result.rows[0]);
 });
 
@@ -1687,11 +2500,9 @@ app.delete('/api/salary-payments/:id', requireAuth, requireAdmin, validateIdPara
   const existing = await pool.query('SELECT * FROM salary_payments WHERE id = $1', [req.params.id]);
   if (!existing.rowCount) return res.status(404).json({ error: 'Salary payment not found.' });
   const rec = existing.rows[0];
-  if (await isDateLockedForEmployee(rec.employee_id, rec.payment_date)) {
-    return res.status(403).json({ error: 'Cannot delete: payroll week is locked.' });
-  }
   await pool.query('DELETE FROM salary_payments WHERE id = $1', [req.params.id]);
   await logAudit(req.session.user.id, 'delete', 'salary_payment', req.params.id, rec);
+  sendSalaryPaidPush(rec.employee_id, rec.amount);
   res.json({ ok: true });
 });
 
@@ -1748,6 +2559,7 @@ app.post('/api/bale-payments', requireAuth, async (req, res) => {
     payment_date,
     notes
   });
+  sendBalePaymentPush(employee_id, amount);
   res.status(201).json(result.rows[0]);
 });
 
@@ -1775,6 +2587,7 @@ app.put('/api/bale-payments/:id', requireAuth, validateIdParam, async (req, res)
     before: before.rows[0] || null,
     after: result.rows[0]
   });
+  sendBalePaymentPush(employee_id, amount);
   res.json(result.rows[0]);
 });
 
@@ -1787,6 +2600,7 @@ app.delete('/api/bale-payments/:id', requireAuth, requireAdmin, validateIdParam,
   }
   await pool.query('DELETE FROM bale_payments WHERE id = $1', [req.params.id]);
   await logAudit(req.session.user.id, 'delete', 'bale_payment', req.params.id, rec);
+  sendBalePaymentPush(rec.employee_id, rec.amount);
   res.json({ ok: true });
 });
 
@@ -1854,7 +2668,233 @@ app.post('/api/cash-advances', requireAuth, async (req, res) => {
     advance_date,
     notes
   });
+  sendPayrollUpdatedPush(employee_id, 'cash advance');
   res.status(201).json(result.rows[0]);
+});
+
+/* ── Cash advance requests (from the employee app) ── */
+app.get('/api/cash-advance-requests', requireAuth, async (req, res) => {
+  const status = req.query.status || '';
+  const search = req.query.search || '';
+  const params = [];
+  let where = '';
+  if (status) {
+    params.push(status);
+    where += ` AND r.status = $${params.length}`;
+  }
+  if (search) {
+    params.push(`%${search}%`);
+    where += ` AND (e.name ILIKE $${params.length} OR e.emp_number ILIKE $${params.length})`;
+  }
+  const result = await pool.query(
+    `SELECT r.id, r.employee_id, r.amount, r.reason, r.pickup_date, r.status,
+       to_char(r.created_at, 'YYYY-MM-DD HH24:MI:SS') AS requested_at,
+       to_char(r.reviewed_at, 'YYYY-MM-DD HH24:MI:SS') AS reviewed_at,
+       e.emp_number, e.name
+     FROM cash_advance_requests r
+     JOIN employees e ON e.id = r.employee_id
+     WHERE 1=1 ${where}
+     ORDER BY
+       CASE r.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+       r.created_at DESC`,
+    params
+  );
+  const counts = await pool.query(
+    `SELECT status, COUNT(*)::int AS count
+     FROM cash_advance_requests GROUP BY status`
+  );
+  const countMap = { pending: 0, approved: 0, rejected: 0 };
+  for (const row of counts.rows) countMap[row.status] = Number(row.count);
+  res.json({ rows: result.rows, counts: countMap });
+});
+
+app.post('/api/cash-advance-requests/:id/approve', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
+  const existing = await pool.query(
+    `SELECT r.*, e.name
+     FROM cash_advance_requests r
+     JOIN employees e ON e.id = r.employee_id
+     WHERE r.id = $1`,
+    [req.params.id]
+  );
+  if (!existing.rowCount) return res.status(404).json({ error: 'Cash advance request not found.' });
+  const rec = existing.rows[0];
+  if (rec.status !== 'pending') {
+    return res.status(409).json({ error: `Request is already ${rec.status}.` });
+  }
+  const advanceDate = todayInManila();
+  const duplicate = await pool.query(
+    'SELECT id FROM cash_advances WHERE employee_id = $1 AND advance_date = $2',
+    [rec.employee_id, advanceDate]
+  );
+  if (duplicate.rowCount) {
+    return res.status(409).json({ error: 'A cash advance already exists for this employee today.' });
+  }
+
+  const created = await pool.query(
+    `INSERT INTO cash_advances (employee_id, amount, advance_date, notes, created_by)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [rec.employee_id, rec.amount, advanceDate, rec.reason || 'Cash advance request (approved)', req.session.user.id]
+  );
+  await pool.query(
+    `UPDATE cash_advance_requests
+     SET status = 'approved', reviewed_by = $1, reviewed_at = NOW()
+     WHERE id = $2`,
+    [req.session.user.id, rec.id]
+  );
+  await logAudit(req.session.user.id, 'approve', 'cash_advance_request', rec.id, {
+    request_id: rec.id,
+    cash_advance_id: created.rows[0].id,
+    employee_id: rec.employee_id,
+    amount: rec.amount
+  });
+  await createNotification({ recipientType: 'employee', recipientId: rec.employee_id, type: 'cash_advance_approved',
+    title: 'Cash advance approved',
+    body: `Your cash advance request of ₱${Number(rec.amount).toFixed(2)} was approved.`,
+    data: { amount: rec.amount } });
+  sendFcmToEmployee(rec.employee_id, 'Cash advance approved', `Your cash advance request of ₱${Number(rec.amount).toFixed(2)} was approved.`, { type: 'cash_advance_approved', screen: 'payroll', employee_id: String(rec.employee_id) });
+  sendPayrollUpdatedPush(rec.employee_id, 'cash advance approved');
+  res.json({ ok: true, cash_advance: created.rows[0] });
+});
+
+app.post('/api/cash-advance-requests/:id/reject', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
+  const existing = await pool.query(
+    `SELECT r.*, e.name
+     FROM cash_advance_requests r
+     JOIN employees e ON e.id = r.employee_id
+     WHERE r.id = $1`,
+    [req.params.id]
+  );
+  if (!existing.rowCount) return res.status(404).json({ error: 'Cash advance request not found.' });
+  const rec = existing.rows[0];
+  if (rec.status !== 'pending') {
+    return res.status(409).json({ error: `Request is already ${rec.status}.` });
+  }
+  await pool.query(
+    `UPDATE cash_advance_requests
+     SET status = 'rejected', reviewed_by = $1, reviewed_at = NOW()
+     WHERE id = $2`,
+    [req.session.user.id, rec.id]
+  );
+  await logAudit(req.session.user.id, 'reject', 'cash_advance_request', rec.id, {
+    request_id: rec.id,
+    employee_id: rec.employee_id,
+    amount: rec.amount
+  });
+  await createNotification({ recipientType: 'employee', recipientId: rec.employee_id, type: 'cash_advance_rejected',
+    title: 'Cash advance rejected',
+    body: `Your cash advance request of ₱${Number(rec.amount).toFixed(2)} was declined.`,
+    data: { amount: rec.amount } });
+  sendFcmToEmployee(rec.employee_id, 'Cash advance rejected', `Your cash advance request of ₱${Number(rec.amount).toFixed(2)} was declined.`, { type: 'cash_advance_rejected', screen: 'payroll', employee_id: String(rec.employee_id) });
+  res.json({ ok: true });
+});
+
+/* ── Payslip requests (from the employee app) ── */
+app.get('/api/payslip-requests', requireAuth, async (req, res) => {
+  const clean = String(req.query.status || '').toLowerCase();
+  const where = clean && clean !== 'all' ? 'WHERE r.status = $1' : '';
+  const params = clean && clean !== 'all' ? [clean] : [];
+  const result = await pool.query(
+    `SELECT r.id, r.employee_id, r.attendance_employee_id, r.name, r.email,
+            to_char(r.period_start, 'YYYY-MM-DD') AS period_start,
+            to_char(r.period_end, 'YYYY-MM-DD') AS period_end,
+            r.status, r.notes, r.requested_at, r.reviewed_at,
+            e.emp_number
+     FROM payslip_requests r
+     LEFT JOIN employees e ON e.id = r.employee_id
+     ${where}
+     ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, r.requested_at DESC`,
+    params
+  );
+  const countsResult = await pool.query(
+    `SELECT status, COUNT(*)::int AS count FROM payslip_requests GROUP BY status`
+  );
+  const counts = { pending: 0, approved: 0, rejected: 0 };
+  for (const row of countsResult.rows) counts[row.status] = row.count;
+  res.json({ rows: result.rows, counts });
+});
+
+app.post('/api/payslip-requests/:id/approve', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
+  const existing = await pool.query(
+    `SELECT r.* FROM payslip_requests r WHERE r.id = $1`,
+    [req.params.id]
+  );
+  if (!existing.rowCount) return res.status(404).json({ error: 'Payslip request not found.' });
+  const rec = existing.rows[0];
+  if (rec.status !== 'pending') {
+    return res.status(409).json({ error: `Request is already ${rec.status}.` });
+  }
+  await pool.query(
+    `UPDATE payslip_requests SET status = 'approved', reviewed_by = $1, reviewed_at = NOW() WHERE id = $2`,
+    [req.session.user.id, rec.id]
+  );
+  await logAudit(req.session.user.id, 'approve', 'payslip_request', rec.id, {
+    request_id: rec.id, employee_id: rec.employee_id,
+    period_start: rec.period_start, period_end: rec.period_end
+  });
+
+  // Ask the attendance backend to build the payslip PDF and email it.
+  let emailSent = false;
+  try {
+    const attendancePort = Number(process.env.ATTENDANCE_PORT) || 8000;
+    const notifyUrl = `http://127.0.0.1:${attendancePort}/internal/payslip-email`;
+    const notifyRes = await fetch(notifyUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Secret': process.env.INTERNAL_NOTIFY_SECRET || '',
+      },
+      body: JSON.stringify({ request_id: rec.id }),
+      signal: AbortSignal.timeout(20000),
+    });
+    emailSent = notifyRes.ok;
+  } catch (err) {
+    console.error('[payslip] Failed to trigger payslip email:', err);
+  }
+
+  const targetId = rec.attendance_employee_id || String(rec.employee_id);
+  await createNotification({ recipientType: 'employee', recipientId: rec.employee_id, type: 'payslip_approved',
+    title: 'Payslip approved',
+    body: emailSent
+      ? `Your payslip for ${rec.period_start} to ${rec.period_end} was sent to ${rec.email}.`
+      : `Your payslip for ${rec.period_start} to ${rec.period_end} is ready (email pending configuration).`,
+    data: { period: rec.period_start, period_start: rec.period_start, period_end: rec.period_end } });
+  sendFcmToEmployee(targetId, 'Payslip approved',
+    emailSent
+      ? `Your payslip for ${rec.period_start} to ${rec.period_end} was sent to ${rec.email}.`
+      : `Your payslip for ${rec.period_start} to ${rec.period_end} is ready (email pending configuration).`,
+    { type: 'payslip_approved', screen: 'payroll', employee_id: targetId, period: rec.period_start });
+  sendPayrollUpdatedPush(targetId, 'payslip approved');
+  res.json({ ok: true, email_sent: emailSent });
+});
+
+app.post('/api/payslip-requests/:id/reject', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
+  const existing = await pool.query(
+    `SELECT r.* FROM payslip_requests r WHERE r.id = $1`,
+    [req.params.id]
+  );
+  if (!existing.rowCount) return res.status(404).json({ error: 'Payslip request not found.' });
+  const rec = existing.rows[0];
+  if (rec.status !== 'pending') {
+    return res.status(409).json({ error: `Request is already ${rec.status}.` });
+  }
+  await pool.query(
+    `UPDATE payslip_requests SET status = 'rejected', reviewed_by = $1, reviewed_at = NOW() WHERE id = $2`,
+    [req.session.user.id, rec.id]
+  );
+  await logAudit(req.session.user.id, 'reject', 'payslip_request', rec.id, {
+    request_id: rec.id, employee_id: rec.employee_id,
+    period_start: rec.period_start, period_end: rec.period_end
+  });
+  const targetId = rec.attendance_employee_id || String(rec.employee_id);
+  await createNotification({ recipientType: 'employee', recipientId: rec.employee_id, type: 'payslip_rejected',
+    title: 'Payslip request declined',
+    body: `Your payslip request for ${rec.period_start} to ${rec.period_end} was declined.`,
+    data: { period: rec.period_start, period_start: rec.period_start, period_end: rec.period_end } });
+  sendFcmToEmployee(targetId, 'Payslip request declined',
+    `Your payslip request for ${rec.period_start} to ${rec.period_end} was declined.`,
+    { type: 'payslip_rejected', screen: 'payroll', employee_id: targetId, period: rec.period_start });
+  res.json({ ok: true });
 });
 
 app.put('/api/cash-advances/:id', requireAuth, async (req, res) => {
@@ -1887,6 +2927,7 @@ app.put('/api/cash-advances/:id', requireAuth, async (req, res) => {
     before: before.rows[0] || null,
     after: result.rows[0]
   });
+  sendPayrollUpdatedPush(employee_id, 'cash advance');
   res.json(result.rows[0]);
 });
 
@@ -1943,11 +2984,21 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
        COALESCE(ad.cash_advance, 0)::numeric(12,2) AS cash_advance,
        COALESCE(a.gross_salary, 0)::numeric(12,2) AS gross_salary,
        COALESCE(a.gross_salary, 0)::numeric(12,2) AS salary,
-       (COALESCE(ps.paid_amount, 0) + COALESCE(sp.total_paid, 0))::numeric(12,2) AS salary_paid_amount,
+       (CASE
+          WHEN COALESCE(ps.paid_amount, 0) > 0
+           AND COALESCE(sp.total_paid, 0) >= COALESCE(a.gross_salary, 0) + COALESCE(ex.extra_total, 0)
+          THEN COALESCE(sp.total_paid, 0)
+          ELSE COALESCE(ps.paid_amount, 0) + COALESCE(sp.total_paid, 0)
+        END)::numeric(12,2) AS salary_paid_amount,
        COALESCE(ex.extra_total, 0)::numeric(12,2) AS extra_payment_amount,
        '' AS extra_payment_notes,
        COALESCE(ps.bale_deducted, false) AS bale_deducted,
-       (COALESCE(ps.paid_amount, 0) + COALESCE(sp.total_paid, 0))::numeric(12,2) AS paid_amount,
+       (CASE
+          WHEN COALESCE(ps.paid_amount, 0) > 0
+           AND COALESCE(sp.total_paid, 0) >= COALESCE(a.gross_salary, 0) + COALESCE(ex.extra_total, 0)
+          THEN COALESCE(sp.total_paid, 0)
+          ELSE COALESCE(ps.paid_amount, 0) + COALESCE(sp.total_paid, 0)
+        END)::numeric(12,2) AS paid_amount,
        COALESCE(ps.paid_amount, 0)::numeric(12,2) AS legacy_paid_amount,
        COALESCE(bp.bale_paid, 0)::numeric(12,2) AS bale_paid_amount,
        ps.paid_at,
@@ -1973,8 +3024,29 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
     [weekStart, weekEnd, search]
   );
 
-  const allEmployeeIds = result.rows.map(r => r.employee_id);
-  const carryoverMap = await getPayrollCarryoversBulk(allEmployeeIds, weekStart, getPeriodDays(result.rows[0]?.pay_period_days || 7));
+  /* Carry-overs must use each employee's own pay period. Grouping prevents a
+     weekly employee from being calculated with the first semi-monthly
+     employee's period (or vice versa). */
+  const carryoverGroups = new Map();
+  for (const row of result.rows) {
+    const employeePeriodDays = getPeriodDays(row.pay_period_days);
+    const employeePeriodStart = periodStartOf(weekStart, employeePeriodDays);
+    const key = `${employeePeriodDays}:${employeePeriodStart}`;
+    if (!carryoverGroups.has(key)) {
+      carryoverGroups.set(key, {
+        employeeIds: [],
+        periodDays: employeePeriodDays,
+        periodStart: employeePeriodStart
+      });
+    }
+    carryoverGroups.get(key).employeeIds.push(row.employee_id);
+  }
+  const carryoverMaps = await Promise.all(
+    [...carryoverGroups.values()].map(group =>
+      getPayrollCarryoversBulk(group.employeeIds, group.periodStart, group.periodDays)
+    )
+  );
+  const carryoverMap = new Map(carryoverMaps.flatMap(map => [...map.entries()]));
 
   const rows = result.rows.map(row => {
     const salary = money(row.salary);
@@ -2047,14 +3119,24 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
   );
 
   const reviewResult = await pool.query(
-    `SELECT r.accepted_at, r.accepted_by, u.username AS accepted_by_username
+    `SELECT r.accepted_at, r.accepted_by, u.username AS accepted_by_username,
+            r.submitted_at, su.username AS submitted_by_username
      FROM payroll_reviews r
      LEFT JOIN users u ON u.id = r.accepted_by
+     LEFT JOIN users su ON su.id = r.submitted_by
      WHERE r.period_key = $1`,
     [weekStart]
   );
   const review = reviewResult.rowCount
-    ? { accepted: true, accepted_at: reviewResult.rows[0].accepted_at, accepted_by: reviewResult.rows[0].accepted_by, accepted_by_username: reviewResult.rows[0].accepted_by_username }
+    ? {
+        accepted: true,
+        accepted_at: reviewResult.rows[0].accepted_at,
+        accepted_by: reviewResult.rows[0].accepted_by,
+        accepted_by_username: reviewResult.rows[0].accepted_by_username,
+        submitted: !!reviewResult.rows[0].submitted_at,
+        submitted_at: reviewResult.rows[0].submitted_at,
+        submitted_by_username: reviewResult.rows[0].submitted_by_username
+      }
     : { accepted: false };
 
   res.json({
@@ -2077,20 +3159,185 @@ app.get('/api/payroll', requireAuth, async (req, res) => {
   });
 });
 
-/* Accept a payroll period after review — required before Bulk Print. */
+/* Dashboard analytics: weekly salary trend over the last N periods. */
+app.get('/api/payroll/trend', requireAuth, async (req, res) => {
+  const periodDays = getPeriodDays(req.query.periodDays);
+  const weeks = Math.min(Math.max(parseInt(req.query.weeks) || 8, 2), 16);
+  const endWeek = periodStartOf(todayInManila(), periodDays);
+  const startWeek = addDays(endWeek, -(weeks - 1) * periodDays);
+  const rangeEnd = addDays(endWeek, periodDays - 1);
+
+  const [attendanceResult, paidResult, baleResult] = await Promise.all([
+    pool.query(
+      `SELECT to_char(work_date, 'YYYY-MM-DD') AS work_date, rate_snapshot
+       FROM attendance_logs
+       WHERE work_date BETWEEN $1 AND $2`,
+      [startWeek, rangeEnd]
+    ),
+    pool.query(
+      `SELECT to_char(payment_date, 'YYYY-MM-DD') AS payment_date, amount
+       FROM salary_payments
+       WHERE payment_date BETWEEN $1 AND $2`,
+      [startWeek, rangeEnd]
+    ),
+    pool.query(
+      `SELECT to_char(advance_date, 'YYYY-MM-DD') AS advance_date, amount
+       FROM cash_advances
+       WHERE advance_date BETWEEN $1 AND $2`,
+      [startWeek, rangeEnd]
+    )
+  ]);
+
+  const buckets = [];
+  for (let i = 0; i < weeks; i++) {
+    const weekStart = addDays(startWeek, i * periodDays);
+    const weekEnd = addDays(weekStart, periodDays - 1);
+    buckets.push({ weekStart, weekEnd, days: 0, salary: 0, paid: 0, bale: 0 });
+  }
+
+  const bucketFor = (dateStr, field) => {
+    const idx = buckets.findIndex(b => dateStr >= b.weekStart && dateStr <= b.weekEnd);
+    return idx >= 0 ? buckets[idx] : null;
+  };
+
+  attendanceResult.rows.forEach(row => {
+    const b = bucketFor(row.work_date);
+    if (b) { b.days += 1; b.salary += money(row.rate_snapshot); }
+  });
+  paidResult.rows.forEach(row => {
+    const b = bucketFor(row.payment_date);
+    if (b) b.paid += money(row.amount);
+  });
+  baleResult.rows.forEach(row => {
+    const b = bucketFor(row.advance_date);
+    if (b) b.bale += money(row.amount);
+  });
+
+  res.json({
+    periodDays,
+    rows: buckets.map(b => ({
+      weekStart: b.weekStart,
+      weekEnd: b.weekEnd,
+      days: b.days,
+      salary: Math.round(b.salary * 100) / 100,
+      paid: Math.round(b.paid * 100) / 100,
+      bale: Math.round(b.bale * 100) / 100
+    }))
+  });
+});
+
+/* HR/Admin: submit the fully generated payroll for admin review. */
+app.post('/api/payroll/submit-review', requireAuth, async (req, res) => {
+  const periodDays = getPeriodDays(req.body.periodDays);
+  const weekStart = req.body.week
+    ? payrollWeekStartOf(req.body.week)
+    : periodStartOf(todayInManila(), periodDays);
+  const counts = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM employees WHERE active)::int AS total,
+            (SELECT COUNT(*) FROM payroll_statuses WHERE week_start = $1 AND status = 'generated')::int AS generated`,
+    [weekStart]
+  );
+  const { total, generated } = counts.rows[0];
+  if (generated < total) {
+    return res.status(400).json({ error: `Submit for review requires every payslip to be generated (${generated}/${total}).` });
+  }
+  await pool.query(
+    `INSERT INTO payroll_reviews (period_key, period_days, submitted_by, submitted_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (period_key) DO UPDATE SET submitted_by = $3, submitted_at = NOW()`,
+    [weekStart, periodDays, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'submit_review', 'payroll', null, { period_key: weekStart, period_days: periodDays });
+  /* Notify connected admin panels (bell + toast) that the payroll is ready to review. */
+  notifyDataChanged({
+    event: 'payroll_submitted',
+    period_key: weekStart,
+    period_days: periodDays,
+    submitted_by: req.session.user.username || 'HR'
+  });
+  res.json({ ok: true, submitted: true, period_key: weekStart });
+});
+
+/* Accept a payroll period after review. Accepting releases payment for every
+   generated payslip at once (auto-pay) and notifies all employees with the
+   period breakdown. It is also required before Bulk Print. */
 app.post('/api/payroll/review', requireAuth, requireAdmin, async (req, res) => {
   const periodDays = getPeriodDays(req.body.periodDays);
   const weekStart = req.body.week
     ? payrollWeekStartOf(req.body.week)
     : periodStartOf(todayInManila(), periodDays);
-  await pool.query(
-    `INSERT INTO payroll_reviews (period_key, period_days, accepted_by)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (period_key) DO UPDATE SET accepted_at = NOW(), accepted_by = $3`,
-    [weekStart, periodDays, req.session.user.id]
-  );
-  await logAudit(req.session.user.id, 'review_accept', 'payroll', null, { period_key: weekStart, period_days: periodDays });
-  res.json({ ok: true, accepted: true, period_key: weekStart });
+  const weekEnd = addDays(weekStart, periodDays - 1);
+
+  const client = await pool.connect();
+  let autoPaidCount = 0;
+  let autoPaidTotal = 0;
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO payroll_reviews (period_key, period_days, accepted_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (period_key) DO UPDATE SET accepted_at = NOW(), accepted_by = $3`,
+      [weekStart, periodDays, req.session.user.id]
+    );
+
+    /* Release payment for every generated payslip in the period (only if no
+       manual salary payment already exists), so the boss only reviews once. */
+    const generated = await client.query(
+      `SELECT ps.employee_id,
+              COALESCE(att.salary, 0)::numeric(12,2) AS salary,
+              COALESCE(ep.extra_total, 0)::numeric(12,2) AS extra_pay,
+              EXISTS(SELECT 1 FROM salary_payments sp
+                     WHERE sp.employee_id = ps.employee_id
+                       AND sp.payment_date BETWEEN $1 AND $2) AS has_salary
+       FROM payroll_statuses ps
+       LEFT JOIN (SELECT employee_id, SUM(rate_snapshot)::numeric(12,2) AS salary
+                  FROM attendance_logs WHERE work_date BETWEEN $1 AND $2 GROUP BY employee_id) att
+         ON att.employee_id = ps.employee_id
+       LEFT JOIN (SELECT employee_id, SUM(amount)::numeric(12,2) AS extra_total
+                  FROM extra_payments WHERE extra_date BETWEEN $1 AND $2 GROUP BY employee_id) ep
+         ON ep.employee_id = ps.employee_id
+       WHERE ps.week_start = $3 AND ps.status = 'generated'`,
+      [weekStart, weekEnd, weekStart]
+    );
+    for (const emp of generated.rows) {
+      const totalEarnings = money(Number(emp.salary) + Number(emp.extra_pay));
+      if (totalEarnings > 0 && !emp.has_salary) {
+        await client.query(
+          `INSERT INTO salary_payments (employee_id, amount, payment_date, notes, created_by)
+           VALUES ($1, $2, $3, 'Auto-paid via payroll acceptance', $4)`,
+          [emp.employee_id, totalEarnings, weekEnd, req.session.user.id]
+        );
+        autoPaidCount++;
+        autoPaidTotal += totalEarnings;
+      }
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  await logAudit(req.session.user.id, 'review_accept', 'payroll', null, {
+    period_key: weekStart, period_days: periodDays,
+    auto_paid: autoPaidCount, auto_paid_amount: autoPaidTotal
+  });
+  /* Fan-out: every approved employee gets the accepted-payroll notification at
+     once, with the period key so the app can open the exact breakdown. */
+  await createNotification({
+    recipientType: 'all-employees', type: 'payroll_accepted',
+    title: 'Payroll accepted',
+    body: `Your payroll for ${weekStart} to ${weekEnd} was accepted and paid by the admin. Check your Payroll tab.`,
+    data: { period: weekStart, week_start: weekStart, week_end: weekEnd }
+  });
+  await sendFcmBroadcast('Payroll accepted',
+    `Your payroll for ${weekStart} to ${weekEnd} was accepted and paid by the admin. Check your Payroll tab.`,
+    { type: 'payroll_accepted', screen: 'payroll', period: weekStart });
+  notifyDataChanged({ event: 'payroll_accepted', period_key: weekStart, period_days: periodDays });
+  res.json({ ok: true, accepted: true, period_key: weekStart, auto_paid: autoPaidCount });
 });
 
 /* Generating a payslip finalizes this employee's selected payroll period. */
@@ -2098,12 +3345,11 @@ app.post('/api/payroll/:employeeId/generate', requireAuth, async (req, res) => {
   const employeeId = Number(req.params.employeeId);
   const employee = await pool.query('SELECT pay_period_days FROM employees WHERE id = $1', [employeeId]);
   if (!employee.rowCount) return res.status(404).json({ error: 'Employee not found.' });
-  const periodDays = getPeriodDays(req.body.payPeriodDays || employee.rows[0].pay_period_days);
+  /* The payslip always follows the employee's own pay-period setting so the
+     global view (Weekly/Semi-monthly) never silently rewrites employee config. */
+  const periodDays = getPeriodDays(employee.rows[0].pay_period_days);
   const weekStart = periodStartOf(req.body.weekStart || todayInManila(), periodDays);
   const weekEnd = addDays(weekStart, periodDays - 1);
-  if (periodDays !== getPeriodDays(employee.rows[0].pay_period_days)) {
-    await pool.query('UPDATE employees SET pay_period_days = $1 WHERE id = $2', [periodDays, employeeId]);
-  }
   const hasData = await pool.query(
     `SELECT EXISTS(SELECT 1 FROM attendance_logs WHERE employee_id = $1 AND work_date BETWEEN $2 AND $3) AS has_attendance,
             EXISTS(SELECT 1 FROM salary_payments WHERE employee_id = $1 AND payment_date BETWEEN $2 AND $3) AS has_salary,
@@ -2117,37 +3363,12 @@ app.post('/api/payroll/:employeeId/generate', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Cannot generate payslip: no attendance or transactions found for this period.' });
   }
 
-  /* Calculate salary based on attendance × rate + extra pay */
-  const earningsResult = await pool.query(
-    `SELECT COALESCE(SUM(al.rate_snapshot), 0)::numeric(12,2) AS salary,
-            COALESCE(MAX(ep.extra_total), 0)::numeric(12,2) AS extra_pay
-     FROM (SELECT $1::int AS employee_id) e
-     LEFT JOIN attendance_logs al ON al.employee_id = e.employee_id AND al.work_date BETWEEN $2 AND $3
-     LEFT JOIN (
-       SELECT employee_id, SUM(amount)::numeric(12,2) AS extra_total
-       FROM extra_payments
-       WHERE employee_id = $1 AND extra_date BETWEEN $2 AND $3
-       GROUP BY employee_id
-     ) ep ON ep.employee_id = e.employee_id`,
-    [employeeId, weekStart, weekEnd]
-  );
-  const salaryAmount = money(earningsResult.rows[0]?.salary || 0);
-  const extraAmount = money(earningsResult.rows[0]?.extra_pay || 0);
-  const totalEarnings = salaryAmount + extraAmount;
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    if (totalEarnings > 0 && !d.has_salary) {
-      /* Auto-insert salary payment for earnings (only if none exists) */
-      await client.query(
-        `INSERT INTO salary_payments (employee_id, amount, payment_date, notes, created_by)
-         VALUES ($1, $2, $3, 'Auto-paid via payslip generation', $4)`,
-        [employeeId, totalEarnings, weekEnd, req.session.user.id]
-      );
-    }
-
+    /* Generating a payslip locks the period for review. Payment is released
+       later when the admin accepts the payroll (see /api/payroll/review). */
     const result = await client.query(
       `INSERT INTO payroll_statuses (employee_id, week_start, status, updated_by, updated_at)
        VALUES ($1, $2, 'generated', $3, NOW())
@@ -2158,7 +3379,14 @@ app.post('/api/payroll/:employeeId/generate', requireAuth, async (req, res) => {
     );
 
     await client.query('COMMIT');
-    await logAudit(req.session.user.id, 'generate', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart, auto_paid: totalEarnings });
+    await logAudit(req.session.user.id, 'generate', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart });
+    await createNotification({ recipientType: 'employee', recipientId: employeeId, type: 'payslip_ready',
+      title: 'Payslip ready for review',
+      body: `Your payslip for ${weekStart} to ${weekEnd} is ready. It will be paid once the admin accepts the payroll.`,
+      data: { period: weekStart, week_start: weekStart, week_end: weekEnd } });
+    sendFcmToEmployee(employeeId, 'Payslip ready for review',
+      `Your payslip for ${weekStart} to ${weekEnd} is ready. Check your Payroll tab.`,
+      { type: 'payslip_ready', screen: 'payroll', employee_id: String(employeeId), period: weekStart });
     res.json(result.rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -2192,6 +3420,11 @@ app.post('/api/payroll/:employeeId/unlock', requireAuth, async (req, res) => {
     if (!result.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Generated payslip not found.' }); }
     await client.query('COMMIT');
     await logAudit(req.session.user.id, 'unlock', 'payslip', result.rows[0].id, { employee_id: employeeId, week_start: weekStart });
+    await createNotification({ recipientType: 'employee', recipientId: employeeId, type: 'payslip_unlocked',
+      title: 'Payslip unlocked',
+      body: `Your payslip for ${weekStart} to ${weekEnd} was unlocked by the admin.`,
+      data: { period: weekStart, week_start: weekStart, week_end: weekEnd } });
+    sendPayrollUpdatedPush(employeeId, 'payslip unlocked');
     res.json(result.rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -2281,7 +3514,7 @@ app.put('/api/payroll/payment', requireAuth, async (req, res) => {
     week_start: start,
     paid_amount
   });
-
+  sendPayrollUpdatedPush(employee_id, 'salary paid');
   res.json(result.rows[0]);
 });
 
@@ -2308,6 +3541,7 @@ app.delete('/api/payroll/payment', requireAuth, requireAdmin, async (req, res) =
     employee_id,
     week_start: start
   });
+  sendPayrollUpdatedPush(employee_id, 'payment removed');
   res.json(result.rows[0] || { ok: true });
 });
 
@@ -2367,6 +3601,31 @@ app.get('/api/audit-logs', requireAuth, requireAdmin, async (req, res) => {
   res.json({ rows: result.rows, total, page: safePage, totalPages });
 });
 
+app.get('/api/announcements', requireAuth, async (req, res) => {
+  const result = await pool.query(
+    `SELECT id, title, message, to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at
+     FROM announcements ORDER BY created_at DESC LIMIT 20`
+  );
+  res.json({ rows: result.rows });
+});
+
+app.post('/api/announcements', requireAuth, requireAdmin, async (req, res) => {
+  const cleanTitle = String(req.body.title || '').trim();
+  const cleanMessage = String(req.body.message || '').trim();
+  if (!cleanTitle || !cleanMessage) {
+    return res.status(400).json({ error: 'Title and message are required.' });
+  }
+  if (cleanTitle.length > 160) return res.status(400).json({ error: 'Title is too long (max 160 characters).' });
+  if (cleanMessage.length > 2000) return res.status(400).json({ error: 'Message is too long (max 2000 characters).' });
+  const result = await pool.query(
+    `INSERT INTO announcements (title, message, created_by) VALUES ($1, $2, $3) RETURNING *`,
+    [cleanTitle, cleanMessage, req.session.user.id]
+  );
+  await logAudit(req.session.user.id, 'create', 'announcement', result.rows[0].id, { title: cleanTitle });
+  const sent = await sendFcmBroadcast(cleanTitle, cleanMessage, { type: 'announcement', screen: 'dashboard' });
+  res.status(201).json({ ...result.rows[0], sent });
+});
+
 app.put('/api/password', requireAuth, async (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password) {
@@ -2411,7 +3670,7 @@ app.get('/api/registrations', requireAuth, async (req, res) => {
   const result = await pool.query(
     `SELECT id, employee_id, name, first_name, last_name, email, phone, face_image,
             sss_number, philhealth_number, pagibig_number, tin_number,
-            status, admin_notes, registered_at, approved_at, payroll_employee_id
+            status, admin_notes, registered_at, approved_at, payroll_employee_id, device_id
      FROM attendance.employees
      WHERE ${where} AND (name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR employee_id ILIKE $1
             OR sss_number ILIKE $1 OR philhealth_number ILIKE $1 OR pagibig_number ILIKE $1 OR tin_number ILIKE $1)
@@ -2443,10 +3702,15 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
   }
   const periodDays = Math.max(1, Math.floor(Number(pay_period_days) || 7));
 
-  const phone = String(reg.phone || '').trim();
-  if (!/^[0-9]{11}$/.test(phone)) {
+  let phone = String(reg.phone || '').trim();
+  let digits = phone.replace(/\D/g, '');
+  if (digits.startsWith('63') && digits.length > 11) digits = digits.slice(2);
+  if (digits.length === 10 && digits.startsWith('9')) digits = '0' + digits;
+  phone = digits;
+  if (!/^0[0-9]{10}$/.test(phone)) {
     return res.status(400).json({ error: 'Registration phone must be exactly 11 digits (numbers only).' });
   }
+  const email = String(reg.email || '').trim();
   let linkExisting = null;
   if (reg.payroll_employee_id) {
     const payrollLink = await pool.query('SELECT id, name FROM employees WHERE id = $1', [reg.payroll_employee_id]);
@@ -2457,7 +3721,6 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
     if (phoneCheck.rowCount > 0) {
       linkExisting = phoneCheck.rows[0];
     } else {
-      const email = String(reg.email || '').trim();
       if (email) {
         const emailCheck = await pool.query('SELECT id, name FROM employees WHERE LOWER(email) = LOWER($1)', [email]);
         if (emailCheck.rowCount > 0) linkExisting = emailCheck.rows[0];
@@ -2478,9 +3741,10 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
       await client.query(
         `UPDATE employees
          SET rate = $1, pay_period_days = $2,
-             photo_url = CASE WHEN photo_url IS NULL OR photo_url = '' THEN $3 ELSE photo_url END
-         WHERE id = $4`,
-        [Number(rate), periodDays, photoUrl, payrollEmployeeId]
+             email = CASE WHEN $3 <> '' THEN $3 ELSE email END,
+             photo_url = CASE WHEN photo_url IS NULL OR photo_url = '' THEN $4 ELSE photo_url END
+         WHERE id = $5`,
+        [Number(rate), periodDays, email, photoUrl, payrollEmployeeId]
       );
     } else {
       const empNumber = await client.query(
@@ -2502,13 +3766,13 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
         }
       }
       const govSql = govCols.length ? `, ${govCols.join(', ')}` : '';
-      const govPlaceholders = govCols.length ? `, ${govCols.map((_, i) => `$${9 + i}`).join(', ')}` : '';
+      const govPlaceholders = govCols.length ? `, ${govCols.map((_, i) => `$${10 + i}`).join(', ')}` : '';
 
       const empInsert = await client.query(
-        `INSERT INTO employees (emp_number, first_name, last_name, name, phone, rate, pay_period_days, active, photo_url${govSql})
-         VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8${govPlaceholders})
+        `INSERT INTO employees (emp_number, first_name, last_name, name, phone, email, rate, pay_period_days, active, photo_url${govSql})
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9${govPlaceholders})
          RETURNING id`,
-        [empNumber.rows[0].emp_number, first, last, name, phone, Number(rate), periodDays, photoUrl, ...govVals]
+        [empNumber.rows[0].emp_number, first, last, name, phone, email, Number(rate), periodDays, photoUrl, ...govVals]
       );
       payrollEmployeeId = empInsert.rows[0].id;
     }
@@ -2516,7 +3780,7 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
     const newEmpId = await client.query(
       `SELECT (
          'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-' ||
-         LPAD((COALESCE(MAX(NULLIF(split_part(employee_id, '-', 4), '')::int), 0) + 1)::text, 4, '0')
+         LPAD((COALESCE(MAX(NULLIF(split_part(employee_id, '-', 3), '')::int), 0) + 1)::text, 4, '0')
        ) AS emp_id
        FROM attendance.employees
        WHERE employee_id LIKE 'EMP-' || EXTRACT(YEAR FROM CURRENT_DATE)::int || '-%'`
@@ -2553,14 +3817,41 @@ app.post('/api/registrations/:id/approve', requireAuth, validateIdParam, async (
 
 app.post('/api/registrations/:id/reject', requireAuth, validateIdParam, async (req, res) => {
   const notes = String(req.body.notes || '').trim().slice(0, 300);
-  const result = await pool.query(
-    `UPDATE attendance.employees SET status = 'rejected', admin_notes = $1
-     WHERE id = $2 AND status IN ('pending', 'review') RETURNING id`,
-    [notes, req.params.id]
+  const existing = await pool.query(
+    `SELECT id, name, email, phone FROM attendance.employees
+     WHERE id = $1 AND status IN ('pending', 'review')`,
+    [req.params.id]
   );
-  if (!result.rowCount) return res.status(404).json({ error: 'Registration not found or already reviewed.' });
-  await logAudit(req.session.user.id, 'reject', 'registration', Number(req.params.id), { notes });
-  res.json({ ok: true });
+  if (!existing.rowCount) return res.status(404).json({ error: 'Registration not found or already reviewed.' });
+  const reg = existing.rows[0];
+  await pool.query(`DELETE FROM attendance.employees WHERE id = $1`, [req.params.id]);
+  await logAudit(req.session.user.id, 'reject', 'registration', Number(req.params.id), {
+    notes,
+    name: reg.name,
+    email: reg.email,
+    phone: reg.phone,
+    deleted: true
+  });
+  res.json({ ok: true, deleted: true });
+});
+
+app.post('/api/registrations/:id/reset-device', requireAuth, requireAdmin, validateIdParam, async (req, res) => {
+  // Recovery path for the device binding: clears the bound device so the
+  // employee can sign in from their new phone (or from another phone).
+  const existing = await pool.query(
+    `SELECT id, name, employee_id FROM attendance.employees
+     WHERE id = $1 AND status = 'approved'`,
+    [req.params.id]
+  );
+  if (!existing.rowCount) return res.status(404).json({ error: 'Approved registration not found.' });
+  const reg = existing.rows[0];
+  await pool.query(`UPDATE attendance.employees SET device_id = '' WHERE id = $1`, [req.params.id]);
+  await logAudit(req.session.user.id, 'reset-device', 'registration', Number(req.params.id), {
+    name: reg.name,
+    employee_id: reg.employee_id || null,
+    note: 'Device binding cleared so the employee can sign in from a new device.'
+  });
+  res.json({ ok: true, name: reg.name });
 });
 
 app.get('/api/health', async (req, res) => {
@@ -2570,6 +3861,45 @@ app.get('/api/health', async (req, res) => {
   } catch (err) {
     res.status(503).json({ status: 'error', db: 'disconnected' });
   }
+});
+
+/* ── Realtime event stream: admin panels refresh only when data changes ── */
+app.get('/api/events', requireAuth, (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+  res.write('retry: 3000\n\n');
+  sseClients.add(res);
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch (_) {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    }
+  }, 25000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
+});
+
+/* ── Internal webhook for the attendance backend to notify the admin panel ── */
+app.post('/internal/notify', (req, res) => {
+  const secret = process.env.INTERNAL_NOTIFY_SECRET || '';
+  const provided = req.headers['x-notify-secret'] || '';
+  const remote = req.socket.remoteAddress || '';
+  const fromLocal = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  if (secret ? provided !== secret : !fromLocal) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  const { type = 'data_changed', source = 'attendance' } = req.body || {};
+  notifyDataChanged({ ...(req.body || {}), type, source });
+  res.json({ ok: true });
 });
 
 app.use((req, res) => {
@@ -2587,6 +3917,9 @@ initDatabase()
       console.log(`Payroll system running at http://localhost:${PORT}`);
     });
     ensureAttendanceBackend();
+    // Start the watchdog only after the initial spawn attempt, so the first
+    // tick cannot race a slow initial backend boot (avoid duplicate spawns).
+    scheduleAttendanceWatchdog();
   })
   .catch(error => {
     console.error('Failed to start app:', error);
@@ -2614,9 +3947,23 @@ function attendancePortInUse() {
   });
 }
 
+/* Health check: does the attendance backend actually respond? A process that
+   is alive but hung (port bound, no replies) must also be restarted, otherwise
+   the Flutter app still sees silent failures. */
+function attendanceBackendHealthy() {
+  return new Promise((resolve) => {
+    const req = http.get(
+      { host: '127.0.0.1', port: ATTENDANCE_PORT, path: '/status', timeout: 2000 },
+      (res) => { res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 500); }
+    );
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+
 function spawnAttendanceBackend(pythonCmd) {
   const backendDir = path.join(__dirname, 'attendance_system', 'backend');
-  const child = spawn(pythonCmd, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', String(ATTENDANCE_PORT)], {
+  const child = spawn(pythonCmd, ['-m', 'uvicorn', 'main:app', '--host', '0.0.0.0', '--port', String(ATTENDANCE_PORT)], {
     cwd: backendDir,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -2663,6 +4010,25 @@ function stopAttendanceBackend() {
   }
 }
 
+/* Watchdog: if the attendance backend dies (crash, kill, manual stop), the
+   admin panel keeps serving but the Flutter app loses all attendance + push
+   features. Auto-restart it every 30s so 'nothing appears in Flutter'
+   problems never linger. Only one restarter runs at a time. */
+let attendanceRestarting = false;
+const ATTENDANCE_WATCHDOG_MS = Number(process.env.ATTENDANCE_WATCHDOG_MS || 30000);
+function scheduleAttendanceWatchdog() {
+  setInterval(async () => {
+    if (!ATTENDANCE_BACKEND_AUTOSTART || attendanceRestarting) return;
+    // Healthy check also covers a hung-but-listening backend.
+    if (await attendanceBackendHealthy()) return;
+    attendanceRestarting = true;
+    console.log('[attendance] Backend not responding - restarting...');
+    spawnAttendanceBackend(ATTENDANCE_PYTHON_CANDIDATES[0]);
+    // Give the child a moment to bind, then clear the flag so the next tick
+    // can restart again if it failed.
+    setTimeout(() => { attendanceRestarting = false; }, 5000);
+  }, ATTENDANCE_WATCHDOG_MS);
+}
 process.on('exit', stopAttendanceBackend);
 process.on('SIGINT', () => { stopAttendanceBackend(); process.exit(0); });
 process.on('SIGTERM', () => { stopAttendanceBackend(); process.exit(0); });

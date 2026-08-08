@@ -51,6 +51,27 @@ CREATE TABLE IF NOT EXISTS cash_advances (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS cash_advance_requests (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+  reason TEXT NOT NULL DEFAULT '',
+  pickup_date DATE,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS deleted_attendance_marks (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  work_date DATE NOT NULL,
+  deleted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (employee_id, work_date)
+);
+
 CREATE TABLE IF NOT EXISTS payroll_statuses (
   id SERIAL PRIMARY KEY,
   employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
@@ -87,6 +108,8 @@ CREATE TABLE IF NOT EXISTS extra_payments (
 
 CREATE INDEX IF NOT EXISTS idx_attendance_logs_work_date ON attendance_logs(work_date);
 CREATE INDEX IF NOT EXISTS idx_cash_advances_date ON cash_advances(advance_date);
+CREATE INDEX IF NOT EXISTS idx_cash_advance_requests_status ON cash_advance_requests(status);
+CREATE INDEX IF NOT EXISTS idx_cash_advance_requests_employee ON cash_advance_requests(employee_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_sss_unique ON employees(sss_number) WHERE sss_number != '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_philhealth_unique ON employees(philhealth_number) WHERE philhealth_number != '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_pagibig_unique ON employees(pagibig_number) WHERE pagibig_number != '';
@@ -95,3 +118,22 @@ CREATE INDEX IF NOT EXISTS idx_employees_name ON employees(name);
 CREATE INDEX IF NOT EXISTS idx_payroll_statuses_week ON payroll_statuses(week_start);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity, entity_id);
 CREATE INDEX IF NOT EXISTS idx_extra_payments_date ON extra_payments(extra_date);
+ALTER TABLE cash_advance_requests ADD COLUMN IF NOT EXISTS pickup_date DATE;
+
+CREATE TABLE IF NOT EXISTS payslip_requests (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  attendance_employee_id VARCHAR(50),
+  name VARCHAR(255) NOT NULL DEFAULT '',
+  email VARCHAR(255) NOT NULL DEFAULT '',
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  notes TEXT DEFAULT '',
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_payslip_requests_status ON payslip_requests(status);
+CREATE INDEX IF NOT EXISTS idx_payslip_requests_employee ON payslip_requests(employee_id);
+

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:firebase_core/firebase_core.dart';
@@ -66,6 +67,25 @@ class PushNotificationService {
   static String _employeeToken = '';
   static PushNotificationStatus _status = const PushNotificationStatus.initial();
 
+  /// Emits a navigation request when a push notification deep-link is tapped,
+  /// e.g. the payload requests opening the attendance screen.
+  static final ValueNotifier<String?> deepLinkNotifier = ValueNotifier<String?>(null);
+
+  /// Carries the payroll period (week start) to highlight when a push asks to
+  /// open the payroll section. Cleared after it is consumed.
+  static final ValueNotifier<String?> deepLinkPeriodNotifier = ValueNotifier<String?>(null);
+
+  static void clearDeepLinkPeriod() {
+    deepLinkPeriodNotifier.value = null;
+  }
+
+  /// Invoked when a push arrives with fresh data while the app is in the
+  /// foreground, so the dashboard can refresh without the old 20s polling.
+  /// The [type] is the push payload type (e.g. present, payroll_updated).
+  static void Function(String type)? onDataRefresh;
+
+  static bool _listening = false;
+
   static const String _firebaseApiKey = String.fromEnvironment(
     'FIREBASE_API_KEY',
     defaultValue: 'AIzaSyBd2lBlpsVeo-uodqHIHsGIGyQnN-HPHHc',
@@ -124,6 +144,8 @@ class PushNotificationService {
       FirebaseMessaging.instance.onTokenRefresh.listen((token) {
         _sendTokenToBackend(token);
       });
+      _setupListeners();
+      unawaited(_handleInitialMessage());
       _initialized = true;
       _status = _status.copyWith(
         configured: true,
@@ -214,5 +236,57 @@ class PushNotificationService {
   static Future<void> clearEmployee() async {
     _employeeToken = '';
     _status = const PushNotificationStatus.initial();
+  }
+
+  static void _setupListeners() {
+    if (_listening) return;
+    _listening = true;
+    FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
+    FirebaseMessaging.onMessageOpenedApp.listen(_handleOpen);
+  }
+
+  static Future<void> _handleInitialMessage() async {
+    final message = await FirebaseMessaging.instance.getInitialMessage();
+    if (message != null) {
+      _handleOpen(message);
+    }
+  }
+
+  static void _handleOpen(RemoteMessage message) {
+    final screen = message.data['screen']?.toString() ?? '';
+    if (screen == 'attendance') {
+      deepLinkNotifier.value = 'attendance';
+    } else if (screen == 'payroll') {
+      deepLinkNotifier.value = 'payroll';
+      final period = message.data['period']?.toString() ?? '';
+      deepLinkPeriodNotifier.value = period.isEmpty ? null : period;
+    } else if (screen == 'dashboard') {
+      deepLinkNotifier.value = 'notifications';
+    }
+  }
+
+  static void _handleForegroundMessage(RemoteMessage message) {
+    final type = message.data['type']?.toString() ?? '';
+    if (type == 'present' ||
+        type == 'time_out' ||
+        type == 'attendance_updated' ||
+        type == 'payroll_updated' ||
+        type == 'cash_advance_approved' ||
+        type == 'cash_advance_rejected' ||
+        type == 'profile_change_approved' ||
+        type == 'profile_change_rejected' ||
+        type == 'announcement' ||
+        type == 'payslip_ready' ||
+        type == 'payslip_unlocked' ||
+        type == 'payslip_approved' ||
+        type == 'payslip_rejected' ||
+        type == 'payroll_accepted' ||
+        type == 'salary_paid' ||
+        type == 'bale_payment' ||
+        type == 'extra_pay_added' ||
+        type == 'payday_reminder' ||
+        type == 'ca_overdue_reminder') {
+      onDataRefresh?.call(type);
+    }
   }
 }

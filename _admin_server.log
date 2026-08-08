@@ -1,0 +1,51 @@
+◇ injected env (0) from .env // tip: ⌁ auth for agents [www.vestauth.com]
+Payroll system running at http://localhost:3001
+[attendance] Starting backend on port 8000...
+[attendance] INFO:     Started server process [12748]
+[attendance] INFO:     Waiting for application startup.
+[attendance] INFO:     Application startup complete.
+[attendance] INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[attendance] INFO:     192.168.1.3:49672 - "GET /status HTTP/1.1" 200 OK
+[attendance] INFO:     192.168.1.3:40642 - "GET /status HTTP/1.1" 200 OK
+[attendance] INFO:     192.168.1.3:55068 - "GET /employee/payroll/periods HTTP/1.1" 200 OK
+[attendance] INFO:     192.168.1.3:55076 - "GET /employee/payslip/periods HTTP/1.1" 200 OK
+[attendance] INFO:     192.168.1.3:55090 - "GET /employee/payslip/requests HTTP/1.1" 200 OK
+[attendance] INFO:     192.168.1.3:55100 - "GET /employee/logs HTTP/1.1" 200 OK
+[attendance] INFO:     127.0.0.1:2554 - "GET /status HTTP/1.1" 200 OK
+[attendance] INFO:     192.168.1.3:55114 - "GET /status HTTP/1.1" 200 OK
+Unhandled error: error: duplicate key value violates unique constraint "employees_employee_id_key"
+    at C:\Users\ASUS\Desktop\Payroll\node_modules\pg\lib\client.js:652:17
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async C:\Users\ASUS\Desktop\Payroll\server.js:3507:5 {
+  length: 239,
+  severity: 'ERROR',
+  code: '23505',
+  detail: 'Key (employee_id)=(EMP-2026-0001) already exists.',
+  hint: undefined,
+  position: undefined,
+  internalPosition: undefined,
+  internalQuery: undefined,
+  where: undefined,
+  schema: 'attendance',
+  table: 'employees',
+  column: undefined,
+  dataType: undefined,
+  constraint: 'employees_employee_id_key',
+  file: 'nbtinsert.c',
+  line: '673',
+  routine: '_bt_check_unique'
+}
+[attendance] INFO:     192.168.1.3:47128 - "GET /status HTTP/1.1" 200 OK
+C:\Users\ASUS\Desktop\Payroll\server.js:3672
+    const req = http.get(
+                ^
+
+ReferenceError: http is not defined
+    at C:\Users\ASUS\Desktop\Payroll\server.js:3672:17
+    at new Promise (<anonymous>)
+    at attendanceBackendHealthy (C:\Users\ASUS\Desktop\Payroll\server.js:3671:10)
+    at Timeout._onTimeout (C:\Users\ASUS\Desktop\Payroll\server.js:3740:15)
+    at listOnTimeout (node:internal/timers:605:17)
+    at process.processTimers (node:internal/timers:541:7)
+
+Node.js v24.14.1

@@ -274,10 +274,11 @@ function exportCSV(data, filename) {
   showToast('CSV exported successfully.');
 }
 
-function deleteButton(resource, id) {
+function deleteButton(resource, id, opts = {}) {
   if (state.user.role !== 'admin') return '';
   const label = resource === 'employees' ? 'Archive' : 'Delete';
-  return `<button class="danger" data-delete-resource="${resource}" data-delete-id="${id}">${label}</button>`;
+  const appMarked = opts.appMarked ? ' data-app-marked="1"' : '';
+  return `<button class="danger" data-delete-resource="${resource}" data-delete-id="${id}"${appMarked}>${label}</button>`;
 }
 
 function passwordToggleIcon(isVisible = false) {
@@ -306,7 +307,38 @@ function bindDeletes() {
     button.addEventListener('click', async () => {
       state.pendingDelete = {
         resource: button.dataset.deleteResource,
-        id: button.dataset.deleteId
+        id: button.dataset.deleteId,
+        appMarked: button.dataset.appMarked === '1'
+      };
+      reRenderCurrentView();
+    });
+  });
+}
+
+function shortTime(value) {
+  if (!value) return '';
+  return String(value).slice(0, 5);
+}
+
+function editAttendanceButton(row) {
+  if (state.user.role !== 'admin') return '';
+  return `<button class="ghost" data-edit-attendance="${row.id}"
+    data-employee="${escapeHtml(row.name)}"
+    data-work-date="${row.work_date}"
+    data-time-in="${shortTime(row.time_in)}"
+    data-time-out="${shortTime(row.time_out)}"
+    title="Edit time in / time out">✎ Edit</button>`;
+}
+
+function bindAttendanceEditButtons() {
+  document.querySelectorAll('[data-edit-attendance]').forEach(button => {
+    button.addEventListener('click', async () => {
+      state.editingAttendance = {
+        id: button.dataset.editAttendance,
+        employee: button.dataset.employee,
+        workDate: button.dataset.workDate,
+        timeIn: button.dataset.timeIn || '',
+        timeOut: button.dataset.timeOut || ''
       };
       reRenderCurrentView();
     });

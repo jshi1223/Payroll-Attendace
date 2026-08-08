@@ -5,19 +5,26 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:local_auth/local_auth.dart';
+import 'package:provider/provider.dart';
 
 import '../constants.dart';
 import '../services/api_client.dart';
+import '../services/app_locale.dart';
+import '../services/app_lock_service.dart';
+import '../services/device_identity.dart';
+import '../services/offline_queue.dart';
 import '../services/push_notification_service.dart';
+import '../services/session_store.dart';
 import '../utils/api_errors.dart';
-import 'attendance_screen.dart';
 import '../widgets/brand_logo.dart';
+import '../widgets/empty_state.dart';
+import 'face_photo_crop_screen.dart';
+import 'employee_notifications_screen.dart';
 
 enum EmployeeSection {
   dashboard,
   attendanceLogs,
   payroll,
-  rawLogs,
   profile,
 }
 
@@ -30,12 +37,9 @@ class EmployeeLoginScreen extends StatefulWidget {
 
 class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     with WidgetsBindingObserver {
-  static const Duration _presentDayMinimum = Duration(hours: 8);
-
   final _loginFormKey = GlobalKey<FormState>();
   final _emailCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
-  final _logSearchCtrl = TextEditingController();
 
   final LocalAuthentication _localAuth = LocalAuthentication();
   final ImagePicker _imagePicker = ImagePicker();
@@ -46,8 +50,21 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
   bool _isPasswordHidden = true;
   bool _isPhotoUploading = false;
   bool _isVerifyingBiometrics = false;
+  bool _isAttendancePromptOpen = false;
+  bool _isMarkingPresent = false;
+  bool _isMarkingTimeout = false;
+  EmployeeSession? _pendingSession;
+  bool _hasSavedSession = false;
   bool _hasBiometrics = false;
-  String _logSearchQuery = '';
+  bool _isRestoringSession = false;
+  bool _needsAppUnlock = false;
+  bool _isSyncingQueue = false;
+  bool _isPayrollPeriodLoading = false;
+  bool _isPickingPhoto = false;
+  bool _passwordUnlockMode = false;
+  bool _isUnlockingWithPassword = false;
+  final _unlockPasswordCtrl = TextEditingController();
+  int _queuedCount = 0;
   String _dashboardStatFilter = 'month';
 
   String _statusMsg = '';
@@ -58,56 +75,141 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
   String _email = '';
   String _phone = '';
   String _governmentId = '';
+  String _sssNumber = '';
+  String _philhealthNumber = '';
+  String _pagibigNumber = '';
+  String _tinNumber = '';
   String _status = '';
   String _photoUrl = '';
-  PushNotificationStatus _pushStatus = PushNotificationService.status;
   EmployeeSection _selectedSection = EmployeeSection.dashboard;
   DateTime _calendarMonth = DateTime(DateTime.now().year, DateTime.now().month);
   DateTime _selectedCalendarDate = DateTime.now();
   DateTime _lastDashboardRefreshAt = DateTime.now();
-  Timer? _dashboardRefreshTimer;
   Timer? _dashboardClockTimer;
+  Timer? _pushRefreshDebounce;
+  String? _lastPushType;
 
   List<dynamic> _groupedLogs = const [];
-  List<dynamic> _rawLogs = const [];
-  List<dynamic> _payrollTotals = const [];
-  List<dynamic> _payrollRows = const [];
-  Map<String, dynamic> _payrollSummary = const {};
+  Map<String, dynamic> _dailyFinancials = const {};
+  List<dynamic> _caRequests = const [];
+  bool _caRequestsLoading = false;
+  bool _caRequestSubmitting = false;
+  int? _caCancelRequestId;
+  List<Map<String, dynamic>> _breakdownPeriods = const [];
+  int _paidPeriodIndex = 0;
+  String _periodTypeLabel = '';
+  List<Map<String, dynamic>> _payslipPeriods = const [];
+  List<dynamic> _payslipRequests = const [];
+  bool _isPayslipLoading = false;
+  bool _isPayslipSubmitting = false;
+  int _notifCount = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _checkBiometrics();
+    PushNotificationService.onDataRefresh = _handlePushRefresh;
+    PushNotificationService.deepLinkNotifier.addListener(_handleDeepLink);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _refreshQueuedCount();
+      _restoreSession();
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _dashboardRefreshTimer?.cancel();
+    PushNotificationService.onDataRefresh = null;
+    PushNotificationService.deepLinkNotifier.removeListener(_handleDeepLink);
     _dashboardClockTimer?.cancel();
+    _pushRefreshDebounce?.cancel();
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
-    _logSearchCtrl.dispose();
+    _unlockPasswordCtrl.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _isSignedIn && _token.isNotEmpty) {
-      _loadLogs();
+    if (state == AppLifecycleState.resumed) {
+      if (_isSignedIn && _token.isNotEmpty) {
+        final lock = context.read<AppLockService>();
+        if (lock.enabled && lock.locked) {
+          if (mounted) setState(() => _needsAppUnlock = true);
+        } else {
+          if (mounted && _needsAppUnlock) setState(() => _needsAppUnlock = false);
+          _loadLogs();
+        }
+      }
+      _syncOfflineQueue(silent: true);
+    } else if (state == AppLifecycleState.paused) {
+      if (_isSignedIn && _token.isNotEmpty) {
+        final lock = context.read<AppLockService>();
+        // Do not lock while a system flow is on screen: the attendance
+        // fingerprint prompt, a biometrics verification prompt, or the
+        // camera / photo picker all trigger a pause/resume cycle that must
+        // not lock the app behind them.
+        if (lock.enabled &&
+            !_isAttendancePromptOpen &&
+            !_isVerifyingBiometrics &&
+            !_isPickingPhoto) {
+          lock.lock();
+          if (mounted) setState(() => _needsAppUnlock = true);
+        }
+      }
+    }
+  }
+
+  void _handlePushRefresh(String type) {
+    if (!mounted || !_isSignedIn || _token.isEmpty) return;
+    // Coalesce bursts of pushes (e.g. several payroll edits in a row) into a
+    // single refresh so the backend is not hammered.
+    _lastPushType = type;
+    _pushRefreshDebounce?.cancel();
+    _pushRefreshDebounce = Timer(const Duration(milliseconds: 400), () {
+      if (mounted && _isSignedIn && _token.isNotEmpty) {
+        if (_lastPushType == 'payroll_updated' ||
+            _lastPushType == 'cash_advance_approved' ||
+            _lastPushType == 'cash_advance_rejected' ||
+            _lastPushType == 'payslip_approved' ||
+            _lastPushType == 'payslip_rejected' ||
+            _lastPushType == 'payroll_accepted' ||
+            _lastPushType == 'payslip_ready' ||
+            _lastPushType == 'payslip_unlocked' ||
+            _lastPushType == 'salary_paid' ||
+            _lastPushType == 'bale_payment' ||
+            _lastPushType == 'extra_pay_added') {
+          _loadPayrollPeriods();
+          _loadPayslipRequests();
+        }
+        _loadNotifications();
+        _loadCashAdvanceRequests();
+        _loadLogs();
+      }
+    });
+  }
+
+  void _handleDeepLink() {
+    final target = PushNotificationService.deepLinkNotifier.value;
+    final period = PushNotificationService.deepLinkPeriodNotifier.value;
+    if (!mounted || !_isSignedIn) return;
+    if (target == 'attendance') {
+      setState(() => _selectedSection = EmployeeSection.attendanceLogs);
+    } else if (target == 'payroll') {
+      _openPayrollSection(period: period);
+      PushNotificationService.clearDeepLinkPeriod();
+    } else if (target == 'notifications') {
+      _openNotifications();
     }
   }
 
   void _startDashboardRefreshTimer() {
-    _dashboardRefreshTimer?.cancel();
+    // No auto-refresh: dashboard and payroll data only load on demand
+    // (login, pull-to-refresh, or the refresh button) so payroll numbers
+    // never change underneath the employee.
     _dashboardClockTimer?.cancel();
     if (!_isSignedIn || _token.isEmpty) return;
-    _dashboardRefreshTimer = Timer.periodic(const Duration(seconds: 20), (_) {
-      if (mounted && _isSignedIn && _token.isNotEmpty) {
-        _loadLogs();
-      }
-    });
     _dashboardClockTimer = Timer.periodic(const Duration(minutes: 1), (_) {
       if (mounted && _isSignedIn) setState(() {});
     });
@@ -118,27 +220,947 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
   }
 
   Future<void> _checkBiometrics() async {
-    bool available = false;
+    bool enrolled = false;
     try {
-      available = await _localAuth.canCheckBiometrics;
-      final isSupported = await _localAuth.isDeviceSupported();
-      available = available && isSupported;
+      if (!await _localAuth.isDeviceSupported()) {
+        enrolled = false;
+      } else {
+        final enrolledList = await _localAuth.getAvailableBiometrics();
+        enrolled = enrolledList.isNotEmpty;
+      }
     } catch (_) {
-      available = false;
+      enrolled = false;
     }
-    if (mounted) setState(() => _hasBiometrics = available);
+    if (mounted) setState(() => _hasBiometrics = enrolled);
   }
+
+  Future<void> _restoreSession() async {
+    if (_isRestoringSession || _isSignedIn) return;
+    _isRestoringSession = true;
+    try {
+      final session = await SessionStore.load();
+      if (session == null || !mounted) return;
+      // Validate the saved token with the server so an expired or revoked
+      // session is cleared up-front instead of failing after a successful
+      // fingerprint scan. Offline devices keep the session optimistically.
+      final invalidReason = await _validateSavedSession(session);
+      if (!mounted) return;
+      if (invalidReason != null) {
+        await SessionStore.clear();
+        if (!mounted) return;
+        final signedInElsewhere = invalidReason == 'device';
+        setState(() {
+          _pendingSession = null;
+          _hasSavedSession = false;
+          _statusMsg = context.tr(
+            signedInElsewhere
+                ? 'You signed in on another device. Please sign in again.'
+                : 'Your saved session has expired. Please sign in with your password.',
+            signedInElsewhere
+                ? 'Nag-sign in ka sa ibang device. Mangyaring mag-sign in muli.'
+                : 'Nag-expire na ang iyong naka-save na session. Mangyaring mag-sign in gamit ang iyong password.',
+          );
+        });
+        return;
+      }
+      // Do NOT auto-login. Remember the saved session only so the login
+      // screen can offer "Login with Fingerprint" as a quick option.
+      setState(() {
+        _pendingSession = session;
+        _hasSavedSession = true;
+      });
+    } finally {
+      _isRestoringSession = false;
+    }
+  }
+
+  /// Returns null when the saved token can still be used. Otherwise returns a
+  /// short reason code ('device' when another device signed in, 'expired'
+  /// otherwise) explaining why the saved session is no longer valid. Any
+  /// non-auth response — endpoint not deployed yet (404), server error (5xx),
+  /// or being offline — keeps the session so the "Login with Fingerprint"
+  /// option never disappears unexpectedly.
+  Future<String?> _validateSavedSession(EmployeeSession session) async {
+    try {
+      final res = await ApiClient.get(
+        '/employee/session',
+        headers: {'Authorization': 'Bearer ${session.token}'},
+        timeout: const Duration(seconds: 8),
+      );
+      if (!ApiClient.isAuthExpiredStatus(res.statusCode)) return null;
+      return res.body.toLowerCase().contains('another device')
+          ? 'device'
+          : 'expired';
+    } catch (_) {
+      // Offline — keep the session optimistically.
+      return null;
+    }
+  }
+
+  Future<void> _loginWithBiometrics() async {
+    final session = _pendingSession;
+    if (session == null || _isLoading || _isVerifyingBiometrics || !_hasBiometrics) {
+      return;
+    }
+    setState(() => _isVerifyingBiometrics = true);
+    bool verified = false;
+    try {
+      verified = await _localAuth.authenticate(
+        localizedReason: 'Verify your fingerprint to sign in.',
+        options: const AuthenticationOptions(
+          biometricOnly: true,
+          stickyAuth: false,
+        ),
+      );
+    } catch (_) {
+      verified = false;
+    }
+    if (!mounted) return;
+    setState(() => _isVerifyingBiometrics = false);
+    if (!verified) {
+      _showProfileSnack(
+        context.tr(
+          'Fingerprint verification failed or cancelled.',
+          'Hindi nakumpirma ang fingerprint o nakansela.',
+        ),
+        error: true,
+      );
+      return;
+    }
+    // Re-validate the saved session with the server before applying it. This
+    // prevents the "login with fingerprint then instantly logged out" case
+    // when the saved token expired or the account was archived.
+    final invalidReason = await _validateSavedSession(session);
+    if (!mounted) return;
+    if (invalidReason != null) {
+      await SessionStore.clear();
+      if (!mounted) return;
+      final signedInElsewhere = invalidReason == 'device';
+      setState(() {
+        _pendingSession = null;
+        _hasSavedSession = false;
+      });
+      _showProfileSnack(
+        context.tr(
+          signedInElsewhere
+              ? 'You signed in on another device. Please sign in again.'
+              : 'Your saved session has expired. Please sign in with your password.',
+          signedInElsewhere
+              ? 'Nag-sign in ka sa ibang device. Mangyaring mag-sign in muli.'
+              : 'Nag-expire na ang iyong naka-save na session. Mangyaring mag-sign in gamit ang iyong password.',
+        ),
+        error: true,
+      );
+      return;
+    }
+    _applySession(session);
+    context.read<AppLockService>().markUnlocked();
+    unawaited(_registerPushNotifications());
+    await _loadLogs();
+    _startDashboardRefreshTimer();
+    await _syncOfflineQueue(silent: true);
+  }
+
+  void _applySession(EmployeeSession session) {
+    setState(() {
+      _isSignedIn = true;
+      _needsAppUnlock = false;
+      _token = session.token;
+      _name = session.name;
+      _employeeId = session.employeeId;
+      _email = session.email;
+      _phone = session.phone;
+      _governmentId = session.governmentId;
+      _sssNumber = session.sssNumber;
+      _philhealthNumber = session.philhealthNumber;
+      _pagibigNumber = session.pagibigNumber;
+      _tinNumber = session.tinNumber;
+      _status = session.status;
+      _photoUrl = session.photoUrl;
+      // Remember the session so "Login with Fingerprint" is available again
+      // after logging out — not just on a fresh app start.
+      _pendingSession = session;
+      _hasSavedSession = true;
+    });
+  }
+
+  Future<void> _unlockApp() async {
+    if (_isVerifyingBiometrics) return;
+    setState(() => _isVerifyingBiometrics = true);
+    final ok = await context.read<AppLockService>().unlock();
+    if (!mounted) return;
+    setState(() {
+      _isVerifyingBiometrics = false;
+      if (ok) _needsAppUnlock = false;
+    });
+    if (ok) {
+      unawaited(_registerPushNotifications());
+      await _loadLogs();
+      _startDashboardRefreshTimer();
+    } else {
+      _showProfileSnack('Fingerprint required to open the app.', error: true);
+    }
+  }
+
+  /// Password fallback for the App Locked gate. Lets the employee unlock the
+  /// app with their password when the fingerprint is unavailable or fails.
+  Future<void> _unlockWithPassword() async {
+    if (_isUnlockingWithPassword) return;
+    final password = _unlockPasswordCtrl.text;
+    if (password.isEmpty) {
+      _showProfileSnack('Enter your password to unlock.', error: true);
+      return;
+    }
+    if (_email.isEmpty) {
+      // No email on file — fall back to logout so the login screen is shown.
+      await _logout();
+      return;
+    }
+    setState(() => _isUnlockingWithPassword = true);
+    try {
+      final res = await ApiClient.postForm(
+        '/employee/login',
+        body: {'email': _email, 'password': password},
+      );
+      if (!mounted) return;
+      final body = json.decode(res.body);
+      if (res.statusCode == 200 && body is Map<String, dynamic>) {
+        final freshToken = body['token']?.toString() ?? '';
+        context.read<AppLockService>().markUnlocked();
+        if (!mounted) return;
+        setState(() {
+          if (freshToken.isNotEmpty) _token = freshToken;
+          _isUnlockingWithPassword = false;
+          _needsAppUnlock = false;
+          _passwordUnlockMode = false;
+          _unlockPasswordCtrl.clear();
+        });
+        await _saveSession();
+        unawaited(_registerPushNotifications());
+        await _loadLogs();
+        _startDashboardRefreshTimer();
+      } else {
+        if (!mounted) return;
+        setState(() => _isUnlockingWithPassword = false);
+        _showProfileSnack(
+          body is Map<String, dynamic>
+              ? serverMessageFromBody(res.body, fallback: 'Incorrect password.')
+              : 'Incorrect password.',
+          error: true,
+        );
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _isUnlockingWithPassword = false);
+      _showProfileSnack(ApiClient.friendlyNetworkError(error), error: true);
+    }
+  }
+
+  Future<void> _saveSession() async {
+    await SessionStore.save(
+      EmployeeSession(
+        token: _token,
+        name: _name,
+        employeeId: _employeeId,
+        email: _email,
+        phone: _phone,
+        governmentId: _governmentId,
+        sssNumber: _sssNumber,
+        philhealthNumber: _philhealthNumber,
+        pagibigNumber: _pagibigNumber,
+        tinNumber: _tinNumber,
+        status: _status,
+        photoUrl: _photoUrl,
+      ),
+    );
+  }
+
+  Future<void> _refreshQueuedCount() async {
+    final count = await OfflineAttendanceQueue.length();
+    if (mounted) setState(() => _queuedCount = count);
+  }
+
+  Future<void> _syncOfflineQueue({bool silent = false}) async {
+    if (_token.isEmpty || _isSyncingQueue) return;
+    _isSyncingQueue = true;
+    try {
+      final result = await OfflineSyncService.syncAll();
+      if (!mounted) return;
+      final remaining = await OfflineAttendanceQueue.length();
+      setState(() => _queuedCount = remaining);
+      if (result.synced > 0) {
+        await _loadLogs();
+        if (!silent) {
+          _showProfileSnack(
+            'Synced ${result.synced} offline ${result.synced == 1 ? 'record' : 'records'}.',
+            error: false,
+          );
+        }
+      }
+    } finally {
+      _isSyncingQueue = false;
+    }
+  }
+
+  Future<void> _handleDashboardRefresh() async {
+    await _syncOfflineQueue(silent: true);
+    await _loadLogs();
+    await _refreshQueuedCount();
+  }
+
+  Future<void> _handleLogsRefresh() async {
+    await _loadLogs();
+    await _refreshQueuedCount();
+  }
+
+  Future<void> _openPayrollSection({String? period}) async {
+    setState(() => _selectedSection = EmployeeSection.payroll);
+    _loadPayslipRequests();
+    await _loadPayrollPeriods();
+    if (!mounted || period == null || period.isEmpty) return;
+    final index = _breakdownPeriods.indexWhere((p) {
+      return (p['period_key']?.toString() ?? '') == period ||
+          (p['start_date']?.toString() ?? '') == period;
+    });
+    if (index >= 0) {
+      setState(() => _paidPeriodIndex = index);
+    }
+  }
+
+  Future<void> _loadNotifications() async {
+    if (_token.isEmpty || !mounted) return;
+    try {
+      final res = await ApiClient.get(
+        '/employee/notifications',
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      if (!mounted || res.statusCode != 200) return;
+      final body = ApiClient.jsonObject(res.body);
+      final unread = body?['unread'];
+      if (mounted) {
+        setState(() => _notifCount = unread is int ? unread : 0);
+      }
+    } catch (_) {
+      // silent: the bell simply keeps its last known count
+    }
+  }
+
+  void _openNotifications() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => EmployeeNotificationsScreen(
+          token: _token,
+          onOpenPayroll: (period) => _openPayrollSection(period: period),
+          onChanged: _loadNotifications,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _loadPayrollPeriods() async {
+    if (_token.isEmpty) return;
+    setState(() => _isPayrollPeriodLoading = true);
+    try {
+      final res = await ApiClient.get(
+        '/employee/payroll/periods',
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      if (!mounted) return;
+      final body = ApiClient.jsonObject(res.body);
+      if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
+        final detail = body?['detail']?.toString().toLowerCase() ?? '';
+        _expireSession(
+          detail.contains('archiv')
+              ? 'Your account was archived by the administrator.'
+              : ApiClient.authMessage,
+          res.body,
+        );
+        return;
+      }
+      setState(() {
+        final all = <Map<String, dynamic>>[];
+        if (res.statusCode == 200 && body != null) {
+          final list = body['periods'];
+          if (list is List) {
+            for (final entry in list) {
+              if (entry is Map) all.add(Map<String, dynamic>.from(entry));
+            }
+          }
+          _periodTypeLabel = body['period_type']?.toString() ?? '';
+        } else {
+          _periodTypeLabel = '';
+        }
+        _breakdownPeriods = all
+            .where((p) {
+              final s = p['payment_status']?.toString() ?? '';
+              return s == 'paid' || s == 'generated';
+            })
+            .toList();
+        if (_paidPeriodIndex >= _breakdownPeriods.length) {
+          _paidPeriodIndex = _breakdownPeriods.isEmpty ? 0 : _breakdownPeriods.length - 1;
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _breakdownPeriods = const [];
+          _periodTypeLabel = '';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _isPayrollPeriodLoading = false);
+    }
+  }
+
+  Future<void> _loadPayslipRequests() async {
+    if (_token.isEmpty) return;
+    if (mounted) setState(() => _isPayslipLoading = true);
+    try {
+      final periodsRes = await ApiClient.get(
+        '/employee/payslip/periods',
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      final requestsRes = await ApiClient.get(
+        '/employee/payslip/requests',
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      if (!mounted) return;
+      final periodsBody = ApiClient.jsonObject(periodsRes.body);
+      final requestsBody = ApiClient.jsonObject(requestsRes.body);
+      if (ApiClient.isAuthExpiredStatus(periodsRes.statusCode) ||
+          ApiClient.isAuthExpiredStatus(requestsRes.statusCode)) {
+        final expiredBody = ApiClient.isAuthExpiredStatus(periodsRes.statusCode)
+            ? periodsRes.body
+            : requestsRes.body;
+        _expireSession(ApiClient.authMessage, expiredBody);
+        return;
+      }
+      setState(() {
+        final available = <Map<String, dynamic>>[];
+        if (periodsRes.statusCode == 200 && periodsBody != null) {
+          final list = periodsBody['periods'];
+          if (list is List) {
+            for (final entry in list) {
+              if (entry is Map) available.add(Map<String, dynamic>.from(entry));
+            }
+          }
+        }
+        _payslipPeriods = available;
+        _payslipRequests = (requestsRes.statusCode == 200 && requestsBody != null)
+            ? (requestsBody['rows'] as List?) ?? const []
+            : const [];
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _payslipPeriods = const [];
+          _payslipRequests = const [];
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _isPayslipLoading = false);
+    }
+  }
+
+  void _showRequestPayslipDialog() {
+    if (_payslipPeriods.isEmpty) return;
+    Map<String, dynamic> selected = _payslipPeriods.first;
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) {
+          final selectedLabel =
+              '${selected['start_date']} → ${selected['end_date']}  ·  ${context.tr(selected['period_type'] == 'weekly' ? 'Weekly' : 'Semi-monthly', selected['period_type'] == 'weekly' ? 'Lingguhan' : 'Kalahating-buwan')}  ·  ${_fmtMoney(selected['net_pay'])}';
+          return AlertDialog(
+            backgroundColor: BrandColors.surface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: Row(
+              children: [
+                const Icon(Icons.receipt_long_rounded, color: BrandColors.cyan),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    context.tr('Request Payslip', 'Humingi ng Payslip'),
+                    style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+                  ),
+                ),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  context.tr(
+                    'Choose the paid period for your payslip. It will be emailed to you after admin approval.',
+                    'Piliin ang bayad na panahon para sa iyong payslip. Ie-email ito sa iyo pagkatapos ng pag-apruba ng admin.',
+                  ),
+                  style: const TextStyle(color: BrandColors.textMuted, fontSize: 12, height: 1.4),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  context.tr('Period', 'Panahon'),
+                  style: const TextStyle(
+                    color: BrandColors.textMuted,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                DropdownButtonFormField<Map<String, dynamic>>(
+                  initialValue: selected,
+                  isExpanded: true,
+                  decoration: InputDecoration(
+                    filled: true,
+                    fillColor: const Color(0xFFF8FAFC),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                  items: _payslipPeriods
+                      .map((p) => DropdownMenuItem<Map<String, dynamic>>(
+                            value: p,
+                            child: Text(
+                              '${p['start_date']} → ${p['end_date']}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+                            ),
+                          ))
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) setDialogState(() => selected = value);
+                  },
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF0FDF4),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF34A853).withValues(alpha: 0.3)),
+                  ),
+                  child: Text(
+                    selectedLabel,
+                    style: const TextStyle(
+                      color: Color(0xFF147A3A),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: Text(context.tr('Cancel', 'Kanselahin')),
+              ),
+              FilledButton(
+                onPressed: _isPayslipSubmitting
+                    ? null
+                    : () {
+                        Navigator.of(dialogContext).pop();
+                        _submitPayslipRequest(selected);
+                      },
+                child: Text(context.tr('Submit Request', 'Isumite ang Kahilingan')),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _submitPayslipRequest(Map<String, dynamic> period) async {
+    if (_isPayslipSubmitting) return;
+    setState(() => _isPayslipSubmitting = true);
+    try {
+      final res = await ApiClient.postJson(
+        '/employee/payslip/request',
+        body: {
+          'period_start': period['start_date'],
+          'period_end': period['end_date'],
+        },
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      if (!mounted) return;
+      final body = ApiClient.jsonObject(res.body);
+      if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
+        _expireSession(ApiClient.authMessage, res.body);
+        return;
+      }
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        _showProfileSnack(
+          context.tr(
+            'Payslip request submitted. Wait for the admin to approve and email it.',
+            'Na-submit ang iyong kahilingan. Hintayin ang pag-apruba at email ng admin.',
+          ),
+          error: false,
+        );
+        await _loadPayslipRequests();
+      } else {
+        String? detail;
+        if (body is Map<String, dynamic>) {
+          detail = body['detail']?.toString();
+        }
+        _showProfileSnack(
+          detail ??
+              context.tr('Unable to submit payslip request.', 'Hindi ma-submit ang kahilingan.'),
+          error: true,
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        _showProfileSnack(
+          context.tr('Network error. Please try again.', 'Network error. Subukan muli.'),
+          error: true,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isPayslipSubmitting = false);
+    }
+  }
+
+  String _isoDate(DateTime dt) {
+    return '${dt.year.toString().padLeft(4, '0')}-'
+        '${dt.month.toString().padLeft(2, '0')}-'
+        '${dt.day.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _loadCashAdvanceRequests() async {
+    if (_token.isEmpty) return;
+    if (mounted) setState(() => _caRequestsLoading = true);
+    try {
+      final res = await ApiClient.get(
+        '/employee/cash-advance-requests',
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      if (!mounted) return;
+      final body = ApiClient.jsonObject(res.body);
+      if (res.statusCode == 200 && body != null) {
+        setState(() => _caRequests = (body['requests'] as List?) ?? const []);
+      }
+    } catch (_) {
+      // Leave the previous list intact on transient errors.
+    } finally {
+      if (mounted) setState(() => _caRequestsLoading = false);
+    }
+  }
+
+  Future<void> _submitCashAdvanceRequest(double amount, String reason, {String? pickupDate}) async {
+    if (_token.isEmpty) return;
+    setState(() => _caRequestSubmitting = true);
+    try {
+      final res = await ApiClient.postJson(
+        '/employee/cash-advance-request',
+        body: {
+          'amount': amount,
+          'reason': reason,
+          'pickup_date': ?pickupDate,
+        },
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      final body = ApiClient.jsonObject(res.body);
+      if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
+        final detail = body?['detail']?.toString().toLowerCase() ?? '';
+        _expireSession(
+          detail.contains('archiv')
+              ? 'Your account was archived by the administrator.'
+              : ApiClient.authMessage,
+          res.body,
+        );
+        return;
+      }
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(context.tr(
+              'Cash advance request submitted.',
+              'Naipadala na ang kahilingan ng paunang sahod.',
+            )),
+          ));
+        }
+        await _loadCashAdvanceRequests();
+      } else {
+        final detail = body?['detail']?.toString() ??
+            body?['error']?.toString();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(detail ??
+                context.tr('Failed to submit request.', 'Hindi naipadala ang kahilingan.')),
+          ));
+        }
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(context.tr('Failed to submit request.', 'Hindi naipadala ang kahilingan.')),
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _caRequestSubmitting = false);
+    }
+  }
+
+  Future<void> _showCashAdvanceRequestDialog() async {
+    final amountCtrl = TextEditingController();
+    final reasonCtrl = TextEditingController();
+    final formKey = GlobalKey<FormState>();
+    DateTime? pickupDate;
+    await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: Text(
+            context.tr('Request Cash Advance', 'Humingi ng Paunang Sahod'),
+            style: const TextStyle(fontWeight: FontWeight.w900),
+          ),
+          content: Form(
+            key: formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: amountCtrl,
+                  autofocus: true,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: InputDecoration(
+                    labelText: context.tr('Amount (₱)', 'Halaga (₱)'),
+                    border: const OutlineInputBorder(),
+                  ),
+                  validator: (v) {
+                    final val = double.tryParse((v ?? '').trim());
+                    if (val == null || val <= 0) {
+                      return context.tr('Enter a valid amount.', 'Maglagay ng wastong halaga.');
+                    }
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 14),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    final now = DateTime.now();
+                    final picked = await showDatePicker(
+                      context: dialogContext,
+                      initialDate: pickupDate ?? now,
+                      firstDate: now,
+                      lastDate: now.add(const Duration(days: 365)),
+                    );
+                    if (picked != null) {
+                      setDialogState(() => pickupDate = picked);
+                    }
+                  },
+                  icon: const Icon(Icons.event_rounded, size: 18),
+                  label: Text(
+                    pickupDate == null
+                        ? context.tr('Select pickup date (when to receive)', 'Pumili ng petsa ng pagkuha (kailan matatanggap)')
+                        : '${context.tr('Pickup date', 'Petsa ng pagkuha')}: ${_isoDate(pickupDate!)}',
+                  ),
+                ),
+                if (pickupDate == null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      context.tr('Required — choose when you will receive the cash advance.', 'Kinakailangan — pumili kung kailan mo makukuha ang paunang sahod.'),
+                      style: const TextStyle(fontSize: 11, color: Color(0xFFC62828)),
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                TextFormField(
+                  controller: reasonCtrl,
+                  maxLength: 500,
+                  decoration: InputDecoration(
+                    labelText: context.tr('Reason (optional)', 'Dahilan (opsyonal)'),
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: Text(context.tr('Cancel', 'Kanselahin')),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                if (!(formKey.currentState?.validate() ?? false)) return;
+                if (pickupDate == null) {
+                  ScaffoldMessenger.of(dialogContext).showSnackBar(SnackBar(
+                    content: Text(context.tr(
+                      'Please choose a pickup date for your cash advance.',
+                      'Mangyaring pumili ng petsa ng pagkuha para sa iyong paunang sahod.',
+                    )),
+                  ));
+                  return;
+                }
+                final amount = double.parse(amountCtrl.text.trim());
+                Navigator.of(dialogContext).pop(true);
+                _submitCashAdvanceRequest(
+                  amount,
+                  reasonCtrl.text.trim(),
+                  pickupDate: _isoDate(pickupDate!),
+                );
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: BrandColors.cyan,
+                foregroundColor: Colors.white,
+              ),
+              child: Text(context.tr('Submit', 'Ipasa')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _caStatusPill(String status) {
+    if (status == 'approved') return _pill('APPROVED', const Color(0xFFE8F5E9), const Color(0xFF147A3A));
+    if (status == 'rejected') return _pill('REJECTED', const Color(0xFFFFEBEE), const Color(0xFFC62828));
+    return _pill('PENDING', const Color(0xFFFFF3E0), const Color(0xFFB45309));
+  }
+
+  String _formatRequestDate(String? raw) {
+    if (raw == null || raw.length < 10) return '-';
+    final date = DateTime.tryParse(raw.substring(0, 10));
+    if (date == null) return raw.substring(0, 10);
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    return '${months[date.month - 1]} ${date.day}, ${date.year}';
+  }
+
+  Future<void> _cancelCashAdvanceRequest(Map<String, dynamic> row) async {
+    if (_token.isEmpty || _caCancelRequestId != null) return;
+    final requestId = row['id'];
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          context.tr('Cancel request?', 'Kanselahin ang kahilingan?'),
+          style: const TextStyle(fontWeight: FontWeight.w900),
+        ),
+        content: Text(context.tr(
+          'This will remove your pending cash advance request of ${_fmtMoney(row['amount'])}.',
+          'Tatanggalin nito ang iyong kahilingan ng paunang sahod na ${_fmtMoney(row['amount'])}.',
+        )),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(context.tr('Keep', 'Panatilihin')),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFC62828),
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(context.tr('Cancel Request', 'Kanselahin ang Kahilingan')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _caCancelRequestId = requestId);
+    try {
+      final res = await ApiClient.postJson(
+        '/employee/cash-advance-request/$requestId/cancel',
+        headers: {'Authorization': 'Bearer $_token'},
+      );
+      final body = ApiClient.jsonObject(res.body);
+      if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
+        final detail = body?['detail']?.toString().toLowerCase() ?? '';
+        _expireSession(
+          detail.contains('archiv')
+              ? 'Your account was archived by the administrator.'
+              : ApiClient.authMessage,
+          res.body,
+        );
+        return;
+      }
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(context.tr('Request cancelled.', 'Nakansela na ang kahilingan.')),
+          ));
+        }
+        await _loadCashAdvanceRequests();
+      } else {
+        final detail = body?['detail']?.toString() ?? body?['error']?.toString();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(detail ??
+                context.tr('Failed to cancel request.', 'Hindi nakansela ang kahilingan.')),
+          ));
+        }
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(context.tr('Failed to cancel request.', 'Hindi nakansela ang kahilingan.')),
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _caCancelRequestId = null);
+    }
+  }
+
 
   Future<void> _pickAndUploadPhoto() async {
     if (_isPhotoUploading || _token.isEmpty) return;
 
-    final picked = await _imagePicker.pickImage(
-      source: ImageSource.gallery,
-      maxWidth: 1200,
-      maxHeight: 1200,
-      imageQuality: 85,
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.camera_alt_rounded),
+              title: Text(context.tr('Take a selfie', 'Mag-selfie gamit ang camera')),
+              onTap: () => Navigator.of(sheetContext).pop(ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_rounded),
+              title: Text(context.tr('Choose from gallery', 'Pumili mula sa gallery')),
+              onTap: () => Navigator.of(sheetContext).pop(ImageSource.gallery),
+            ),
+          ],
+        ),
+      ),
     );
-    if (picked == null) return;
+    if (source == null || !mounted) return;
+
+    // The camera / photo picker is a separate system activity: it triggers a
+    // pause/resume cycle. Keep the app lock from firing behind it. The flag
+    // is always reset (try/finally) so a picker error cannot leave the app
+    // permanently unlocked.
+    if (mounted) setState(() => _isPickingPhoto = true);
+    XFile? picked;
+    try {
+      picked = await _imagePicker.pickImage(
+        source: source,
+        maxWidth: 1200,
+        maxHeight: 1200,
+        imageQuality: 85,
+      );
+    } finally {
+      if (mounted) setState(() => _isPickingPhoto = false);
+    }
+    if (picked == null || !mounted) return;
+    final pickedFile = picked;
+
+    final croppedPath = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => FacePhotoCropScreen(imagePath: pickedFile.path),
+      ),
+    );
+    if (croppedPath == null || !mounted) return;
 
     setState(() => _isPhotoUploading = true);
     try {
@@ -146,13 +1168,13 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
         '/employee/photo',
         headers: {'Authorization': 'Bearer $_token'},
         fields: const {},
-        filePaths: {'photo': picked.path},
+        filePaths: {'photo': croppedPath},
         timeout: const Duration(seconds: 30),
       );
 
       if (!mounted) return;
       if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
-        _expireSession();
+        _expireSession(ApiClient.authMessage, res.body);
         return;
       }
 
@@ -163,6 +1185,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
           _photoUrl = photoUrl;
           _statusMsg = '';
         });
+        unawaited(_saveSession());
         _showProfileSnack(
           'Profile photo updated.',
           error: false,
@@ -185,132 +1208,6 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     }
   }
 
-  Future<void> _editGovernmentId() async {
-    if (_token.isEmpty) return;
-
-    final ctrl = TextEditingController(text: _governmentId);
-    final saved = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: BrandColors.surface,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: const Text(
-            'Edit Government ID',
-            style: TextStyle(
-              color: BrandColors.text,
-              fontSize: 17,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          content: TextFormField(
-            controller: ctrl,
-            autofocus: true,
-            cursorColor: BrandColors.cyan,
-            style: const TextStyle(color: BrandColors.text),
-            decoration: InputDecoration(
-              labelText: 'Government ID',
-              hintText: 'e.g. SSS / UMID / Driver\u2019s License no.',
-              labelStyle: const TextStyle(color: BrandColors.textMuted),
-              hintStyle: const TextStyle(color: BrandColors.textMuted),
-              prefixIcon: const Icon(Icons.badge_rounded, color: BrandColors.cyan),
-              filled: true,
-              fillColor: BrandColors.bg,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: BrandColors.border),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: BrandColors.border),
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: BrandColors.cyan, width: 1.4),
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(dialogContext).pop(true),
-              style: FilledButton.styleFrom(backgroundColor: BrandColors.cyan),
-              child: const Text('Save'),
-            ),
-          ],
-        );
-      },
-    );
-
-    ctrl.dispose();
-    if (saved != true) return;
-
-    final value = ctrl.text.trim();
-    if (value.isEmpty) {
-      _showProfileSnack('Government ID cannot be empty.', error: true);
-      return;
-    }
-
-    try {
-      final res = await ApiClient.putForm(
-        '/employee/government-id',
-        headers: {'Authorization': 'Bearer $_token'},
-        body: {'government_id': value},
-      );
-
-      if (!mounted) return;
-      if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
-        _expireSession();
-        return;
-      }
-
-      if (res.statusCode == 200) {
-        setState(() => _governmentId = value);
-        _showProfileSnack('Government ID updated.', error: false);
-      } else {
-        _showProfileSnack(
-          ApiClient.messageFromBody(res.body, fallback: 'Unable to update Government ID.'),
-          error: true,
-        );
-      }
-    } catch (error) {
-      if (mounted) {
-        _showProfileSnack(ApiClient.friendlyNetworkError(error), error: true);
-      }
-    }
-  }
-
-  Future<void> _verifyBiometrics() async {
-    if (_isVerifyingBiometrics) return;
-
-    setState(() => _isVerifyingBiometrics = true);
-    bool authenticated = false;
-    try {
-      authenticated = await _localAuth.authenticate(
-        localizedReason:
-            'Confirm your fingerprint to finish setting up biometrics.',
-        options: const AuthenticationOptions(
-          biometricOnly: true,
-          stickyAuth: true,
-        ),
-      );
-    } catch (_) {
-      authenticated = false;
-    }
-    if (!mounted) return;
-
-    setState(() => _isVerifyingBiometrics = false);
-    _showProfileSnack(
-      authenticated
-          ? 'Biometrics verified successfully.'
-          : 'Biometrics verification failed or cancelled.',
-      error: !authenticated,
-    );
-  }
-
   void _showProfileSnack(String message, {required bool error}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -324,9 +1221,19 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       );
   }
 
-  void _expireSession([String message = ApiClient.authMessage]) {
-    _dashboardRefreshTimer?.cancel();
+  void _expireSession(
+      [String message = ApiClient.authMessage, String responseBody = '']) {
+    _dashboardClockTimer?.cancel();
     if (!mounted) return;
+    // Kapag ang server ay nag-revoke ng session dahil nag-sign in ang
+    // employee sa ibang device, ipakita ang eksaktong dahilan imbes na
+    // ang generic na 'session expired' na mensahe.
+    if (responseBody.toLowerCase().contains('another device')) {
+      message = context.tr(
+        'You signed in on another device. Please sign in again.',
+        'Nag-sign in ka sa ibang device. Mangyaring mag-sign in muli.',
+      );
+    }
     setState(() {
       _isSignedIn = false;
       _token = '';
@@ -334,19 +1241,24 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       _employeeId = '';
       _email = '';
       _phone = '';
+      _governmentId = '';
+      _sssNumber = '';
+      _philhealthNumber = '';
+      _pagibigNumber = '';
+      _tinNumber = '';
       _status = '';
       _photoUrl = '';
       _groupedLogs = const [];
-      _rawLogs = const [];
-      _payrollTotals = const [];
-      _payrollRows = const [];
-      _payrollSummary = const {};
+      _dailyFinancials = const {};
       _lastDashboardRefreshAt = DateTime.now();
       _selectedSection = EmployeeSection.dashboard;
       _statusMsg = message;
       _logsMsg = '';
+      _pendingSession = null;
+      _hasSavedSession = false;
     });
     unawaited(PushNotificationService.clearEmployee());
+    unawaited(SessionStore.clear());
   }
 
   Future<void> _login() async {
@@ -354,8 +1266,9 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       return;
     }
 
-    final email = _emailCtrl.text.trim();
+    final identifier = _emailCtrl.text.trim();
     final password = _passwordCtrl.text;
+    final appLock = context.read<AppLockService>();
 
     setState(() {
       _isLoading = true;
@@ -363,27 +1276,38 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     });
 
     try {
+      final deviceId = await DeviceIdentity.getId();
       final res = await ApiClient.postForm(
         '/employee/login',
-        body: {'email': email, 'password': password},
+        body: {
+          'email': identifier,
+          'password': password,
+          if (deviceId.isNotEmpty) 'device_id': deviceId,
+        },
       );
       final body = json.decode(res.body);
 
       if (res.statusCode == 200 && body is Map<String, dynamic>) {
-        setState(() {
-          _isSignedIn = true;
-          _token = body['token']?.toString() ?? '';
-          _name = body['name']?.toString() ?? '';
-          _employeeId = body['employee_id']?.toString() ?? '';
-          _email = body['email']?.toString() ?? '';
-          _phone = body['phone']?.toString() ?? '';
-          _governmentId = body['government_id']?.toString() ?? '';
-          _status = body['status']?.toString() ?? '';
-          _photoUrl = body['photo_url']?.toString() ?? '';
-        });
+        _applySession(EmployeeSession(
+          token: body['token']?.toString() ?? '',
+          name: body['name']?.toString() ?? '',
+          employeeId: body['employee_id']?.toString() ?? '',
+          email: body['email']?.toString() ?? '',
+          phone: body['phone']?.toString() ?? '',
+          governmentId: body['government_id']?.toString() ?? '',
+          sssNumber: body['sss_number']?.toString() ?? '',
+          philhealthNumber: body['philhealth_number']?.toString() ?? '',
+          pagibigNumber: body['pagibig_number']?.toString() ?? '',
+          tinNumber: body['tin_number']?.toString() ?? '',
+          status: body['status']?.toString() ?? '',
+          photoUrl: body['photo_url']?.toString() ?? '',
+        ));
+        appLock.markUnlocked();
+        unawaited(_saveSession());
         unawaited(_registerPushNotifications());
         await _loadLogs();
         _startDashboardRefreshTimer();
+        await _syncOfflineQueue(silent: true);
         return;
       }
 
@@ -401,8 +1325,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
 
   Future<void> _registerPushNotifications() async {
     await PushNotificationService.registerForEmployee(_token);
-    if (!mounted) return;
-    setState(() => _pushStatus = PushNotificationService.status);
+    _loadNotifications();
   }
 
   Future<void> _loadLogs() async {
@@ -421,21 +1344,25 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       final body = json.decode(res.body);
 
       if (ApiClient.isAuthExpiredStatus(res.statusCode)) {
-        _expireSession();
+        final detail = body is Map<String, dynamic>
+            ? body['detail']?.toString().toLowerCase() ?? ''
+            : '';
+        _expireSession(
+          detail.contains('archiv')
+              ? 'Your account was archived by the administrator.'
+              : ApiClient.authMessage,
+          res.body,
+        );
         return;
       }
 
       if (res.statusCode == 200 && body is Map<String, dynamic>) {
         setState(() {
           _groupedLogs = (body['grouped'] as List?) ?? const [];
-          _rawLogs = (body['raw'] as List?) ?? const [];
-          final payroll = body['payroll'];
-          if (payroll is Map<String, dynamic>) {
-            _payrollTotals = (payroll['totals'] as List?) ?? const [];
-            _payrollRows = (payroll['rows'] as List?) ?? const [];
-            _payrollSummary = Map<String, dynamic>.from(payroll['summary'] as Map? ?? const {});
-          }
-          _logsMsg = _groupedLogs.isEmpty ? 'No attendance logs yet.' : '';
+          _dailyFinancials = body['daily'] is Map
+              ? Map<String, dynamic>.from(body['daily'] as Map)
+              : const {};
+          _logsMsg = '';
           _lastDashboardRefreshAt = DateTime.now();
           final emp = body['employee'];
           if (emp is Map<String, dynamic>) {
@@ -443,6 +1370,11 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
             _employeeId = emp['employee_id']?.toString() ?? _employeeId;
             _email = emp['email']?.toString() ?? _email;
             _phone = emp['phone']?.toString() ?? _phone;
+            _governmentId = emp['government_id']?.toString() ?? _governmentId;
+            _sssNumber = emp['sss_number']?.toString() ?? _sssNumber;
+            _philhealthNumber = emp['philhealth_number']?.toString() ?? _philhealthNumber;
+            _pagibigNumber = emp['pagibig_number']?.toString() ?? _pagibigNumber;
+            _tinNumber = emp['tin_number']?.toString() ?? _tinNumber;
             _status = emp['status']?.toString() ?? _status;
             _photoUrl = emp['photo_url']?.toString() ?? _photoUrl;
           }
@@ -460,15 +1392,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     } finally {
       if (mounted) setState(() => _isLogsLoading = false);
     }
-  }
-
-  void _onLogSearchChanged(String value) {
-    setState(() => _logSearchQuery = value.trim().toLowerCase());
-  }
-
-  void _clearLogSearch() {
-    _logSearchCtrl.clear();
-    setState(() => _logSearchQuery = '');
+    unawaited(_loadCashAdvanceRequests());
   }
 
   Future<void> _showForgotPasswordForm() async {
@@ -487,16 +1411,30 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       barrierDismissible: false,
       builder: (dialogContext) {
         return AlertDialog(
-          title: const Text('Confirm Logout'),
-          content: const Text('Are you sure you want to log out?'),
+          icon: const Icon(
+            Icons.logout_rounded,
+            color: Color(0xFFB31D18),
+            size: 34,
+          ),
+          title: Text(context.tr('Confirm Logout', 'Kumpirmahin ang Logout')),
+          content: Text(
+            context.tr(
+              'Are you sure you want to log out?',
+              'Sigurado ka bang gusto mong mag-logout?',
+            ),
+          ),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(false),
-              child: const Text('Cancel'),
+              child: Text(context.tr('Cancel', 'Kanselahin')),
             ),
             ElevatedButton(
               onPressed: () => Navigator.of(dialogContext).pop(true),
-              child: const Text('Logout'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFB31D18),
+                foregroundColor: Colors.white,
+              ),
+              child: Text(context.tr('Logout', 'Mag-logout')),
             ),
           ],
         );
@@ -504,6 +1442,26 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     );
 
     if (shouldLogout != true || !mounted) return;
+
+    // Preserve the saved session so "Login with Fingerprint" stays available
+    // on the login screen after logging out.  The stored token stays valid and
+    // is only cleared when it actually expires or the account is archived.
+    // Build from the current state (not _pendingSession) so any refreshed or
+    // edited profile data is kept, never a stale copy.
+    final savedSession = EmployeeSession(
+      token: _token,
+      name: _name,
+      employeeId: _employeeId,
+      email: _email,
+      phone: _phone,
+      governmentId: _governmentId,
+      sssNumber: _sssNumber,
+      philhealthNumber: _philhealthNumber,
+      pagibigNumber: _pagibigNumber,
+      tinNumber: _tinNumber,
+      status: _status,
+      photoUrl: _photoUrl,
+    );
 
     setState(() {
       _isSignedIn = false;
@@ -513,19 +1471,25 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       _employeeId = '';
       _email = '';
       _phone = '';
+      _governmentId = '';
+      _sssNumber = '';
+      _philhealthNumber = '';
+      _pagibigNumber = '';
+      _tinNumber = '';
       _status = '';
       _groupedLogs = const [];
-      _rawLogs = const [];
-      _payrollTotals = const [];
-      _payrollRows = const [];
-      _payrollSummary = const {};
+      _dailyFinancials = const {};
       _logsMsg = '';
       _statusMsg = '';
+      _pendingSession = savedSession;
+      _hasSavedSession = true;
       _emailCtrl.clear();
       _passwordCtrl.clear();
     });
-    _dashboardRefreshTimer?.cancel();
+    _dashboardClockTimer?.cancel();
+    context.read<AppLockService>().markUnlocked();
     unawaited(PushNotificationService.clearEmployee());
+    await SessionStore.save(savedSession);
   }
 
   void _changeCalendarMonth(int offset) {
@@ -680,16 +1644,17 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     selected: _selectedSection == EmployeeSection.dashboard,
                     selectedTileColor: const Color(0xFFE9F7FB),
                     leading: const Icon(Icons.dashboard_rounded, color: BrandColors.cyan),
-                    title: const Text(
-                      'Dashboard',
-                      style: TextStyle(
+                    title: Text(
+                      context.tr('Dashboard', 'Dashboard'),
+                      style: const TextStyle(
                         color: BrandColors.text,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
-                    subtitle: const Text('Main actions', style: TextStyle(color: BrandColors.textMuted, fontSize: 12)),
+                    subtitle: Text(context.tr('Main actions', 'Mga pangunahing aksyon'), style: const TextStyle(color: BrandColors.textMuted, fontSize: 12)),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     onTap: () {
+                      HapticFeedback.selectionClick();
                       setState(() => _selectedSection = EmployeeSection.dashboard);
                       Navigator.of(context).pop();
                     },
@@ -698,35 +1663,18 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     selected: _selectedSection == EmployeeSection.attendanceLogs,
                     selectedTileColor: const Color(0xFFE9F7FB),
                     leading: const Icon(Icons.badge_rounded, color: BrandColors.cyan),
-                    title: const Text(
-                      'Attendance',
-                      style: TextStyle(
+                    title: Text(
+                      context.tr('Attendance', 'Attendance'),
+                      style: const TextStyle(
                         color: BrandColors.text,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
-                    subtitle: const Text('Open logs', style: TextStyle(color: BrandColors.textMuted, fontSize: 12)),
+                    subtitle: Text(context.tr('Open logs', 'Buksan ang mga logs'), style: const TextStyle(color: BrandColors.textMuted, fontSize: 12)),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     onTap: () {
+                      HapticFeedback.selectionClick();
                       setState(() => _selectedSection = EmployeeSection.attendanceLogs);
-                      Navigator.of(context).pop();
-                    },
-                  ),
-                  ListTile(
-                    selected: _selectedSection == EmployeeSection.rawLogs,
-                    selectedTileColor: const Color(0xFFE9F7FB),
-                    leading: const Icon(Icons.receipt_long_rounded, color: BrandColors.cyan),
-                    title: const Text(
-                      'Raw Logs',
-                      style: TextStyle(
-                        color: BrandColors.text,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    subtitle: const Text('Separate form', style: TextStyle(color: BrandColors.textMuted, fontSize: 12)),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                    onTap: () {
-                      setState(() => _selectedSection = EmployeeSection.rawLogs);
                       Navigator.of(context).pop();
                     },
                   ),
@@ -734,17 +1682,18 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     selected: _selectedSection == EmployeeSection.payroll,
                     selectedTileColor: const Color(0xFFE9F7FB),
                     leading: const Icon(Icons.payments_rounded, color: BrandColors.cyan),
-                    title: const Text(
-                      'Payroll',
-                      style: TextStyle(
+                    title: Text(
+                      context.tr('Payroll', 'Payroll'),
+                      style: const TextStyle(
                         color: BrandColors.text,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
-                    subtitle: const Text('Pay and balance', style: TextStyle(color: BrandColors.textMuted, fontSize: 12)),
+                    subtitle: Text(context.tr('Pay and balance', 'Sahod at balanse'), style: const TextStyle(color: BrandColors.textMuted, fontSize: 12)),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     onTap: () {
-                      setState(() => _selectedSection = EmployeeSection.payroll);
+                      HapticFeedback.selectionClick();
+                      _openPayrollSection();
                       Navigator.of(context).pop();
                     },
                   ),
@@ -752,16 +1701,17 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     selected: _selectedSection == EmployeeSection.profile,
                     selectedTileColor: const Color(0xFFE9F7FB),
                     leading: const Icon(Icons.person_rounded, color: BrandColors.cyan),
-                    title: const Text(
-                      'Profile',
-                      style: TextStyle(
+                    title: Text(
+                      context.tr('Profile', 'Profile'),
+                      style: const TextStyle(
                         color: BrandColors.text,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
-                    subtitle: const Text('Account details', style: TextStyle(color: BrandColors.textMuted, fontSize: 12)),
+                    subtitle: Text(context.tr('Account details', 'Detalye ng account'), style: const TextStyle(color: BrandColors.textMuted, fontSize: 12)),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     onTap: () {
+                      HapticFeedback.selectionClick();
                       setState(() => _selectedSection = EmployeeSection.profile);
                       Navigator.of(context).pop();
                     },
@@ -769,6 +1719,44 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   const SizedBox(height: 10),
                   const Divider(height: 1, color: BrandColors.border),
                 ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Consumer<AppLocale>(
+                builder: (context, locale, _) {
+                  return ListTile(
+                    dense: true,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    leading: Icon(
+                      locale.isFilipino
+                          ? Icons.language_rounded
+                          : Icons.translate_rounded,
+                      color: BrandColors.cyan,
+                    ),
+                    title: Text(
+                      locale.isFilipino ? 'Wika (Language)' : 'Language',
+                      style: const TextStyle(
+                        color: BrandColors.text,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 13,
+                      ),
+                    ),
+                    subtitle: Text(
+                      locale.languageLabel,
+                      style: const TextStyle(
+                        color: BrandColors.textMuted,
+                        fontSize: 11,
+                      ),
+                    ),
+                    trailing: const Icon(
+                      Icons.swap_horiz_rounded,
+                      color: BrandColors.textMuted,
+                      size: 20,
+                    ),
+                    onTap: locale.toggle,
+                  );
+                },
               ),
             ),
             Padding(
@@ -783,7 +1771,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     side: const BorderSide(color: BrandColors.border),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ),
-                  child: const Text('Logout'),
+                  child: Text(context.tr('Logout', 'Mag-logout')),
                 ),
               ),
             ),
@@ -812,51 +1800,10 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     return '${months[dt.month - 1]} ${dt.day}, ${dt.year}';
   }
 
-  String _fmtTime(dynamic value) {
-    final dt = _parseFlexibleDateTime(value);
-    if (dt == null) return value?.toString() ?? '-';
-    final hour = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
-    final minute = dt.minute.toString().padLeft(2, '0');
-    final ampm = dt.hour >= 12 ? 'PM' : 'AM';
-    return '$hour:$minute $ampm';
-  }
 
   DateTime _dateFromWorkDate(dynamic value) {
     final dt = _parseFlexibleDateTime(value);
     return dt ?? DateTime.fromMillisecondsSinceEpoch(0);
-  }
-
-  Widget _searchBar() {
-    return TextField(
-      controller: _logSearchCtrl,
-      onChanged: _onLogSearchChanged,
-      textInputAction: TextInputAction.search,
-      decoration: InputDecoration(
-        hintText: 'Search logs by date, time, or status',
-        prefixIcon: const Icon(Icons.search_rounded, color: BrandColors.cyan),
-        suffixIcon: _logSearchQuery.isNotEmpty
-            ? IconButton(
-                onPressed: _clearLogSearch,
-                icon: const Icon(Icons.close_rounded),
-                tooltip: 'Clear search',
-              )
-            : null,
-        filled: true,
-        fillColor: const Color(0xFFF8FAFC),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: const BorderSide(color: BrandColors.border),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: const BorderSide(color: BrandColors.border),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: const BorderSide(color: BrandColors.cyan, width: 1.4),
-        ),
-      ),
-    );
   }
 
   List<Map<String, dynamic>> _sortedGroupedLogs() {
@@ -867,103 +1814,28 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     return list;
   }
 
-  bool _matchesRawQuery(Map<String, dynamic> row, String query) {
-    if (query.isEmpty) return true;
-    final text = [
-      row['timestamp'],
-      row['type'],
-      row['employee_id'],
-      row['name'],
-    ].where((value) => value != null).join(' ').toLowerCase();
-    return text.contains(query);
-  }
-
-  List<Map<String, dynamic>> _sortedRawLogs() {
-    final list = _rawLogs
-        .map((entry) => Map<String, dynamic>.from(entry as Map))
-        .toList();
-    list.sort((a, b) {
-      final aTs = DateTime.tryParse(a['timestamp']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
-      final bTs = DateTime.tryParse(b['timestamp']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
-      return bTs.compareTo(aTs);
-    });
-    return list;
-  }
-
-  List<Map<String, dynamic>> _filteredRawLogs() {
-    final list = _sortedRawLogs();
-    if (_logSearchQuery.isEmpty) return list;
-    return list.where((row) => _matchesRawQuery(row, _logSearchQuery)).toList();
-  }
-
-  String _fmtDuration(dynamic value) {
-    if (value == null) return '-';
-
-    Duration? duration;
-    final raw = value.toString().trim();
-
-    if (raw.isEmpty || raw == '-') return '-';
-
-    final numeric = int.tryParse(raw);
-    if (numeric != null) {
-      duration = Duration(seconds: numeric);
-    } else {
-      final parts = raw.split(':').map((part) => int.tryParse(part.trim())).toList();
-      if (parts.length >= 2 && parts.every((part) => part != null)) {
-        final safe = parts.cast<int>();
-        if (safe.length == 2) {
-          duration = Duration(minutes: safe[0], seconds: safe[1]);
-        } else if (safe.length >= 3) {
-          duration = Duration(hours: safe[0], minutes: safe[1], seconds: safe[2]);
-        }
-      }
-    }
-
-    if (duration == null) return raw;
-
-    final hours = duration.inHours;
-    final minutes = duration.inMinutes.remainder(60);
-    final seconds = duration.inSeconds.remainder(60);
-    return 'Duration: ${hours}h ${minutes.toString().padLeft(2, '0')}m ${seconds.toString().padLeft(2, '0')}s';
-  }
-
   String _fmtMoney(dynamic value) {
     final amount = double.tryParse(value?.toString() ?? '') ?? 0;
     return 'PHP ${amount.toStringAsFixed(2)}';
   }
 
-  Duration? _durationFromLog(dynamic value) {
-    if (value == null) return null;
-    final raw = value.toString().trim();
-    if (raw.isEmpty || raw == '-') return null;
-
-    final numeric = int.tryParse(raw);
-    if (numeric != null) {
-      return Duration(seconds: numeric);
-    }
-
-    final parts = raw.split(':').map((part) => int.tryParse(part.trim())).toList();
-    if (parts.length < 2 || parts.any((part) => part == null)) {
-      return null;
-    }
-
-    final safe = parts.cast<int>();
-    if (safe.length == 2) {
-      return Duration(minutes: safe[0], seconds: safe[1]);
-    }
-    return Duration(hours: safe[0], minutes: safe[1], seconds: safe[2]);
+  String _fmtPeso(double value) {
+    final negative = value < 0;
+    final abs = value.abs();
+    final parts = abs.toStringAsFixed(2).split('.');
+    final intPart = parts[0].replaceAllMapped(
+      RegExp(r'(\d)(?=(\d{3})+$)'),
+      (m) => '${m[1]},',
+    );
+    return '${negative ? '-' : ''}\u20B1$intPart.${parts[1]}';
   }
 
   bool _isPresentDay(Map<String, dynamic> row) {
-    final hasCompletedSession = row['time_in'] != null && row['time_out'] != null;
-    if (!hasCompletedSession) return false;
-    final duration = _durationFromLog(row['duration']);
-    return duration != null && duration >= _presentDayMinimum;
+    return row['time_in'] != null;
   }
 
-  int _dashboardPresentDaysCount(String filter) {
+  Iterable<Map<String, dynamic>> _dashboardFilteredRows(String filter) {
     final now = DateTime.now();
-    final days = <String>{};
     Iterable<Map<String, dynamic>> rows = _sortedGroupedLogs();
     switch (filter) {
       case '7d':
@@ -984,11 +1856,55 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
         });
         break;
     }
-    for (final row in rows) {
+    return rows;
+  }
+
+  int _dashboardPresentDaysCount(String filter) {
+    final days = <String>{};
+    for (final row in _dashboardFilteredRows(filter)) {
       final day = _dateFromWorkDate(row['work_date']);
       days.add('${day.year}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}');
     }
     return days.length;
+  }
+
+  int _dashboardRecordCount(String filter) {
+    return _dashboardFilteredRows(filter).length;
+  }
+
+  String _dashboardHoursWorked(String filter) {
+    var totalSeconds = 0;
+    for (final row in _dashboardFilteredRows(filter)) {
+      final duration = row['duration']?.toString();
+      if (duration == null || duration.isEmpty) continue;
+      final parts = duration.split(':');
+      if (parts.length != 3) continue;
+      final hours = int.tryParse(parts[0]) ?? 0;
+      final minutes = int.tryParse(parts[1]) ?? 0;
+      final seconds = int.tryParse(parts[2]) ?? 0;
+      totalSeconds += hours * 3600 + minutes * 60 + seconds;
+    }
+    if (totalSeconds <= 0) return context.tr('0h', '0 oras');
+    final h = totalSeconds ~/ 3600;
+    final m = (totalSeconds % 3600) ~/ 60;
+    if (h == 0) return '${m}m';
+    return m == 0 ? '${h}h' : '${h}h ${m}m';
+  }
+
+  String _dashboardClockLabel(DateTime now) {
+    final hour12 = now.hour % 12 == 0 ? 12 : now.hour % 12;
+    final minute = now.minute.toString().padLeft(2, '0');
+    final suffix = now.hour < 12 ? 'AM' : 'PM';
+    return '$hour12:$minute $suffix';
+  }
+
+  String _dashboardDateLabel(DateTime now) {
+    const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    return '${weekdays[now.weekday - 1]}, ${months[now.month - 1]} ${now.day}, ${now.year}';
   }
 
   Map<String, dynamic>? _todayLog() {
@@ -1000,52 +1916,304 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     return null;
   }
 
+  bool _hasTimedOutToday(Map<String, dynamic>? todayLog) {
+    return todayLog != null && todayLog['time_out'] != null;
+  }
+
   String _todayStatusTitle(Map<String, dynamic>? todayLog) {
-    if (todayLog == null) return 'Ready to mark present';
-    return 'Present today';
+    if (todayLog == null) {
+      return context.tr('Ready to time in', 'Handa nang mag-time in');
+    }
+    if (_hasTimedOutToday(todayLog)) {
+      return context.tr('Shift completed for today', 'Tapos na ang shift mo ngayong araw');
+    }
+    return context.tr('You are on shift', 'Naka-shift ka na');
   }
 
   String _todayStatusCaption(Map<String, dynamic>? todayLog) {
-    if (todayLog == null) return 'No attendance record yet for today.';
-    final markedAt = todayLog['time_in'];
-    return 'Marked present at ${markedAt == null ? 'today' : _fmtTime(markedAt)}.';
+    if (todayLog == null) {
+      if (_hasBiometrics) {
+        return context.tr(
+          'Confirm your fingerprint, then time in for today. If the scan fails, you can still continue without it.',
+          'Kumpirmahin ang iyong fingerprint, pagkatapos ay mag-time in para ngayong araw. Kung pumalpak ang scan, maaari ka pa ring magpatuloy nang wala ito.',
+        );
+      }
+      return context.tr(
+        'Time in once for today to record your attendance.',
+        'Mag-time in nang isang beses para ngayong araw upang maitala ang iyong attendance.',
+      );
+    }
+    if (_hasTimedOutToday(todayLog)) {
+      return context.tr(
+        'Your time in and time out are recorded for today.',
+        'Naitala na ang iyong time in at time out ngayong araw.',
+      );
+    }
+    return context.tr(
+      'You have timed in. Remember to time out when your shift ends.',
+      'Naka-time in ka na. Huwag kalimutang mag-time out kapag tapos na ang shift mo.',
+    );
   }
 
   Color _todayStatusColor(Map<String, dynamic>? todayLog) {
     if (todayLog == null) return BrandColors.cyan;
-    return const Color(0xFF147A3A);
+    if (_hasTimedOutToday(todayLog)) return const Color(0xFF147A3A);
+    return const Color(0xFFC46A18);
   }
 
   String _todayActionLabel(Map<String, dynamic>? todayLog) {
-    if (todayLog != null) return 'View Logs';
-    return 'Mark Present';
-  }
-
-  VoidCallback _todayAction(Map<String, dynamic>? todayLog) {
-    if (todayLog != null) {
-      return () => setState(() => _selectedSection = EmployeeSection.attendanceLogs);
+    if (_isVerifyingBiometrics) {
+      return context.tr(
+        'Confirming fingerprint...',
+        'Kinukumpirma ang fingerprint...',
+      );
     }
-    return () => _openAttendance('present');
+    if (_isMarkingPresent || _isMarkingTimeout) {
+      return context.tr('Saving...', 'Sine-save...');
+    }
+    if (todayLog == null) {
+      return context.tr('Time In', 'Mag-time In');
+    }
+    if (_hasTimedOutToday(todayLog)) {
+      return context.tr('Completed', 'Tapos Na');
+    }
+    return context.tr('Time Out', 'Mag-time Out');
   }
 
-  String _pushCompactLabel() {
-    if (_pushStatus.uploaded) return 'Push notifications active';
-    if (_pushStatus.initialized && _pushStatus.tokenGenerated) return 'Push token ready';
-    if (_pushStatus.configured) return 'Push setup pending';
-    return 'Push unavailable';
+  VoidCallback? _todayAction(Map<String, dynamic>? todayLog) {
+    if (_isMarkingPresent || _isMarkingTimeout || _isVerifyingBiometrics) return null;
+    if (todayLog == null) return _markPresent;
+    if (_hasTimedOutToday(todayLog)) return null;
+    return _markTimeout;
+  }
+
+  Future<void> _markPresent() async {
+    if (_token.isEmpty || _isMarkingPresent || _isVerifyingBiometrics || _todayLog() != null) {
+      return;
+    }
+    final confirmed = await _confirmBiometricsForAttendance();
+    if (!confirmed || !mounted) return;
+
+    setState(() => _isMarkingPresent = true);
+    try {
+      final response = await ApiClient.postJson(
+        '/present',
+        headers: {'Authorization': 'Bearer $_token'},
+        body: const <String, dynamic>{},
+      );
+      if (!mounted) return;
+      if (ApiClient.isAuthExpiredStatus(response.statusCode)) {
+        _expireSession(ApiClient.authMessage, response.body);
+        return;
+      }
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        await _loadLogs();
+        _showProfileSnack('Time in recorded successfully.', error: false);
+        return;
+      }
+      _showProfileSnack(
+        friendlyAttendanceError(ApiClient.messageFromBody(
+          response.body,
+          fallback: 'Unable to mark present.',
+        )),
+        error: true,
+      );
+    } catch (error) {
+      if (isRetryableNetworkError(error)) {
+        await OfflineAttendanceQueue.enqueue(
+          type: 'present',
+          timestamp: DateTime.now(),
+          employeeToken: _token,
+        );
+        await _refreshQueuedCount();
+        if (mounted) {
+          _showProfileSnack('Saved offline. It will sync when connected.', error: false);
+        }
+      } else if (mounted) {
+        _showProfileSnack(ApiClient.friendlyNetworkError(error), error: true);
+      }
+    } finally {
+      if (mounted) setState(() => _isMarkingPresent = false);
+    }
+  }
+
+  Future<void> _markTimeout() async {
+    final todayLog = _todayLog();
+    if (_token.isEmpty ||
+        _isMarkingTimeout ||
+        _isVerifyingBiometrics ||
+        todayLog == null ||
+        todayLog['time_out'] != null) {
+      return;
+    }
+    // Anti-cheat pre-check: time-out must be at least MIN_WORK_MINUTES after
+    // time-in. The server enforces the same rule (MIN_WORK_MINUTES in .env);
+    // this gives instant feedback without a round trip. A negative value
+    // (phone clock slightly behind the server) is left to the server, which
+    // is the authoritative gate for the minimum-work rule.
+    final timeIn = _parseFlexibleDateTime(todayLog['time_in']);
+    if (timeIn != null) {
+      const minWorkMinutes = 30;
+      final workedMinutes = DateTime.now().difference(timeIn).inMinutes;
+      if (workedMinutes >= 0 && workedMinutes < minWorkMinutes) {
+        _showProfileSnack(
+          'You need to work at least $minWorkMinutes minutes before timing out.',
+          error: true,
+        );
+        return;
+      }
+    }
+    final confirmed = await _confirmBiometricsForAttendance();
+    if (!confirmed || !mounted) return;
+
+    setState(() => _isMarkingTimeout = true);
+    try {
+      final response = await ApiClient.postJson(
+        '/timeout',
+        headers: {'Authorization': 'Bearer $_token'},
+        body: const <String, dynamic>{},
+      );
+      if (!mounted) return;
+      if (ApiClient.isAuthExpiredStatus(response.statusCode)) {
+        _expireSession(ApiClient.authMessage, response.body);
+        return;
+      }
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        await _loadLogs();
+        _showProfileSnack('Time out recorded successfully.', error: false);
+        return;
+      }
+      _showProfileSnack(
+        friendlyAttendanceError(ApiClient.messageFromBody(
+          response.body,
+          fallback: 'Unable to time out.',
+        )),
+        error: true,
+      );
+    } catch (error) {
+      if (isRetryableNetworkError(error)) {
+        await OfflineAttendanceQueue.enqueue(
+          type: 'time_out',
+          timestamp: DateTime.now(),
+          employeeToken: _token,
+        );
+        await _refreshQueuedCount();
+        if (mounted) {
+          _showProfileSnack('Saved offline. It will sync when connected.', error: false);
+        }
+      } else if (mounted) {
+        _showProfileSnack(ApiClient.friendlyNetworkError(error), error: true);
+      }
+    } finally {
+      if (mounted) setState(() => _isMarkingTimeout = false);
+    }
+  }
+
+  Future<bool> _confirmBiometricsForAttendance() async {
+    // Require fingerprint confirmation before recording attendance whenever
+    // the device has a fingerprint enrolled. Devices without a fingerprint
+    // still proceed (fallback) so employees are never locked out. When a
+    // scan fails or is cancelled, the employee may choose to continue
+    // anyway so they are never blocked from recording attendance.
+    if (!_hasBiometrics) return true;
+    var verified = false;
+    var allowWithoutFingerprint = false;
+    while (!verified && !allowWithoutFingerprint) {
+      setState(() {
+        _isVerifyingBiometrics = true;
+        _isAttendancePromptOpen = true;
+      });
+      try {
+        verified = await _localAuth.authenticate(
+          localizedReason:
+              'Confirm your fingerprint to record your attendance.',
+          options: const AuthenticationOptions(
+            biometricOnly: true,
+            // Do not reuse a prior unlock: every attendance mark needs a
+            // fresh fingerprint confirmation.
+            stickyAuth: false,
+          ),
+        );
+      } catch (_) {
+        verified = false;
+      }
+      if (!mounted) return false;
+      setState(() {
+        _isVerifyingBiometrics = false;
+        _isAttendancePromptOpen = false;
+      });
+      if (verified) break;
+
+      // Scan failed or was cancelled — offer alternatives instead of
+      // blocking the employee from recording attendance.
+      const cancelChoice = 0;
+      const tryAgainChoice = 1;
+      const markAnywayChoice = 2;
+      final choice = await showDialog<int>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return AlertDialog(
+            icon: const Icon(
+              Icons.fingerprint_rounded,
+              color: Color(0xFFB31D18),
+              size: 34,
+            ),
+            title: Text(
+              context.tr(
+                'Fingerprint not verified',
+                'Hindi nakumpirma ang fingerprint',
+              ),
+            ),
+            content: Text(
+              context.tr(
+                'You can try the fingerprint again, or continue without it.',
+                'Maaari mong subukan muli ang fingerprint, o magpatuloy nang wala ito.',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(cancelChoice),
+                child: Text(context.tr('Cancel', 'Kanselahin')),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(tryAgainChoice),
+                child: Text(context.tr('Try Again', 'Subukan Muli')),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.of(dialogContext).pop(markAnywayChoice),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: BrandColors.cyan,
+                  foregroundColor: Colors.white,
+                ),
+                child: Text(
+                  context.tr('Continue Anyway', 'Magpatuloy Pa Rin'),
+                ),
+              ),
+            ],
+          );
+        },
+      );
+      if (!mounted) return false;
+      if (choice == tryAgainChoice) {
+        continue; // Try Again — loop back to the fingerprint prompt
+      }
+      if (choice == markAnywayChoice) {
+        allowWithoutFingerprint = true; // Continue Anyway
+        break;
+      }
+      return false; // Cancelled — do not record attendance
+    }
+    return true;
   }
 
   String _dashboardUpdatedLabel() {
     final elapsed = DateTime.now().difference(_lastDashboardRefreshAt);
-    if (elapsed.inSeconds < 45) return 'Updated just now';
-    if (elapsed.inMinutes < 60) return 'Updated ${elapsed.inMinutes}m ago';
-    return 'Updated ${elapsed.inHours}h ago';
-  }
-
-  bool _hasPayrollData(Map<String, dynamic> total) {
-    return _toMoneyValue(_payrollSummary['total_amount'] ?? total['amount']) > 0 ||
-        _toMoneyValue(_payrollSummary['paid_amount'] ?? total['paid_amount']) > 0 ||
-        _toMoneyValue(_payrollSummary['balance'] ?? total['balance']) > 0;
+    if (elapsed.inSeconds < 45) return context.tr('Updated just now', 'Kakasilang na-update');
+    if (elapsed.inMinutes < 60) {
+      return context.tr('Updated ${elapsed.inMinutes}m ago', 'Na-update ${elapsed.inMinutes}m ang nakalipas');
+    }
+    return context.tr('Updated ${elapsed.inHours}h ago', 'Na-update ${elapsed.inHours}h ang nakalipas');
   }
 
   double _toMoneyValue(dynamic value) {
@@ -1167,95 +2335,10 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     );
   }
 
-  Widget _payrollStrip(Map<String, dynamic> total) {
-    final hasPayroll = _hasPayrollData(total);
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: BrandColors.border),
-      ),
-      child: hasPayroll
-          ? Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _sectionHeader('Payroll', Icons.account_balance_wallet_rounded),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _payrollMetric('Salary', _fmtMoney(_payrollSummary['total_amount'] ?? total['amount'])),
-                    ),
-                    Expanded(
-                      child: _payrollMetric('Paid', _fmtMoney(_payrollSummary['paid_amount'] ?? total['paid_amount'])),
-                    ),
-                    Expanded(
-                      child: _payrollMetric('Balance', _fmtMoney(_payrollSummary['balance'] ?? total['balance'])),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _payrollMetric('C/A Balance', _fmtMoney(total['remaining_bale_balance'] ?? _payrollSummary['remaining_bale_balance'])),
-                    ),
-                  ],
-                ),
-              ],
-            )
-          : const Row(
-              children: [
-                Icon(Icons.account_balance_wallet_outlined, color: BrandColors.textMuted, size: 22),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'Payroll not available yet',
-                    style: TextStyle(
-                      color: BrandColors.textMuted,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-    );
-  }
-
-  Widget _payrollMetric(String label, String value) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(
-            color: BrandColors.textMuted,
-            fontSize: 11,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          value,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
-            color: BrandColors.text,
-            fontSize: 13,
-            fontWeight: FontWeight.w900,
-          ),
-        ),
-      ],
-    );
-  }
-
   Widget _compactAttendanceRow(Map<String, dynamic> row) {
-    final complete = row['time_in'] != null && row['time_out'] != null;
-    final label = complete ? 'Complete' : row['time_in'] != null ? 'Missing time-out' : 'Pending';
-    final color = complete ? const Color(0xFF147A3A) : const Color(0xFFC46A18);
+    final present = row['time_in'] != null;
+    final label = present ? 'Present' : 'Pending';
+    final color = present ? const Color(0xFF147A3A) : const Color(0xFFC46A18);
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
@@ -1284,23 +2367,12 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     fontWeight: FontWeight.w900,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  '${_fmtTime(row['time_in'])} - ${row['time_out'] == null ? 'No time-out' : _fmtTime(row['time_out'])}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: BrandColors.textMuted,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
               ],
             ),
           ),
           _pill(
             label.toUpperCase(),
-            complete ? const Color(0xFFEAF8EF) : const Color(0xFFFFF4E8),
+            present ? const Color(0xFFEAF8EF) : const Color(0xFFFFF4E8),
             color,
           ),
         ],
@@ -1308,63 +2380,192 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     );
   }
 
-  Future<void> _openAttendance(String type) async {
-    await Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => AttendanceScreen(
-          initialType: type,
-          employeeToken: _token,
+
+  Widget _timeChip({
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: BrandColors.border),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 12, color: BrandColors.cyan),
+                const SizedBox(width: 4),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    color: BrandColors.textMuted,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 3),
+            Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: BrandColors.text,
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
         ),
       ),
     );
-    if (mounted && _isSignedIn && _token.isNotEmpty) {
-      await _loadLogs();
-      final now = DateTime.now();
-      setState(() {
-        _calendarMonth = DateTime(now.year, now.month, 1);
-        _selectedCalendarDate = DateTime(now.year, now.month, now.day);
-      });
-    }
+  }
+
+  String _timeOfDay(dynamic value) {
+    if (value == null || value.toString().isEmpty) return '-';
+    final dt = _parseFlexibleDateTime(value);
+    if (dt == null) return '-';
+    final hour12 = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
+    final minute = dt.minute.toString().padLeft(2, '0');
+    final suffix = dt.hour < 12 ? 'AM' : 'PM';
+    return '$hour12:$minute $suffix';
+  }
+
+  String _formatDurationShort(String hms) {
+    final parts = hms.split(':');
+    if (parts.length != 3) return hms;
+    final hours = int.tryParse(parts[0]) ?? 0;
+    final minutes = int.tryParse(parts[1]) ?? 0;
+    if (hours == 0) return '${minutes}m';
+    return minutes == 0 ? '${hours}h' : '${hours}h ${minutes}m';
   }
 
   @override
   Widget build(BuildContext context) {
     if (_isSignedIn) {
-      return PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (didPop, _) {
-          if (!didPop) {
-            _logout();
-          }
+      return Consumer<AppLocale>(
+        builder: (context, locale, _) {
+          return PopScope(
+            canPop: false,
+            onPopInvokedWithResult: (didPop, _) {
+              if (!didPop) {
+                _logout();
+              }
+            },
+            child: Scaffold(
+              backgroundColor: BrandColors.bg,
+              drawer: _needsAppUnlock ? null : _employeeDrawer(context),
+              appBar: AppBar(
+                backgroundColor: BrandColors.surface,
+                elevation: 0,
+                toolbarHeight: 72,
+                title: const BrandMark(
+                  compact: true,
+                  titleColor: BrandColors.text,
+                  subtitleColor: BrandColors.textMuted,
+                ),
+                actions: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        IconButton(
+                          tooltip: 'Notifications',
+                          onPressed: _openNotifications,
+                          icon: const Icon(
+                            Icons.notifications_rounded,
+                            color: BrandColors.text,
+                            size: 26,
+                          ),
+                        ),
+                        if (_notifCount > 0)
+                          Positioned(
+                            right: 2,
+                            top: 6,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 1,
+                              ),
+                              constraints: const BoxConstraints(minWidth: 18),
+                              decoration: BoxDecoration(
+                                color: BrandColors.cyan,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: BrandColors.surface,
+                                  width: 1.5,
+                                ),
+                              ),
+                              child: Text(
+                                _notifCount > 99 ? '99+' : '$_notifCount',
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+                bottom: PreferredSize(
+                  preferredSize: const Size.fromHeight(1),
+                  child: Container(height: 1, color: BrandColors.border),
+                ),
+              ),
+              body: _needsAppUnlock
+                  ? _buildAppUnlockGate()
+                  : AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 260),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) {
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0.02, 0.03),
+                              end: Offset.zero,
+                            ).animate(animation),
+                            child: child,
+                          ),
+                        );
+                      },
+                      child: _selectedSection == EmployeeSection.dashboard
+                          ? KeyedSubtree(
+                              key: const ValueKey('dashboard'),
+                              child: _buildEmployeeDashboard(),
+                            )
+                          : _selectedSection == EmployeeSection.attendanceLogs
+                              ? KeyedSubtree(
+                                  key: const ValueKey('attendanceLogs'),
+                                  child: _buildEmployeeLogs(),
+                                )
+                              : _selectedSection == EmployeeSection.payroll
+                                      ? KeyedSubtree(
+                                          key: const ValueKey('payroll'),
+                                          child: _buildPayrollPage(),
+                                        )
+                                      : KeyedSubtree(
+                                          key: const ValueKey('profile'),
+                                          child: _buildEmployeeProfile(),
+                                        ),
+                    ),
+            ),
+          );
         },
-        child: Scaffold(
-          backgroundColor: BrandColors.bg,
-          drawer: _employeeDrawer(context),
-          appBar: AppBar(
-            backgroundColor: BrandColors.surface,
-            elevation: 0,
-            toolbarHeight: 72,
-            title: const BrandMark(
-              compact: true,
-              titleColor: BrandColors.text,
-              subtitleColor: BrandColors.textMuted,
-            ),
-            bottom: PreferredSize(
-              preferredSize: const Size.fromHeight(1),
-              child: Container(height: 1, color: BrandColors.border),
-            ),
-          ),
-          body: _selectedSection == EmployeeSection.dashboard
-              ? _buildEmployeeDashboard()
-              : _selectedSection == EmployeeSection.attendanceLogs
-                  ? _buildEmployeeLogs()
-                  : _selectedSection == EmployeeSection.rawLogs
-                      ? _buildRawLogsPage()
-                      : _selectedSection == EmployeeSection.payroll
-                          ? _buildPayrollPage()
-                          : _buildEmployeeProfile(),
-        ),
       );
     }
 
@@ -1398,12 +2599,18 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                 children: [
                   const BrandLogo(size: 84, radius: 18, withFrame: false, padding: EdgeInsets.zero),
                   const SizedBox(height: 16),
-                  const Text('Employee Login', style: TextStyle(color: BrandColors.text, fontSize: 22, fontWeight: FontWeight.w900)),
+                  Text(
+                    context.tr('Employee Login', 'Pag-login ng Empleyado'),
+                    style: const TextStyle(color: BrandColors.text, fontSize: 22, fontWeight: FontWeight.w900),
+                  ),
                   const SizedBox(height: 6),
-                  const Text(
-                    'Sign in to see only your own attendance logs.',
+                  Text(
+                    context.tr(
+                      'Sign in to see only your own attendance logs.',
+                      'Mag-login para makita ang sarili mong attendance logs.',
+                    ),
                     textAlign: TextAlign.center,
-                    style: TextStyle(color: BrandColors.textMuted, fontSize: 13, height: 1.4),
+                    style: const TextStyle(color: BrandColors.textMuted, fontSize: 13, height: 1.4),
                   ),
                   const SizedBox(height: 20),
                   Form(
@@ -1413,14 +2620,26 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       children: [
                         _field(
                           controller: _emailCtrl,
-                          label: 'Email',
-                          icon: Icons.email_rounded,
-                          keyboardType: TextInputType.emailAddress,
+                          label: context.tr('Email or Phone', 'Email o Numero ng Telepono'),
+                          icon: Icons.alternate_email_rounded,
+                          keyboardType: TextInputType.text,
                           validator: (value) {
                             final text = value?.trim() ?? '';
-                            if (text.isEmpty) return 'Email is required.';
-                            if (!text.contains('@') || !text.contains('.')) {
-                              return 'Enter a valid email.';
+                            if (text.isEmpty) {
+                              return context.tr(
+                                'Email or phone is required.',
+                                'Kinakailangan ang email o numero ng telepono.',
+                              );
+                            }
+                            final digits = text.replaceAll(RegExp(r'\D'), '');
+                            final isEmail = text.contains('@') && text.contains('.');
+                            final isPhone = digits.length == 11 ||
+                                (digits.length == 12 && digits.startsWith('63'));
+                            if (!isEmail && !isPhone) {
+                              return context.tr(
+                                'Enter a valid email or 11-digit phone number.',
+                                'Maglagay ng wastong email o 11-digit na numero ng telepono.',
+                              );
                             }
                             return null;
                           },
@@ -1428,7 +2647,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                         const SizedBox(height: 14),
                         _field(
                           controller: _passwordCtrl,
-                          label: 'Password',
+                          label: context.tr('Password', 'Password'),
                           icon: Icons.lock_rounded,
                           obscureText: _isPasswordHidden,
                           suffixIcon: IconButton(
@@ -1439,10 +2658,14 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                                   : Icons.visibility_off_rounded,
                               color: BrandColors.textMuted,
                             ),
-                            tooltip: _isPasswordHidden ? 'Show password' : 'Hide password',
+                            tooltip: _isPasswordHidden
+                                ? context.tr('Show password', 'Ipakita ang password')
+                                : context.tr('Hide password', 'Itago ang password'),
                           ),
                           validator: (value) {
-                            if ((value ?? '').isEmpty) return 'Password is required.';
+                            if ((value ?? '').isEmpty) {
+                              return context.tr('Password is required.', 'Kinakailangan ang password.');
+                            }
                             return null;
                           },
                         ),
@@ -1483,13 +2706,77 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                               height: 22,
                               child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white),
                             )
-                          : const Text('Sign In', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                          : Text(
+                              context.tr('Sign In', 'Mag-sign In'),
+                              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                            ),
                     ),
                   ),
+                  if (_hasSavedSession && _hasBiometrics) ...[
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        const Expanded(child: Divider()),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Text(
+                            context.tr('or', 'o'),
+                            style: const TextStyle(
+                              color: BrandColors.textMuted,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const Expanded(child: Divider()),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: OutlinedButton.icon(
+                        onPressed: _isLoading || _isVerifyingBiometrics
+                            ? null
+                            : _loginWithBiometrics,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: BrandColors.cyan,
+                          side: const BorderSide(color: BrandColors.cyan),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        icon: _isVerifyingBiometrics
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: BrandColors.cyan,
+                                ),
+                              )
+                            : const Icon(Icons.fingerprint_rounded),
+                        label: Text(
+                          _isVerifyingBiometrics
+                              ? context.tr(
+                                  'Verifying fingerprint...',
+                                  'Kinukumpirma ang fingerprint...',
+                                )
+                              : context.tr(
+                                  'Login with Fingerprint',
+                                  'Mag-login gamit ang Fingerprint',
+                                ),
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 10),
                   TextButton(
                     onPressed: _showForgotPasswordForm,
-                    child: const Text('Forgot Password?'),
+                    child: Text(
+                      context.tr('Forgot Password?', 'Nakalimutan ang Password?'),
+                    ),
                   ),
                 ],
               ),
@@ -1500,20 +2787,218 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     );
   }
 
+  Widget _buildAppUnlockGate() {
+    return SafeArea(
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _passwordUnlockMode ? Icons.lock_rounded : Icons.fingerprint_rounded,
+                size: 72,
+                color: BrandColors.cyan,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                context.tr('App Locked', 'Naka-lock ang App'),
+                style: const TextStyle(
+                  color: BrandColors.text,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _passwordUnlockMode
+                    ? context.tr(
+                        'Enter your password to unlock the app.',
+                        'Ilagay ang iyong password para i-unlock ang app.',
+                      )
+                    : context.tr(
+                        'Use your fingerprint to unlock the app.',
+                        'Gamitin ang iyong fingerprint para i-unlock ang app.',
+                      ),
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: BrandColors.textMuted, fontSize: 13),
+              ),
+              const SizedBox(height: 24),
+              if (_passwordUnlockMode) ...[
+                TextField(
+                  controller: _unlockPasswordCtrl,
+                  obscureText: true,
+                  autofocus: true,
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _unlockWithPassword(),
+                  style: const TextStyle(color: BrandColors.text, fontSize: 15),
+                  decoration: InputDecoration(
+                    labelText: context.tr('Password', 'Password'),
+                    prefixIcon: const Icon(Icons.lock_rounded, color: BrandColors.textMuted),
+                    filled: true,
+                    fillColor: BrandColors.bg,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: BrandColors.border),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: BrandColors.border),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: BrandColors.cyan, width: 1.6),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton.icon(
+                    onPressed: _isUnlockingWithPassword ? null : _unlockWithPassword,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: BrandColors.cyan,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    icon: _isUnlockingWithPassword
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.lock_open_rounded),
+                    label: Text(
+                      _isUnlockingWithPassword
+                          ? context.tr('Unlocking...', 'Ina-unlock...')
+                          : context.tr('Unlock with Password', 'I-unlock gamit ang Password'),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextButton(
+                  onPressed: () {
+                    _unlockPasswordCtrl.clear();
+                    setState(() => _passwordUnlockMode = false);
+                  },
+                  child: Text(context.tr('Use fingerprint instead', 'Gamitin ang fingerprint sa halip')),
+                ),
+              ] else ...[
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton.icon(
+                    onPressed: _isVerifyingBiometrics ? null : _unlockApp,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: BrandColors.cyan,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    icon: _isVerifyingBiometrics
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.fingerprint_rounded),
+                    label: Text(
+                      _isVerifyingBiometrics
+                          ? context.tr('Unlocking...', 'Ina-unlock...')
+                          : context.tr('Unlock with Fingerprint', 'I-unlock gamit ang Fingerprint'),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextButton(
+                  onPressed: () {
+                    setState(() => _passwordUnlockMode = true);
+                    _unlockPasswordCtrl.clear();
+                  },
+                  child: Text(context.tr('Use password instead', 'Gamitin ang password sa halip')),
+                ),
+              ],
+              TextButton(
+                onPressed: _logout,
+                child: Text(context.tr('Log out instead', 'Mag-logout na lang')),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildEmployeeDashboard() {
     final todayLog = _todayLog();
     final statusColor = _todayStatusColor(todayLog);
-    final total = _payrollTotals.isNotEmpty
-        ? Map<String, dynamic>.from(_payrollTotals.first as Map)
-        : <String, dynamic>{};
     final recentLogs = _sortedGroupedLogs().take(3).toList();
+    final now = DateTime.now();
 
     return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
+      child: RefreshIndicator(
+        onRefresh: _handleDashboardRefresh,
+        color: BrandColors.cyan,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+            _card(
+              child: Row(
+                children: [
+                  Container(
+                    width: 54,
+                    height: 54,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE9F7FB),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: const Icon(Icons.schedule_rounded, color: BrandColors.cyan, size: 28),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _dashboardClockLabel(now),
+                          style: const TextStyle(
+                            color: BrandColors.text,
+                            fontSize: 26,
+                            fontWeight: FontWeight.w900,
+                            height: 1.0,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _dashboardDateLabel(now),
+                          style: const TextStyle(
+                            color: BrandColors.textMuted,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_status.isNotEmpty)
+                    _pill(_status.toUpperCase(), const Color(0xFFEAF8EF), const Color(0xFF147A3A)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
             _card(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1523,11 +3008,45 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       Container(
                         width: 54,
                         height: 54,
+                        clipBehavior: Clip.antiAlias,
                         decoration: BoxDecoration(
                           color: statusColor.withValues(alpha: 0.13),
-                          borderRadius: BorderRadius.circular(16),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: statusColor.withValues(alpha: 0.35),
+                            width: 2,
+                          ),
                         ),
-                        child: Icon(Icons.badge_rounded, color: statusColor, size: 28),
+                        child: _photoUrl.isNotEmpty
+                            ? Image.network(
+                                '${AppConstants.baseUrl}$_photoUrl',
+                                fit: BoxFit.cover,
+                                loadingBuilder: (context, child, progress) {
+                                  if (progress == null) return child;
+                                  return Center(
+                                    child: SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: statusColor,
+                                      ),
+                                    ),
+                                  );
+                                },
+                                errorBuilder: (context, error, stack) {
+                                  return Icon(
+                                    Icons.person_rounded,
+                                    color: statusColor,
+                                    size: 30,
+                                  );
+                                },
+                              )
+                            : Icon(
+                                Icons.person_rounded,
+                                color: statusColor,
+                                size: 30,
+                              ),
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -1577,34 +3096,65 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       borderRadius: BorderRadius.circular(18),
                       border: Border.all(color: statusColor.withValues(alpha: 0.18)),
                     ),
-                    child: Row(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        Icon(Icons.today_rounded, color: statusColor, size: 24),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _todayStatusTitle(todayLog),
-                                style: const TextStyle(
-                                  color: BrandColors.text,
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w900,
-                                ),
+                        Row(
+                          children: [
+                            Icon(Icons.today_rounded, color: statusColor, size: 24),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    _todayStatusTitle(todayLog),
+                                    style: const TextStyle(
+                                      color: BrandColors.text,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _todayStatusCaption(todayLog),
+                                    style: const TextStyle(
+                                      color: BrandColors.textMuted,
+                                      fontSize: 12,
+                                      height: 1.3,
+                                    ),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                _todayStatusCaption(todayLog),
-                                style: const TextStyle(
-                                  color: BrandColors.textMuted,
-                                  fontSize: 12,
-                                  height: 1.3,
-                                ),
+                            ),
+                          ],
+                        ),
+                        if (todayLog != null) ...[  
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              _timeChip(
+                                icon: Icons.login_rounded,
+                                label: context.tr('In', 'Pasok'),
+                                value: _timeOfDay(todayLog['time_in']),
+                              ),
+                              const SizedBox(width: 8),
+                              _timeChip(
+                                icon: Icons.logout_rounded,
+                                label: context.tr('Out', 'Uwi'),
+                                value: _timeOfDay(todayLog['time_out']),
+                              ),
+                              const SizedBox(width: 8),
+                              _timeChip(
+                                icon: Icons.timelapse_rounded,
+                                label: context.tr('Duration', 'Tagal'),
+                                value: (todayLog['duration']?.toString() ?? '').isNotEmpty
+                                    ? _formatDurationShort(todayLog['duration'].toString())
+                                    : '-',
                               ),
                             ],
                           ),
-                        ),
+                        ],
                       ],
                     ),
                   ),
@@ -1615,11 +3165,11 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                         child: ElevatedButton.icon(
                           onPressed: _todayAction(todayLog),
                           icon: Icon(
-                            _todayActionLabel(todayLog) == 'Time Out'
-                                ? Icons.logout_rounded
-                                : _todayActionLabel(todayLog) == 'View Logs'
-                                    ? Icons.list_alt_rounded
-                                    : Icons.login_rounded,
+                            todayLog == null
+                                ? Icons.login_rounded
+                                : _hasTimedOutToday(todayLog)
+                                    ? Icons.check_circle_rounded
+                                    : Icons.logout_rounded,
                             size: 18,
                           ),
                           label: Text(_todayActionLabel(todayLog)),
@@ -1634,9 +3184,9 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       const SizedBox(width: 10),
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: () => setState(() => _selectedSection = EmployeeSection.payroll),
+                          onPressed: () => _openPayrollSection(),
                           icon: const Icon(Icons.payments_rounded, size: 18),
-                          label: const Text('Payroll'),
+                          label: Text(context.tr('Payroll', 'Payroll')),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: const Color(0xFF364152),
                             foregroundColor: Colors.white,
@@ -1657,7 +3207,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                 children: [
                   Row(
                     children: [
-                      Expanded(child: _sectionHeader('Overview', Icons.dashboard_rounded)),
+                      Expanded(child: _sectionHeader(context.tr('Overview', 'Buod'), Icons.dashboard_rounded)),
                       Text(
                         _dashboardUpdatedLabel(),
                         style: const TextStyle(
@@ -1673,7 +3223,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     children: [
                       Expanded(
                         child: _miniStat(
-                          'Present',
+                          context.tr('Present', 'Presente'),
                           '${_dashboardPresentDaysCount(_dashboardStatFilter)}',
                           Icons.event_available_rounded,
                           BrandColors.cyan,
@@ -1682,8 +3232,8 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       const SizedBox(width: 10),
                       Expanded(
                         child: _miniStat(
-                          'Completed',
-                          '${_sortedGroupedLogs().where((row) => row['time_in'] != null && row['time_out'] != null).length}',
+                          context.tr('Records', 'Mga Record'),
+                          '${_dashboardRecordCount(_dashboardStatFilter)}',
                           Icons.task_alt_rounded,
                           const Color(0xFF147A3A),
                         ),
@@ -1691,9 +3241,9 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       const SizedBox(width: 10),
                       Expanded(
                         child: _miniStat(
-                          'Open',
-                          '${_sortedGroupedLogs().where((row) => row['time_in'] != null && row['time_out'] == null).length}',
-                          Icons.pending_actions_rounded,
+                          context.tr('Hours', 'Oras'),
+                          _dashboardHoursWorked(_dashboardStatFilter),
+                          Icons.schedule_rounded,
                           const Color(0xFFC46A18),
                         ),
                       ),
@@ -1704,62 +3254,80 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     spacing: 8,
                     runSpacing: 8,
                     children: [
-                      _filterChip('month', 'Month'),
-                      _filterChip('7d', '7 Days'),
-                      _filterChip('all', 'All Time'),
+                      _filterChip('month', context.tr('This Month', 'Ngayong Buwan')),
+                      _filterChip('7d', context.tr('Last 7 Days', 'Huling 7 Araw')),
+                      _filterChip('all', context.tr('All Time', 'Lahat')),
                     ],
                   ),
-                  const SizedBox(height: 14),
-                  _payrollStrip(total),
                 ],
               ),
             ),
+            if (_queuedCount > 0) ...[
+              const SizedBox(height: 14),
+              _card(
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.cloud_queue_rounded,
+                      color: Color(0xFFB45309),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _isSyncingQueue
+                            ? context.tr('Syncing offline records...', 'Sini-sync ang offline records...')
+                            : _queuedCount == 1
+                                ? context.tr('1 offline record waiting to sync.', '1 offline record ang naghihintay i-sync.')
+                                : context.tr('$_queuedCount offline records waiting to sync.',
+                                    '$_queuedCount offline records ang naghihintay i-sync.'),
+                        style: const TextStyle(
+                          color: BrandColors.text,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                    if (!_isSyncingQueue)
+                      TextButton(
+                        onPressed: () => _syncOfflineQueue(),
+                        child: Text(context.tr('Sync', 'I-sync')),
+                      )
+                    else
+                      const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 14),
             _card(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _sectionHeader('Recent Attendance', Icons.history_rounded),
+                  _sectionHeader(context.tr('Recent Attendance', 'Kamakailang Attendance'), Icons.history_rounded),
                   const SizedBox(height: 10),
                   if (recentLogs.isEmpty)
-                    const Text(
-                      'No attendance logs yet.',
-                      style: TextStyle(color: BrandColors.textMuted, fontSize: 13),
+                    EmptyState(
+                      icon: Icons.history_rounded,
+                      title: context.tr('No attendance logs yet.', 'Wala pang attendance logs.'),
+                      subtitle: context.tr(
+                        'Your recent attendance records will show up here.',
+                        'Dito lalabas ang iyong mga kamakailang attendance records.',
+                      ),
                     )
                   else
                     ...recentLogs.map((row) => _compactAttendanceRow(row)),
                 ],
               ),
             ),
-            const SizedBox(height: 14),
-            _card(
-              child: Row(
-                children: [
-                  Icon(
-                    _pushStatus.uploaded ? Icons.notifications_active_rounded : Icons.notifications_off_rounded,
-                    color: _pushStatus.uploaded ? const Color(0xFF147A3A) : BrandColors.textMuted,
-                    size: 22,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      _pushCompactLabel(),
-                      style: const TextStyle(
-                        color: BrandColors.text,
-                        fontWeight: FontWeight.w800,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ),
-                  if (!_pushStatus.uploaded)
-                    TextButton(
-                      onPressed: _token.isEmpty ? null : _registerPushNotifications,
-                      child: const Text('Fix'),
-                    ),
-                ],
-              ),
-            ),
           ],
+        ),
         ),
       ),
     );
@@ -1773,9 +3341,6 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
     final selectedLogs = _selectedCalendarLogs();
     final selectedLog = selectedLogs.isNotEmpty ? selectedLogs.first : null;
     final hasRecord = selectedLog != null;
-    final isComplete = selectedLog == null
-        ? false
-        : selectedLog['time_in'] != null && selectedLog['time_out'] != null;
     const weekdays = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 
     return _card(
@@ -1796,22 +3361,25 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     child: const Icon(Icons.calendar_month_rounded, color: BrandColors.cyan, size: 24),
                   ),
                   const SizedBox(width: 12),
-                  const Expanded(
+                  Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Calendar',
-                          style: TextStyle(
+                          context.tr('Calendar', 'Kalendaryo'),
+                          style: const TextStyle(
                             color: BrandColors.text,
                             fontSize: 18,
                             fontWeight: FontWeight.w900,
                           ),
                         ),
-                        SizedBox(height: 4),
+                        const SizedBox(height: 4),
                         Text(
-                          'Quick date view for your attendance logs.',
-                          style: TextStyle(
+                          context.tr(
+                            'Quick date view for your attendance logs.',
+                            'Mabilis na pagtingin sa petsa ng iyong mga attendance logs.',
+                          ),
+                          style: const TextStyle(
                             color: BrandColors.textMuted,
                             fontSize: 12,
                             height: 1.35,
@@ -1828,7 +3396,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                 children: [
                   _monthNavButton(
                     icon: Icons.chevron_left_rounded,
-                    onPressed: () => _changeCalendarMonth(-1),
+                    onPressed: () { HapticFeedback.selectionClick(); _changeCalendarMonth(-1); },
                   ),
                   Expanded(
                     child: Column(
@@ -1844,7 +3412,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          'Tap arrows to switch months',
+                          context.tr('Tap arrows to switch months', 'Pindutin ang mga arrow para lumipat ng buwan'),
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             color: BrandColors.textMuted.withValues(alpha: 0.85),
@@ -1857,7 +3425,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   ),
                   _monthNavButton(
                     icon: Icons.chevron_right_rounded,
-                    onPressed: () => _changeCalendarMonth(1),
+                    onPressed: () { HapticFeedback.selectionClick(); _changeCalendarMonth(1); },
                   ),
                 ],
               ),
@@ -1890,9 +3458,9 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Text(
-                            'Days Present',
-                            style: TextStyle(
+                          Text(
+                            context.tr('Days Present', 'Mga Araw na Presente'),
+                            style: const TextStyle(
                               color: BrandColors.textMuted,
                               fontSize: 11,
                               fontWeight: FontWeight.w800,
@@ -1901,7 +3469,12 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '$monthAttendanceCount day${monthAttendanceCount == 1 ? '' : 's'}',
+                            context.tr(
+                              '$monthAttendanceCount day${monthAttendanceCount == 1 ? '' : 's'}',
+                              monthAttendanceCount == 1
+                                  ? '$monthAttendanceCount araw'
+                                  : '$monthAttendanceCount araw',
+                            ),
                             style: const TextStyle(
                               color: BrandColors.text,
                               fontSize: 20,
@@ -1975,6 +3548,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   final hasAttendance = attendanceCount > 0;
                   return InkWell(
                     onTap: () {
+                      HapticFeedback.selectionClick();
                       setState(() => _selectedCalendarDate = day);
                     },
                     borderRadius: BorderRadius.circular(12),
@@ -2065,7 +3639,10 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
               ),
               const SizedBox(height: 12),
               Text(
-                'Selected: ${dayName(_selectedCalendarDate)}',
+                context.tr(
+                  'Selected: ${dayName(_selectedCalendarDate)}',
+                  'Napili: ${dayName(_selectedCalendarDate)}',
+                ),
                 style: const TextStyle(
                   color: BrandColors.textMuted,
                   fontSize: 12,
@@ -2084,83 +3661,129 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                     ? Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          if (constraints.maxWidth < 420) ...[
+                          Row(
+                            children: [
+                              _calendarStat(
+                                label: context.tr('Time In', 'Pasok'),
+                                value: _timeOfDay(selectedLog['time_in']),
+                                accent: const Color(0xFF147A3A),
+                              ),
+                              const SizedBox(width: 8),
+                              _calendarStat(
+                                label: context.tr('Time Out', 'Uwi'),
+                                value: _timeOfDay(selectedLog['time_out']),
+                                accent: const Color(0xFFC46A18),
+                              ),
+                            ],
+                          ),
+                          if ((selectedLog['duration']?.toString() ?? '').isNotEmpty) ...[
+                            const SizedBox(height: 8),
                             _calendarStat(
-                              label: 'Status',
-                              value: isComplete ? 'Complete' : 'Open',
-                              accent: isComplete ? const Color(0xFF147A3A) : const Color(0xFFB45309),
+                              label: context.tr('Duration', 'Tagal'),
+                              value: _formatDurationShort(selectedLog['duration'].toString()),
+                              accent: const Color(0xFF7C5CDB),
                               fullWidth: true,
-                            ),
-                            const SizedBox(height: 10),
-                            _calendarStat(
-                              label: 'Time In',
-                              value: _fmtTime(selectedLog['time_in']),
-                              accent: BrandColors.cyan,
-                              fullWidth: true,
-                            ),
-                            const SizedBox(height: 10),
-                            _calendarStat(
-                              label: 'Time Out',
-                              value: _fmtTime(selectedLog['time_out']),
-                              accent: const Color(0xFF364152),
-                              fullWidth: true,
-                            ),
-                            const SizedBox(height: 10),
-                            _calendarStat(
-                              label: 'Duration',
-                              value: _fmtDuration(selectedLog['duration']),
-                              accent: const Color(0xFF7C3AED),
-                              fullWidth: true,
-                            ),
-                          ] else ...[
-                            Row(
-                              children: [
-                                _calendarStat(
-                                  label: 'Status',
-                                  value: isComplete ? 'Complete' : 'Open',
-                                  accent: isComplete ? const Color(0xFF147A3A) : const Color(0xFFB45309),
-                                ),
-                                const SizedBox(width: 10),
-                                _calendarStat(
-                                  label: 'Time In',
-                                  value: _fmtTime(selectedLog['time_in']),
-                                  accent: BrandColors.cyan,
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 10),
-                            Row(
-                              children: [
-                                _calendarStat(
-                                  label: 'Time Out',
-                                  value: _fmtTime(selectedLog['time_out']),
-                                  accent: const Color(0xFF364152),
-                                ),
-                                const SizedBox(width: 10),
-                                _calendarStat(
-                                  label: 'Duration',
-                                  value: _fmtDuration(selectedLog['duration']),
-                                  accent: const Color(0xFF7C3AED),
-                                ),
-                              ],
                             ),
                           ],
                         ],
                       )
-                    : const Text(
-                        'No attendance record for the selected date.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: BrandColors.textMuted,
-                          fontSize: 12,
-                          height: 1.4,
-                          fontWeight: FontWeight.w600,
+                    : EmptyState(
+                        icon: Icons.event_busy_rounded,
+                        title: context.tr(
+                          'No attendance record for the selected date.',
+                          'Walang attendance record para sa napiling petsa.',
                         ),
                       ),
               ),
+              ..._dayFinancialsSection(),
             ],
           );
         },
+      ),
+    );
+  }
+
+  List<Widget> _dayFinancialsSection() {
+    final fin = _selectedDayFinancials();
+    if (fin == null || !_dayHasFinancials(fin)) return const [];
+    return [
+      const SizedBox(height: 12),
+      _dayFinancialsCard(fin),
+    ];
+  }
+
+  String _dateKey(DateTime d) {
+    final mm = d.month.toString().padLeft(2, '0');
+    final dd = d.day.toString().padLeft(2, '0');
+    return '${d.year}-$mm-$dd';
+  }
+
+  Map<String, dynamic>? _selectedDayFinancials() {
+    final raw = _dailyFinancials[_dateKey(_selectedCalendarDate)];
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return null;
+  }
+
+  bool _dayHasFinancials(Map<String, dynamic> fin) {
+    return _toMoneyValue(fin['salary']) > 0 ||
+        _toMoneyValue(fin['extra']) > 0 ||
+        _toMoneyValue(fin['cash_advance']) > 0;
+  }
+
+  Widget _dayFinancialsCard(Map<String, dynamic> fin) {
+    final cashAdvance = _toMoneyValue(fin['cash_advance']);
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBF0),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFE9DFC0)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.account_balance_wallet_rounded,
+                  size: 15, color: Color(0xFF8A6D1F)),
+              const SizedBox(width: 6),
+              Text(
+                context.tr('Day Earnings', 'Kita ng Araw'),
+                style: const TextStyle(
+                  color: Color(0xFF8A6D1F),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.6,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              _calendarStat(
+                label: context.tr('Salary', 'Sahod'),
+                value: _fmtMoney(fin['salary']),
+                accent: const Color(0xFF147A3A),
+              ),
+              const SizedBox(width: 8),
+              _calendarStat(
+                label: context.tr('Extra Pay', 'Dagdag Sahod'),
+                value: _fmtMoney(fin['extra']),
+                accent: const Color(0xFF7C5CDB),
+              ),
+            ],
+          ),
+          if (cashAdvance > 0) ...[
+            const SizedBox(height: 8),
+            _calendarStat(
+              label: context.tr('Cash Advance', 'Cash Advance'),
+              value: _fmtMoney(fin['cash_advance']),
+              accent: const Color(0xFFC0392B),
+              fullWidth: true,
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -2228,259 +3851,129 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
 
   Widget _buildEmployeeLogs() {
     return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _card(
-              child: Row(
-                children: [
-                  Container(
-                    width: 48,
-                    height: 48,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFE9F7FB),
-                      borderRadius: BorderRadius.circular(14),
+      child: RefreshIndicator(
+        onRefresh: _handleLogsRefresh,
+        color: BrandColors.cyan,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _card(
+                child: Row(
+                  children: [
+                    Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE9F7FB),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: const Icon(Icons.badge_rounded, color: BrandColors.cyan, size: 24),
                     ),
-                    child: const Icon(Icons.badge_rounded, color: BrandColors.cyan, size: 24),
-                  ),
-                  const SizedBox(width: 12),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            context.tr('Attendance Logs', 'Mga Attendance Logs'),
+                            style: const TextStyle(
+                              color: BrandColors.text,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            context.tr(
+                              'Your attendance records are listed here.',
+                              'Narito ang listahan ng iyong mga attendance records.',
+                            ),
+                            style: const TextStyle(
+                              color: BrandColors.textMuted,
+                              fontSize: 12,
+                              height: 1.35,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              _calendarCard(),
+              const SizedBox(height: 14),
+              Row(
+                children: [
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Attendance Logs',
-                          style: TextStyle(
-                            color: BrandColors.text,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Your attendance records are listed here.',
-                          style: const TextStyle(
-                            color: BrandColors.textMuted,
-                            fontSize: 12,
-                            height: 1.35,
-                          ),
-                        ),
-                      ],
+                    child: ElevatedButton.icon(
+                      onPressed: _isLogsLoading ? null : () { HapticFeedback.lightImpact(); _loadLogs(); },
+                      icon: _isLogsLoading
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Icon(Icons.refresh_rounded, size: 18),
+                      label: Text(context.tr('Refresh', 'I-refresh')),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: BrandColors.cyan,
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size.fromHeight(48),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                      ),
                     ),
                   ),
                 ],
               ),
-            ),
-            const SizedBox(height: 14),
-            _calendarCard(),
-            const SizedBox(height: 14),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _isLogsLoading ? null : () { HapticFeedback.lightImpact(); _loadLogs(); },
-                    icon: _isLogsLoading
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                          )
-                        : const Icon(Icons.refresh_rounded, size: 18),
-                    label: const Text('Refresh'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: BrandColors.cyan,
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size.fromHeight(48),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              const SizedBox(height: 14),
+              if (_isLogsLoading && _groupedLogs.isEmpty)
+                _card(
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Center(
+                      child: CircularProgressIndicator(strokeWidth: 2.4),
                     ),
                   ),
                 ),
+              if (_logsMsg.isNotEmpty) ...[
+                _card(
+                  child: Text(
+                    _logsMsg,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: BrandColors.textMuted, fontSize: 13, height: 1.35),
+                  ),
+                ),
+                const SizedBox(height: 12),
               ],
-            ),
-            const SizedBox(height: 14),
-            if (_logsMsg.isNotEmpty) ...[
-              _card(
-                child: Text(
-                  _logsMsg,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: BrandColors.textMuted, fontSize: 13, height: 1.35),
-                ),
-              ),
-              const SizedBox(height: 12),
             ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildRawLogsPage() {
-    final rawLogs = _filteredRawLogs();
-
-    return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _card(
-              child: Row(
-                children: [
-                  Container(
-                    width: 48,
-                    height: 48,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFFF7E6),
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: const Icon(Icons.receipt_long_rounded, color: Color(0xFFB45309), size: 24),
-                  ),
-                  const SizedBox(width: 12),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Raw Logs',
-                          style: TextStyle(
-                            color: BrandColors.text,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
-                        SizedBox(height: 4),
-                        Text(
-                          'Each time entry is shown as its own record.',
-                          style: TextStyle(
-                            color: BrandColors.textMuted,
-                            fontSize: 12,
-                            height: 1.35,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _isLogsLoading ? null : () { HapticFeedback.lightImpact(); _loadLogs(); },
-                    icon: _isLogsLoading
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                          )
-                        : const Icon(Icons.refresh_rounded, size: 18),
-                    label: const Text('Refresh'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: BrandColors.cyan,
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size.fromHeight(48),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            _searchBar(),
-            const SizedBox(height: 14),
-            if (_logsMsg.isNotEmpty) ...[
-              _card(
-                child: Text(
-                  _logsMsg,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: BrandColors.textMuted, fontSize: 13, height: 1.35),
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
-            if (rawLogs.isEmpty)
-              _card(
-                child: const Text(
-                  'No raw logs available.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: BrandColors.textMuted, fontSize: 13, height: 1.35),
-                ),
-              )
-            else
-              ...rawLogs.map((row) {
-                final type = row['type']?.toString().toLowerCase() ?? '';
-                final isIn = type == 'time_in';
-                final title = isIn ? 'Time In' : 'Time Out';
-                final icon = isIn ? Icons.login_rounded : Icons.logout_rounded;
-                final accent = isIn ? BrandColors.cyan : const Color(0xFF364152);
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF8FAFC),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: BrandColors.border),
-                  ),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 42,
-                        height: 42,
-                        decoration: BoxDecoration(
-                          color: accent.withValues(alpha: 0.10),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Icon(icon, color: accent, size: 20),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              title,
-                              style: const TextStyle(
-                                color: BrandColors.text,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              '${_fmtDate(row['timestamp'])} • ${_fmtTime(row['timestamp'])}',
-                              style: const TextStyle(
-                                color: BrandColors.textMuted,
-                                fontSize: 12,
-                                height: 1.35,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      _pill(
-                        isIn ? 'IN' : 'OUT',
-                        isIn ? const Color(0xFFEAF8EF) : const Color(0xFFF1F5F9),
-                        accent,
-                      ),
-                    ],
-                  ),
-                );
-              }),
-          ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildPayrollPage() {
-    final total = _payrollTotals.isNotEmpty
-        ? Map<String, dynamic>.from(_payrollTotals.first as Map)
-        : <String, dynamic>{};
-    final history = (total['payment_history'] as List?) ?? const [];
+    final hasPendingCaRequest = _caRequests.any((e) {
+      final row = Map<String, dynamic>.from(e as Map);
+      return (row['status']?.toString() ?? '') == 'pending';
+    });
+    final breakdownPeriods = _breakdownPeriods;
+    final hasPaidPeriods = breakdownPeriods.isNotEmpty;
+    final index = hasPaidPeriods
+        ? _paidPeriodIndex.clamp(0, breakdownPeriods.length - 1)
+        : 0;
+    final currentPeriod = hasPaidPeriods ? breakdownPeriods[index] : null;
+    final periodTypeLabel = _periodTypeLabel.isNotEmpty
+        ? _periodTypeLabel
+        : (currentPeriod?['period_type']?.toString() ?? '');
+    final hasPendingPayslip = _payslipRequests.any((e) {
+      final row = Map<String, dynamic>.from(e as Map);
+      return (row['status']?.toString() ?? '') == 'pending';
+    });
     return RefreshIndicator(
       onRefresh: _loadLogs,
       color: BrandColors.cyan,
@@ -2492,81 +3985,515 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Payroll',
-                  style: TextStyle(
+                Text(
+                  context.tr('Cash Advance Requests', 'Mga Kahilingan ng Paunang Sahod'),
+                  style: const TextStyle(color: BrandColors.text, fontSize: 16, fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  context.tr(
+                    'Request a salary advance for admin approval.',
+                    'Humingi ng paunang sahod para i-approve ng admin.',
+                  ),
+                  style: const TextStyle(color: BrandColors.textMuted, fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                if (_caRequestsLoading && _caRequests.isEmpty)
+                  const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(12),
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                else if (_caRequests.isEmpty)
+                  EmptyState(
+                    icon: Icons.request_page_outlined,
+                    title: context.tr('No requests yet.', 'Wala pang kahilingan.'),
+                  )
+                else
+                  ..._caRequests.map((entry) {
+                    final row = Map<String, dynamic>.from(entry as Map);
+                    final status = row['status']?.toString() ?? 'pending';
+                    final isCancelling = _caCancelRequestId != null &&
+                        _caCancelRequestId.toString() == row['id'].toString();
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _fmtMoney(row['amount']),
+                                  style: const TextStyle(
+                                    color: BrandColors.text,
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _formatRequestDate(row['created_at']?.toString()),
+                                  style: const TextStyle(
+                                    color: BrandColors.textMuted,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                                if ((row['pickup_date']?.toString() ?? '').isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Text(
+                                      '${context.tr('Pickup', 'Pagkuha')}: ${_formatRequestDate(row['pickup_date']?.toString())}',
+                                      style: const TextStyle(
+                                        color: BrandColors.cyan,
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              _caStatusPill(status),
+                              if (status == 'pending') ...[
+                                const SizedBox(height: 4),
+                                GestureDetector(
+                                  onTap: isCancelling
+                                      ? null
+                                      : () => _cancelCashAdvanceRequest(row),
+                                  child: Text(
+                                    isCancelling
+                                        ? context.tr('Cancelling…', 'Kinakansela…')
+                                        : context.tr('Cancel', 'Kanselahin'),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                      color: isCancelling
+                                          ? BrandColors.textMuted
+                                          : const Color(0xFFC62828),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ],
+                      ),
+                    );
+                  }),
+                if (!hasPendingCaRequest) ...[
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _caRequestSubmitting ? null : _showCashAdvanceRequestDialog,
+                      icon: const Icon(Icons.add, size: 18),
+                      label: Text(context.tr('Request Cash Advance', 'Humingi ng Paunang Sahod')),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          _card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        context.tr('Request Payslip', 'Humingi ng Payslip'),
+                        style: const TextStyle(color: BrandColors.text, fontSize: 16, fontWeight: FontWeight.w900),
+                      ),
+                    ),
+                    if (_isPayslipLoading)
+                      const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  context.tr(
+                    'Request your payslip as a PDF. The admin approves it and we email it to you.',
+                    'Humingi ng iyong payslip bilang PDF. I-aaprove ng admin at iesend ito sa iyong email.',
+                  ),
+                  style: const TextStyle(color: BrandColors.textMuted, fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                if (_payslipPeriods.isEmpty)
+                  EmptyState(
+                    icon: Icons.receipt_long_outlined,
+                    title: context.tr('No paid periods yet.', 'Wala pang bayad na panahon.'),
+                    subtitle: context.tr(
+                      'Payslips become available once a period is generated and paid.',
+                      'Magiging available ang payslip kapag na-generate at nabayaran na ang isang panahon.',
+                    ),
+                  )
+                else if (hasPendingPayslip)
+                  _infoRow(
+                    context.tr('Pending request', 'Naghihintay na kahilingan'),
+                    context.tr('Wait for the admin to approve and email it.', 'Hintayin ang pag-apruba at email ng admin.'),
+                  )
+                else ...[
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: _isPayslipSubmitting ? null : _showRequestPayslipDialog,
+                      icon: const Icon(Icons.email_outlined, size: 18),
+                      label: Text(context.tr('Request Payslip', 'Humingi ng Payslip')),
+                    ),
+                  ),
+                ],
+                if (_payslipRequests.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  ..._payslipRequests.map((entry) {
+                    final row = Map<String, dynamic>.from(entry as Map);
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '${row['period_start'] ?? '-'} → ${row['period_end'] ?? '-'}',
+                                  style: const TextStyle(
+                                    color: BrandColors.text,
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _formatRequestDate(row['requested_at']?.toString()),
+                                  style: const TextStyle(
+                                    color: BrandColors.textMuted,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          _caStatusPill(row['status']?.toString() ?? 'pending'),
+                        ],
+                      ),
+                    );
+                  }),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          _card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        context.tr('Period Breakdown', 'Detalye ng Bawat Panahon'),
+                        style: const TextStyle(color: BrandColors.text, fontSize: 16, fontWeight: FontWeight.w900),
+                      ),
+                    ),
+                    if (_isPayrollPeriodLoading)
+                      const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                if (!hasPaidPeriods)
+                  EmptyState(
+                    icon: Icons.pie_chart_outline,
+                    title: context.tr('No paid periods yet.', 'Wala pang bayad na panahon.'),
+                    subtitle: context.tr(
+                      'Your payroll breakdown appears here once a period is generated and paid.',
+                      'Dito lalabas ang iyong payroll kapag na-generate at nabayaran na ang isang panahon.',
+                    ),
+                  )
+                else ...[
+                  if (periodTypeLabel.isNotEmpty) ...[
+                    _pill(periodTypeLabel.toUpperCase(), const Color(0xFFE0F2FE), const Color(0xFF0369A1)),
+                    const SizedBox(height: 10),
+                  ],
+                  Row(
+                    children: [
+                      IconButton(
+                        onPressed: index > 0
+                            ? () => setState(() => _paidPeriodIndex--)
+                            : null,
+                        icon: const Icon(Icons.chevron_left_rounded),
+                        color: index > 0 ? BrandColors.cyan : BrandColors.textMuted,
+                      ),
+                      Expanded(
+                        child: Column(
+                          children: [
+                            Text(
+                              '${context.tr('Period', 'Panahon')} ${index + 1} ${context.tr('of', 'ng')} ${breakdownPeriods.length}',
+                              style: const TextStyle(
+                                color: BrandColors.text,
+                                fontWeight: FontWeight.w800,
+                                fontSize: 13,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              '${currentPeriod!['start_date'] ?? '-'} → ${currentPeriod['end_date'] ?? '-'}',
+                              style: const TextStyle(
+                                color: BrandColors.textMuted,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: index < breakdownPeriods.length - 1
+                            ? () => setState(() => _paidPeriodIndex++)
+                            : null,
+                        icon: const Icon(Icons.chevron_right_rounded),
+                        color: index < breakdownPeriods.length - 1 ? BrandColors.cyan : BrandColors.textMuted,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  _periodBreakdownTile(currentPeriod),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Center(
+            child: Text(
+              context.tr('Only paid or generated periods are shown.', 'Ang mga bayad o na-generate na panahon lang ang ipinapakita.'),
+              style: const TextStyle(color: BrandColors.textMuted, fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _periodBreakdownTile(Map<String, dynamic> row) {
+    final status = (row['payment_status']?.toString() ?? 'unpaid').toUpperCase();
+    final Color pillBg;
+    final Color pillFg;
+    if (status == 'PAID') {
+      pillBg = const Color(0xFFE8F5E9);
+      pillFg = const Color(0xFF147A3A);
+    } else if (status == 'GENERATED') {
+      pillBg = const Color(0xFFE3F2FD);
+      pillFg = const Color(0xFF0B5FAD);
+    } else if (status == 'PARTIAL') {
+      pillBg = const Color(0xFFFFF3E0);
+      pillFg = const Color(0xFFB45309);
+    } else {
+      pillBg = const Color(0xFFFFEBEE);
+      pillFg = const Color(0xFFC62828);
+    }
+    final history = (row['payment_history'] as List?) ?? const [];
+    final salary = _toMoneyValue(row['salary'] ?? row['amount']);
+    final extra = _toMoneyValue(row['extra_payment']);
+    final paid = _toMoneyValue(row['paid_amount']);
+    final balance = _toMoneyValue(row['balance']);
+    final cashAdvanceBalance = _toMoneyValue(row['remaining_bale_balance']);
+    final totalEarnings = salary + extra;
+    final netPay = totalEarnings;
+
+    Widget sectionLabel(String label) => Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Row(
+            children: [
+              Container(
+                width: 3,
+                height: 12,
+                decoration: BoxDecoration(
+                  color: BrandColors.cyan,
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: BrandColors.textMuted,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.6,
+                ),
+              ),
+            ],
+          ),
+        );
+
+    Widget breakdownRow(String label, String value, {TextStyle? valueStyle}) => Row(
+          children: [
+            SizedBox(
+              width: 94,
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: BrandColors.textMuted,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                value,
+                textAlign: TextAlign.right,
+                style: valueStyle ??
+                    const TextStyle(
+                      color: BrandColors.text,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ),
+          ],
+        );
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: BrandColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${row['start_date'] ?? '-'} → ${row['end_date'] ?? '-'}',
+                  style: const TextStyle(
                     color: BrandColors.text,
-                    fontSize: 22,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              _pill(status, pillBg, pillFg),
+            ],
+          ),
+          const SizedBox(height: 12),
+          sectionLabel(context.tr('Earnings', 'Mga Kita')),
+          const SizedBox(height: 6),
+          breakdownRow(context.tr('Days', 'Mga Araw'), '${row['days'] ?? 0}'),
+          const SizedBox(height: 6),
+          breakdownRow(context.tr('Salary', 'Sahod'), _fmtPeso(salary)),
+          if (extra > 0) ...[
+            const SizedBox(height: 6),
+            breakdownRow(context.tr('Extra Pay', 'Dagdag na Sahod'), _fmtPeso(extra)),
+          ],
+          const Divider(height: 18),
+          breakdownRow(
+            context.tr('Total Earnings', 'Kabuuang Kita'),
+            _fmtPeso(totalEarnings),
+            valueStyle: const TextStyle(
+              color: BrandColors.cyan,
+              fontSize: 13,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (cashAdvanceBalance > 0) ...[
+            sectionLabel(context.tr('Cash Advance', 'Paunang Sahod')),
+            const SizedBox(height: 6),
+            breakdownRow(
+              context.tr('Outstanding Balance', 'Natitirang Balanse'),
+              _fmtPeso(cashAdvanceBalance),
+            ),
+          ],
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: BrandColors.surface,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: BrandColors.border),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  context.tr('Net Pay', 'Netong Sahod'),
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 13,
                     fontWeight: FontWeight.w900,
                   ),
                 ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Your pay summary from the payroll system.',
-                  style: TextStyle(color: BrandColors.textMuted, fontSize: 13),
+                Text(
+                  _fmtPeso(netPay),
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                  ),
                 ),
-                const SizedBox(height: 18),
-                _infoRow('Total Pay', _fmtMoney(_payrollSummary['total_amount'] ?? total['amount'])),
-                const SizedBox(height: 10),
-                _infoRow('Paid', _fmtMoney(_payrollSummary['paid_amount'] ?? total['paid_amount'])),
-                const SizedBox(height: 10),
-                _infoRow('Balance', _fmtMoney(_payrollSummary['balance'] ?? total['balance'])),
-                const SizedBox(height: 10),
-                _infoRow('C/A Balance', _fmtMoney(total['remaining_bale_balance'] ?? _payrollSummary['remaining_bale_balance'])),
-                const SizedBox(height: 10),
-                _infoRow('Status', (total['payment_status']?.toString().toUpperCase() ?? 'UNPAID')),
               ],
             ),
           ),
-          const SizedBox(height: 14),
-          _card(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Payment History',
-                  style: TextStyle(color: BrandColors.text, fontSize: 16, fontWeight: FontWeight.w900),
+          const SizedBox(height: 12),
+          sectionLabel(context.tr('Payments', 'Mga Bayad')),
+          const SizedBox(height: 6),
+          breakdownRow(context.tr('Paid', 'Nabayaran'), _fmtPeso(paid)),
+          if (history.isNotEmpty)
+            for (final entry in history)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: breakdownRow(
+                  _fmtPeso(_toMoneyValue((entry as Map)['amount_paid'])),
+                  entry['created_at']?.toString() ?? '-',
                 ),
-                const SizedBox(height: 12),
-                if (history.isEmpty)
-                  const Text('No payment history yet.', style: TextStyle(color: BrandColors.textMuted))
-                else
-                  ...history.map((entry) {
-                    final row = Map<String, dynamic>.from(entry as Map);
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _infoRow(
-                        _fmtMoney(row['amount_paid']),
-                        row['created_at']?.toString() ?? '-',
-                      ),
-                    );
-                  }),
-              ],
+              ),
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: pillBg.withValues(alpha: 0.4),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: pillFg.withValues(alpha: 0.35)),
             ),
-          ),
-          const SizedBox(height: 14),
-          _card(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text(
-                  'Payable Days',
-                  style: TextStyle(color: BrandColors.text, fontSize: 16, fontWeight: FontWeight.w900),
+                Text(
+                  context.tr('Balance', 'Natitira'),
+                  style: const TextStyle(
+                    color: BrandColors.text,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w900,
+                  ),
                 ),
-                const SizedBox(height: 12),
-                if (_payrollRows.isEmpty)
-                  const Text('No payable days yet.', style: TextStyle(color: BrandColors.textMuted))
-                else
-                  ..._payrollRows.take(8).map((entry) {
-                    final row = Map<String, dynamic>.from(entry as Map);
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _infoRow(
-                        row['work_date']?.toString() ?? '-',
-                        _fmtMoney(row['amount']),
-                      ),
-                    );
-                  }),
+                Text(
+                  _fmtPeso(balance),
+                  style: TextStyle(
+                    color: pillFg,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
               ],
             ),
           ),
@@ -2574,6 +4501,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
       ),
     );
   }
+
 
   Widget _buildEmployeeProfile() {
     return SafeArea(
@@ -2593,6 +4521,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                         Container(
                           width: 82,
                           height: 82,
+                          clipBehavior: Clip.antiAlias,
                           decoration: BoxDecoration(
                             color: const Color(0xFF00E676),
                             shape: BoxShape.circle,
@@ -2600,17 +4529,31 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                               color: BrandColors.border,
                               width: 2,
                             ),
-                            image: _photoUrl.isNotEmpty
-                                ? DecorationImage(
-                                    image: NetworkImage(
-                                      '${AppConstants.baseUrl}$_photoUrl',
-                                    ),
-                                    fit: BoxFit.cover,
-                                  )
-                                : null,
                           ),
                           child: _photoUrl.isNotEmpty
-                              ? null
+                              ? Image.network(
+                                  '${AppConstants.baseUrl}$_photoUrl',
+                                  fit: BoxFit.cover,
+                                  loadingBuilder: (context, child, progress) {
+                                    if (progress == null) return child;
+                                    return const Center(
+                                      child: SizedBox(
+                                        width: 22,
+                                        height: 22,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                  errorBuilder: (context, error, stack) {
+                                    return const Icon(
+                                      Icons.person_rounded,
+                                      color: Colors.white,
+                                      size: 42,
+                                    );
+                                  },
+                                )
                               : const Icon(
                                   Icons.person_rounded,
                                   color: Colors.white,
@@ -2645,7 +4588,9 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   ),
                   const SizedBox(height: 10),
                   Text(
-                    _photoUrl.isNotEmpty ? 'Tap photo to change' : 'Tap to upload your photo',
+                    _photoUrl.isNotEmpty
+                        ? context.tr('Tap photo to change', 'Pindutin ang photo para palitan')
+                        : context.tr('Tap to upload your photo', 'Pindutin para i-upload ang iyong photo'),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: BrandColors.textMuted,
@@ -2655,7 +4600,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   ),
                   const SizedBox(height: 14),
                   Text(
-                    _name.isNotEmpty ? _name : 'Employee',
+                    _name.isNotEmpty ? _name : context.tr('Employee', 'Empleyado'),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: BrandColors.text,
@@ -2665,7 +4610,7 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    _employeeId.isNotEmpty ? _employeeId : 'No employee ID',
+                    _employeeId.isNotEmpty ? _employeeId : context.tr('No employee ID', 'Walang employee ID'),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: BrandColors.textMuted,
@@ -2684,36 +4629,47 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Account Info',
-                    style: TextStyle(
+                  Text(
+                    context.tr('Account Info', 'Impormasyon ng Account'),
+                    style: const TextStyle(
                       color: BrandColors.text,
                       fontSize: 15,
                       fontWeight: FontWeight.w800,
                     ),
                   ),
                   const SizedBox(height: 12),
-                  _infoRow('Name', _name.isNotEmpty ? _name : '-'),
+                  _infoRow(context.tr('Name', 'Pangalan'), _name.isNotEmpty ? _name : '-'),
                   const SizedBox(height: 10),
-                  _infoRow('Employee ID', _employeeId.isNotEmpty ? _employeeId : '-'),
+                  _infoRow(context.tr('Employee ID', 'Employee ID'), _employeeId.isNotEmpty ? _employeeId : '-'),
                   const SizedBox(height: 10),
-                  _infoRow('Email', _email.isNotEmpty ? _email : '-'),
-                  const SizedBox(height: 10),
-                  _infoRow('Phone', _phone.isNotEmpty ? _phone : '-'),
+                  _infoRow(context.tr('Email', 'Email'), _email.isNotEmpty ? _email : '-'),
                   const SizedBox(height: 10),
                   _infoRow(
-                    'Government ID',
-                    _governmentId.isNotEmpty ? _governmentId : '-',
-                    trailing: IconButton(
-                      onPressed: _editGovernmentId,
-                      icon: const Icon(Icons.edit_rounded, size: 17),
-                      color: BrandColors.cyan,
-                      visualDensity: VisualDensity.compact,
-                      tooltip: 'Edit Government ID',
-                    ),
+                    context.tr('Phone', 'Telepono'),
+                    _phone.isNotEmpty ? _phone : '-',
                   ),
                   const SizedBox(height: 10),
-                  _infoRow('Status', _status.isNotEmpty ? _status : '-'),
+                  _infoRow(
+                    context.tr('SSS', 'SSS'),
+                    _sssNumber.isNotEmpty ? _sssNumber : '-',
+                  ),
+                  const SizedBox(height: 10),
+                  _infoRow(
+                    context.tr('PhilHealth', 'PhilHealth'),
+                    _philhealthNumber.isNotEmpty ? _philhealthNumber : '-',
+                  ),
+                  const SizedBox(height: 10),
+                  _infoRow(
+                    context.tr('Pag-IBIG', 'Pag-IBIG'),
+                    _pagibigNumber.isNotEmpty ? _pagibigNumber : '-',
+                  ),
+                  const SizedBox(height: 10),
+                  _infoRow(
+                    context.tr('TIN', 'TIN'),
+                    _tinNumber.isNotEmpty ? _tinNumber : '-',
+                  ),
+                  const SizedBox(height: 10),
+                  _infoRow(context.tr('Status', 'Status'), _status.isNotEmpty ? _status : '-'),
                 ],
               ),
             ),
@@ -2722,9 +4678,9 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Biometrics',
-                    style: TextStyle(
+                  Text(
+                    context.tr('App Lock', 'App Lock'),
+                    style: const TextStyle(
                       color: BrandColors.text,
                       fontSize: 15,
                       fontWeight: FontWeight.w800,
@@ -2733,8 +4689,14 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                   const SizedBox(height: 8),
                   Text(
                     _hasBiometrics
-                        ? 'Fingerprint is available on this device. It stays on your device and is never uploaded.'
-                        : 'No fingerprint is available on this device. You can still mark your attendance without it.',
+                        ? context.tr(
+                            'Require your fingerprint to open the app when you return or restart it.',
+                            'Kailanganin ang iyong fingerprint para mabuksan ang app kapag bumalik o nag-restart ka.',
+                          )
+                        : context.tr(
+                            'Fingerprint is not available on this device, so the app lock cannot be enabled.',
+                            'Hindi available ang fingerprint sa device na ito, kaya hindi maaaring i-enable ang app lock.',
+                          ),
                     style: const TextStyle(
                       color: BrandColors.textMuted,
                       fontSize: 12,
@@ -2742,38 +4704,53 @@ class _EmployeeLoginScreenState extends State<EmployeeLoginScreen>
                       height: 1.4,
                     ),
                   ),
-                  const SizedBox(height: 14),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: _isVerifyingBiometrics || !_hasBiometrics
-                          ? null
-                          : _verifyBiometrics,
-                      style: FilledButton.styleFrom(
-                        backgroundColor: BrandColors.surface,
-                        foregroundColor: BrandColors.text,
-                        side: const BorderSide(color: BrandColors.border),
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
+                  const SizedBox(height: 6),
+                  Consumer<AppLockService>(
+                    builder: (context, lock, _) {
+                      return SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(
+                          context.tr(
+                            'Require fingerprint to open',
+                            'Kailanganin ang fingerprint para mabuksan',
+                          ),
+                          style: const TextStyle(
+                            color: BrandColors.text,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
-                      ),
-                      icon: _isVerifyingBiometrics
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.fingerprint_rounded),
-                      label: Text(
-                        _isVerifyingBiometrics
-                            ? 'Verifying...'
-                            : 'Verify Fingerprint',
-                        style: const TextStyle(fontWeight: FontWeight.w800),
-                      ),
-                    ),
+                        value: lock.enabled,
+                        activeTrackColor: BrandColors.cyan,
+                        onChanged: !_hasBiometrics
+                            ? null
+                            : (value) => lock.setEnabled(value),
+                      );
+                    },
                   ),
                 ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            _card(
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _logout,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFB31D18),
+                    side: const BorderSide(color: Color(0xFFE2B0B0)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  icon: const Icon(Icons.logout_rounded, size: 18),
+                  label: Text(
+                    context.tr('Logout', 'Mag-logout'),
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
               ),
             ),
           ],
@@ -3457,22 +5434,25 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             child: const Icon(Icons.lock_reset_rounded, color: BrandColors.cyan),
                           ),
                           const SizedBox(width: 12),
-                          const Expanded(
+                          Expanded(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  'Forgot Password',
-                                  style: TextStyle(
+                                  context.tr('Forgot Password', 'Nakalimutan ang Password'),
+                                  style: const TextStyle(
                                     color: BrandColors.text,
                                     fontSize: 18,
                                     fontWeight: FontWeight.w900,
                                   ),
                                 ),
-                                SizedBox(height: 4),
+                                const SizedBox(height: 4),
                                 Text(
-                                  'Use your registered email so we can route the reset request.',
-                                  style: TextStyle(
+                                  context.tr(
+                                    'Use your registered email so we can route the reset request.',
+                                    'Gamitin ang iyong rehistradong email para mapadala namin ang reset request.',
+                                  ),
+                                  style: const TextStyle(
                                     color: BrandColors.textMuted,
                                     fontSize: 12,
                                     height: 1.35,
@@ -3490,7 +5470,7 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                         focusNode: _emailFocusNode,
                         keyboardType: TextInputType.emailAddress,
                         decoration: InputDecoration(
-                          labelText: 'Registered email',
+                          labelText: context.tr('Registered email', 'Rehistradong email'),
                           prefixIcon: const Icon(Icons.email_rounded, color: BrandColors.cyan),
                           filled: true,
                           fillColor: const Color(0xFFF7FAFC),
@@ -3509,8 +5489,8 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                         ),
                         validator: (value) {
                           final text = value?.trim() ?? '';
-                          if (text.isEmpty) return 'Email is required.';
-                          if (!text.contains('@')) return 'Enter a valid email.';
+                          if (text.isEmpty) return context.tr('Email is required.', 'Kinakailangan ang email.');
+                          if (!text.contains('@')) return context.tr('Enter a valid email.', 'Maglagay ng wastong email.');
                           return null;
                         },
                       ),
@@ -3521,7 +5501,7 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             Expanded(
                               child: TextButton(
                                 onPressed: _isSending ? null : _resetToEmailStep,
-                                child: const Text('Use a different email'),
+                                child: Text(context.tr('Use a different email', 'Gumamit ng ibang email')),
                               ),
                             ),
                             const SizedBox(width: 10),
@@ -3532,8 +5512,8 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                                     : _resendCode,
                                 child: Text(
                                   _resendRemainingSeconds > 0
-                                      ? 'Resend in ${_formatCountdown(_resendRemainingSeconds)}'
-                                      : 'Resend code',
+                                      ? '${context.tr('Resend in', 'Ulitin sa')} ${_formatCountdown(_resendRemainingSeconds)}'
+                                      : context.tr('Resend code', 'Ulitin ang code'),
                                 ),
                               ),
                             ),
@@ -3569,16 +5549,16 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             _statusChip(
                               icon: Icons.schedule_rounded,
                               label: _codeExpiryRemainingSeconds > 0
-                                  ? 'Expires in ${_formatCountdown(_codeExpiryRemainingSeconds)}'
-                                  : 'Code expired',
+                                  ? '${context.tr('Expires in', 'Mae-expire sa')} ${_formatCountdown(_codeExpiryRemainingSeconds)}'
+                                  : context.tr('Code expired', 'Nag-expire ang code'),
                               bg: const Color(0xFFFDF2F2),
                               fg: const Color(0xFFB42318),
                             ),
                             _statusChip(
                               icon: Icons.refresh_rounded,
                               label: _resendRemainingSeconds > 0
-                                  ? 'Resend in ${_formatCountdown(_resendRemainingSeconds)}'
-                                  : 'Resend ready',
+                                  ? '${context.tr('Resend in', 'Ulitin sa')} ${_formatCountdown(_resendRemainingSeconds)}'
+                                  : context.tr('Resend ready', 'Handa nang ulitin'),
                               bg: const Color(0xFFF8FAFC),
                               fg: BrandColors.textMuted,
                             ),
@@ -3593,9 +5573,12 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                               borderRadius: BorderRadius.circular(14),
                               border: Border.all(color: const Color(0xFFFECACA)),
                             ),
-                            child: const Text(
-                              'That code has expired. Request a new one to continue.',
-                              style: TextStyle(
+                            child: Text(
+                              context.tr(
+                                'That code has expired. Request a new one to continue.',
+                                'Nag-expire na ang code na iyon. Humingi ng bago para magpatuloy.',
+                              ),
+                              style: const TextStyle(
                                 color: Color(0xFFB42318),
                                 fontSize: 12,
                                 height: 1.45,
@@ -3610,7 +5593,7 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             focusNode: _newPasswordFocusNode,
                             obscureText: _newPasswordHidden,
                             decoration: InputDecoration(
-                              labelText: 'New password',
+                              labelText: context.tr('New password', 'Bagong password'),
                               prefixIcon: const Icon(Icons.lock_rounded, color: BrandColors.cyan),
                               suffixIcon: IconButton(
                                 onPressed: () {
@@ -3638,8 +5621,12 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             ),
                             validator: (value) {
                               final text = value?.trim() ?? '';
-                              if (text.isEmpty) return 'New password is required.';
-                              if (text.length < 8) return 'Password must be at least 8 characters.';
+                              if (text.isEmpty) {
+                                return context.tr('New password is required.', 'Kinakailangan ang bagong password.');
+                              }
+                              if (text.length < 8) {
+                                return context.tr('Password must be at least 8 characters.', 'Ang password ay dapat hindi bababa sa 8 na karakter.');
+                              }
                               return null;
                             },
                           ),
@@ -3649,7 +5636,7 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             focusNode: _confirmPasswordFocusNode,
                             obscureText: _confirmPasswordHidden,
                             decoration: InputDecoration(
-                              labelText: 'Confirm password',
+                              labelText: context.tr('Confirm password', 'Kumpirmahin ang password'),
                               prefixIcon: const Icon(Icons.lock_outline_rounded, color: BrandColors.cyan),
                               suffixIcon: IconButton(
                                 onPressed: () {
@@ -3677,7 +5664,12 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                             ),
                             validator: (value) {
                               final text = value?.trim() ?? '';
-                              if (text.isEmpty) return 'Please confirm your password.';
+                              if (text.isEmpty) {
+                                return context.tr('Please confirm your password.', 'Paki-kumpirma ang iyong password.');
+                              }
+                              if (text != _newPasswordCtrl.text) {
+                                return context.tr('Passwords do not match.', 'Hindi magkatugma ang mga password.');
+                              }
                               return null;
                             },
                           ),
@@ -3690,7 +5682,10 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                               border: Border.all(color: BrandColors.border),
                             ),
                             child: Text(
-                              'Code verified. You can now create your new password.',
+                              context.tr(
+                                'Code verified. You can now create your new password.',
+                                'Na-verify ang code. Maaari ka nang gumawa ng iyong bagong password.',
+                              ),
                               style: const TextStyle(
                                 color: BrandColors.textMuted,
                                 fontSize: 12,
@@ -3707,7 +5702,10 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                               border: Border.all(color: BrandColors.border),
                             ),
                             child: Text(
-                              'Enter the 6-digit code sent to your email, then tap Verify Code.',
+                              context.tr(
+                                'Enter the 6-digit code sent to your email, then tap Verify Code.',
+                                'Ipasok ang 6-digit na code na ipinadala sa iyong email, pagkatapos ay pindutin ang I-verify ang Code.',
+                              ),
                               style: const TextStyle(
                                 color: BrandColors.textMuted,
                                 fontSize: 12,
@@ -3735,7 +5733,7 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                           Expanded(
                             child: TextButton(
                               onPressed: _isSending ? null : () => Navigator.pop(context),
-                              child: const Text('Cancel'),
+                              child: Text(context.tr('Cancel', 'Kanselahin')),
                             ),
                           ),
                           const SizedBox(width: 10),
@@ -3766,10 +5764,10 @@ class _ForgotPasswordPageState extends State<_ForgotPasswordPage> {
                                     )
                                   : Text(
                                       !_codeSent
-                                          ? 'Send Code'
+                                          ? context.tr('Send Code', 'Ipadala ang Code')
                                           : !_codeVerified
-                                              ? 'Verify Code'
-                                              : 'Reset Password',
+                                              ? context.tr('Verify Code', 'I-verify ang Code')
+                                              : context.tr('Reset Password', 'I-reset ang Password'),
                                     ),
                             ),
                           ),

@@ -1,14 +1,18 @@
-import 'dart:async';
+﻿import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:local_auth/local_auth.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../services/api_client.dart';
+import '../services/app_locale.dart';
+import '../services/device_identity.dart';
 import '../utils/api_errors.dart';
-import 'employee_login_screen.dart';
 import '../widgets/brand_logo.dart';
 import '../widgets/result_dialog.dart';
+import 'face_photo_crop_screen.dart';
+import 'registration_status_screen.dart';
 
 part 'registration_widgets.dart';
 
@@ -21,6 +25,7 @@ class RegistrationScreen extends StatefulWidget {
 
 class _RegistrationScreenState extends State<RegistrationScreen> {
   final _formKey = GlobalKey<FormState>();
+  final ImagePicker _imagePicker = ImagePicker();
   final _firstNameCtrl = TextEditingController();
   final _lastNameCtrl = TextEditingController();
   final _emailCtrl = TextEditingController();
@@ -33,9 +38,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   final _confirmPasswordCtrl = TextEditingController();
   bool _passwordVisible = false;
   bool _confirmPasswordVisible = false;
-
-  final LocalAuthentication _localAuth = LocalAuthentication();
-  bool _hasBiometrics = false;
+  String _facePhotoPath = '';
+  bool _facePhotoError = false;
 
   static final RegExp _emailPattern = RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$');
   static final RegExp _sssPattern = RegExp(r'^\d{2}-\d{7}-\d$');
@@ -45,30 +49,11 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   int _pageStep = 0;
   bool _isCheckingAvailability = false;
-  bool _biometricsVerified = false;
   String _statusMsg = '';
   String _submissionStatus =
       'Please wait while we submit your registration.';
   int _submissionAttempt = 0;
   static const int _maxSubmissionAttempts = 3;
-
-  @override
-  void initState() {
-    super.initState();
-    _checkBiometrics();
-  }
-
-  Future<void> _checkBiometrics() async {
-    bool available = false;
-    try {
-      available = await _localAuth.canCheckBiometrics;
-      final isSupported = await _localAuth.isDeviceSupported();
-      available = available && isSupported;
-    } catch (_) {
-      available = false;
-    }
-    if (mounted) setState(() => _hasBiometrics = available);
-  }
 
   @override
   void dispose() {
@@ -88,14 +73,40 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   @override
   Widget build(BuildContext context) {
     if (_pageStep == 2) return _buildSubmitting();
-    if (_pageStep == 1) return _buildBiometricsScreen();
     return _buildInfoForm();
   }
 
-  Future<void> _goToBiometrics() async {
+  Future<void> _pickFacePhoto(ImageSource source) async {
+    final picked = await _imagePicker.pickImage(
+      source: source,
+      maxWidth: 1200,
+      maxHeight: 1200,
+      imageQuality: 85,
+    );
+    if (picked == null) return;
+    if (!mounted) return;
+    final croppedPath = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => FacePhotoCropScreen(imagePath: picked.path),
+      ),
+    );
+    if (croppedPath == null) return;
+    if (!mounted) return;
+    setState(() {
+      _facePhotoPath = croppedPath;
+      _facePhotoError = false;
+    });
+  }
+
+  Future<void> _submitForm() async {
     if (_isCheckingAvailability) return;
 
     if (!(_formKey.currentState?.validate() ?? false)) {
+      return;
+    }
+
+    if (_facePhotoPath.isEmpty) {
+      setState(() => _facePhotoError = true);
       return;
     }
 
@@ -143,44 +154,6 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     if (!mounted) return;
     FocusScope.of(context).unfocus();
     HapticFeedback.mediumImpact();
-    setState(() {
-      _pageStep = 1;
-      _statusMsg = '';
-      _biometricsVerified = false;
-    });
-  }
-
-  Future<void> _verifyBiometrics() async {
-    if (_biometricsVerified) return;
-
-    bool authenticated = false;
-    try {
-      authenticated = await _localAuth.authenticate(
-        localizedReason:
-            'Verify your fingerprint to finish setting up your account.',
-        options: const AuthenticationOptions(
-          biometricOnly: true,
-          stickyAuth: true,
-        ),
-      );
-    } catch (_) {
-      authenticated = false;
-    }
-
-    if (!mounted) return;
-    if (!authenticated) {
-      setState(() {
-        _statusMsg =
-            'Fingerprint verification failed or cancelled. Please try again.';
-      });
-      return;
-    }
-
-    HapticFeedback.heavyImpact();
-    setState(() {
-      _biometricsVerified = true;
-      _statusMsg = '';
-    });
     _submitRegistration();
   }
 
@@ -207,9 +180,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           });
         }
 
-        final response = await ApiClient.postForm(
+        final deviceId = await DeviceIdentity.getId();
+        final response = await ApiClient.sendMultipart(
           '/register',
-          body: {
+          fields: {
             'first_name': _firstNameCtrl.text.trim(),
             'last_name': _lastNameCtrl.text.trim(),
             'email': _emailCtrl.text.trim(),
@@ -219,7 +193,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             'philhealth_number': _philhealthCtrl.text.trim(),
             'pagibig_number': _pagibigCtrl.text.trim(),
             'tin_number': _tinCtrl.text.trim(),
+            if (deviceId.isNotEmpty) 'device_id': deviceId,
           },
+          filePaths: {'photo': _facePhotoPath},
+          timeout: const Duration(seconds: 30),
         );
 
         if (response.statusCode == 200) {
@@ -275,21 +252,15 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   void _showSuccessDialog() {
-    ResultDialog.show(
-      context,
-      title: 'Registration Submitted',
-      message:
-          'Your account has been submitted for approval.\nPlease wait for admin confirmation, then sign in.',
-      accentColor: BrandColors.cyan,
-      icon: Icons.check_rounded,
-      buttonText: 'Done',
-      onConfirm: () {},
-    ).then((_) {
-      if (!mounted) return;
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const EmployeeLoginScreen()),
-      );
-    });
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => RegistrationStatusScreen(
+          email: _emailCtrl.text.trim(),
+          phone: _normalizedPhoneNumber(),
+        ),
+      ),
+    );
   }
 
   Future<void> _showSubmissionErrorDialog(String message) async {
@@ -308,8 +279,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
     if (!mounted) return;
     setState(() {
-      _pageStep = 1;
-      _biometricsVerified = false;
+      _pageStep = 0;
       _statusMsg = 'Error: $cleanMessage';
     });
   }
@@ -362,6 +332,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   Widget _buildInfoForm() {
+    final locale = context.appLocale;
     return Scaffold(
       backgroundColor: BrandColors.bg,
       appBar: AppBar(
@@ -393,8 +364,6 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const SizedBox(height: 8),
-            const _StepBar(currentStep: 0),
-            const SizedBox(height: 20),
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(18),
@@ -412,19 +381,25 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                     padding: EdgeInsets.zero,
                   ),
                   const SizedBox(height: 14),
-                  const Text(
-                    'Employee Registration',
-                    style: TextStyle(
+                  Text(
+                    locale.t(
+                      'Employee Registration',
+                      'Pagrerehistro ng Empleyado',
+                    ),
+                    style: const TextStyle(
                       color: BrandColors.text,
                       fontSize: 20,
                       fontWeight: FontWeight.w800,
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    'Fill in your details, then verify your fingerprint.',
+                  Text(
+                    locale.t(
+                      'Fill in your details to submit your registration for approval.',
+                      'Punan ang iyong detalye upang isumite ang iyong rehistrasyon para sa pag-apruba.',
+                    ),
                     textAlign: TextAlign.center,
-                    style: TextStyle(
+                    style: const TextStyle(
                       color: BrandColors.textMuted,
                       fontSize: 13,
                       height: 1.4,
@@ -440,10 +415,17 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               child: AutofillGroup(
                 child: Column(
                   children: [
+                    _FacePhotoField(
+                      photoPath: _facePhotoPath,
+                      error: _facePhotoError,
+                      onTakePhoto: () => _pickFacePhoto(ImageSource.camera),
+                      onChoosePhoto: () => _pickFacePhoto(ImageSource.gallery),
+                    ),
+                    const SizedBox(height: 16),
                     _AppField(
                       ctrl: _firstNameCtrl,
-                      label: 'First Name',
-                      hint: 'Enter your first name',
+                      label: locale.t('First Name', 'Unang Pangalan'),
+                      hint: locale.t('Enter your first name', 'Ilagay ang iyong unang pangalan'),
                       icon: Icons.person_rounded,
                       required: true,
                       textCapitalization: TextCapitalization.words,
@@ -451,7 +433,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       autofillHints: const [AutofillHints.givenName],
                       validator: (value) {
                         if ((value ?? '').trim().isEmpty) {
-                          return 'First name is required.';
+                          return locale.t('First name is required.', 'Kinakailangan ang unang pangalan.');
                         }
                         return null;
                       },
@@ -459,8 +441,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                     const SizedBox(height: 14),
                     _AppField(
                       ctrl: _lastNameCtrl,
-                      label: 'Last Name',
-                      hint: 'Enter your last name',
+                      label: locale.t('Last Name', 'Apelyido'),
+                      hint: locale.t('Enter your last name', 'Ilagay ang iyong apelyido'),
                       icon: Icons.person_outline_rounded,
                       required: true,
                       textCapitalization: TextCapitalization.words,
@@ -468,16 +450,17 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       autofillHints: const [AutofillHints.familyName],
                       validator: (value) {
                         if ((value ?? '').trim().isEmpty) {
-                          return 'Last name is required.';
+                          return locale.t('Last name is required.', 'Kinakailangan ang apelyido.');
                         }
                         return null;
                       },
                     ),
                     const SizedBox(height: 14),
-                    _AppField(
+                    _ResponsiveFormPair(
+                      first: _AppField(
                       ctrl: _emailCtrl,
-                      label: 'Email',
-                      hint: 'Enter a valid email',
+                      label: locale.t('Email', 'Email'),
+                      hint: locale.t('Enter a valid email', 'Maglagay ng wastong email'),
                       icon: Icons.email_rounded,
                       required: true,
                       keyboardType: TextInputType.emailAddress,
@@ -485,17 +468,18 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       autofillHints: const [AutofillHints.email],
                       validator: (value) {
                         final text = (value ?? '').trim();
-                        if (text.isEmpty) return 'Email is required.';
+                        if (text.isEmpty) {
+                          return locale.t('Email is required.', 'Kinakailangan ang email.');
+                        }
                         if (!_emailPattern.hasMatch(text)) {
-                          return 'Enter a valid email address.';
+                          return locale.t('Enter a valid email address.', 'Maglagay ng wastong email address.');
                         }
                         return null;
                       },
-                    ),
-                    const SizedBox(height: 14),
-                    _AppField(
+                      ),
+                      second: _AppField(
                       ctrl: _phoneCtrl,
-                      label: 'Phone Number',
+                      label: locale.t('Phone Number', 'Numero ng Telepono'),
                       hint: '9123456789',
                       icon: Icons.phone_rounded,
                       required: true,
@@ -542,19 +526,22 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                           RegExp(r'\D'),
                           '',
                         );
-                        if (digits.isEmpty) return 'Phone number is required.';
+                        if (digits.isEmpty) {
+                          return locale.t('Phone number is required.', 'Kinakailangan ang numero ng telepono.');
+                        }
                         if (digits.length != 10 && digits.length != 11) {
-                          return 'Enter a valid PH mobile number.';
+                          return locale.t('Enter a valid PH mobile number.', 'Maglagay ng wastong PH mobile number.');
                         }
                         return null;
                       },
+                      ),
                     ),
                     const SizedBox(height: 8),
-                    const Align(
+                    Align(
                       alignment: Alignment.centerLeft,
                       child: Text(
-                        'Government IDs',
-                        style: TextStyle(
+                        locale.t('Government IDs', 'Mga Government ID'),
+                        style: const TextStyle(
                           color: BrandColors.text,
                           fontSize: 13,
                           fontWeight: FontWeight.w700,
@@ -562,98 +549,97 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    _AppField(
+                    _ResponsiveGovIdGrid(
+                      first: _AppField(
                       ctrl: _sssCtrl,
-                      label: 'SSS Number',
+                      label: locale.t('SSS Number', 'Numero ng SSS'),
                       hint: 'e.g. 12-3456789-0',
                       icon: Icons.badge_rounded,
                       required: true,
                       textInputAction: TextInputAction.next,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
-                        LengthLimitingTextInputFormatter(11),
+                      inputFormatters: const [
+                        _GovIdInputFormatter([2, 7, 1]),
                       ],
                       validator: (value) {
                         final text = (value ?? '').trim();
-                        if (text.isEmpty) return 'SSS Number is required.';
+                        if (text.isEmpty) {
+                          return locale.t('SSS Number is required.', 'Kinakailangan ang Numero ng SSS.');
+                        }
                         if (!_sssPattern.hasMatch(text)) {
                           return 'Format: 12-3456789-0';
                         }
                         return null;
                       },
-                    ),
-                    const SizedBox(height: 14),
-                    _AppField(
+                      ),
+                      second: _AppField(
                       ctrl: _philhealthCtrl,
-                      label: 'PhilHealth Number',
+                      label: locale.t('PhilHealth Number', 'Numero ng PhilHealth'),
                       hint: 'e.g. 12-345678901-2',
                       icon: Icons.health_and_safety_rounded,
                       required: true,
                       textInputAction: TextInputAction.next,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
-                        LengthLimitingTextInputFormatter(14),
+                      inputFormatters: const [
+                        _GovIdInputFormatter([2, 9, 1]),
                       ],
                       validator: (value) {
                         final text = (value ?? '').trim();
                         if (text.isEmpty) {
-                          return 'PhilHealth Number is required.';
+                          return locale.t('PhilHealth Number is required.', 'Kinakailangan ang Numero ng PhilHealth.');
                         }
                         if (!_philhealthPattern.hasMatch(text)) {
                           return 'Format: 12-345678901-2';
                         }
                         return null;
                       },
-                    ),
-                    const SizedBox(height: 14),
-                    _AppField(
+                      ),
+                      third: _AppField(
                       ctrl: _pagibigCtrl,
-                      label: 'Pag-IBIG Number',
+                      label: locale.t('Pag-IBIG Number', 'Numero ng Pag-IBIG'),
                       hint: 'e.g. 1234-5678-9012',
                       icon: Icons.home_work_rounded,
                       required: true,
                       textInputAction: TextInputAction.next,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
-                        LengthLimitingTextInputFormatter(14),
+                      inputFormatters: const [
+                        _GovIdInputFormatter([4, 4, 4]),
                       ],
                       validator: (value) {
                         final text = (value ?? '').trim();
                         if (text.isEmpty) {
-                          return 'Pag-IBIG Number is required.';
+                          return locale.t('Pag-IBIG Number is required.', 'Kinakailangan ang Numero ng Pag-IBIG.');
                         }
                         if (!_pagibigPattern.hasMatch(text)) {
                           return 'Format: 1234-5678-9012';
                         }
                         return null;
                       },
-                    ),
-                    const SizedBox(height: 14),
-                    _AppField(
+                      ),
+                      fourth: _AppField(
                       ctrl: _tinCtrl,
-                      label: 'TIN Number',
+                      label: locale.t('TIN Number', 'Numero ng TIN'),
                       hint: 'e.g. 123-456-789-012',
                       icon: Icons.receipt_long_rounded,
                       required: true,
                       textInputAction: TextInputAction.next,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(RegExp(r'[0-9-]')),
-                        LengthLimitingTextInputFormatter(15),
+                      inputFormatters: const [
+                        _GovIdInputFormatter([3, 3, 3, 3]),
                       ],
                       validator: (value) {
                         final text = (value ?? '').trim();
-                        if (text.isEmpty) return 'TIN Number is required.';
+                        if (text.isEmpty) {
+                          return locale.t('TIN Number is required.', 'Kinakailangan ang Numero ng TIN.');
+                        }
                         if (!_tinPattern.hasMatch(text)) {
                           return 'Format: 123-456-789-012';
                         }
                         return null;
                       },
+                      ),
                     ),
                     const SizedBox(height: 14),
                     _AppField(
                       ctrl: _passwordCtrl,
-                      label: 'Password',
-                      hint: 'At least 8 characters',
+                      label: locale.t('Password', 'Password'),
+                      hint: locale.t('At least 8 characters', 'Hindi bababa sa 8 na karakter'),
                       icon: Icons.lock_rounded,
                       required: true,
                       keyboardType: TextInputType.visiblePassword,
@@ -674,9 +660,11 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       ),
                       validator: (value) {
                         final text = value ?? '';
-                        if (text.isEmpty) return 'Password is required.';
+                        if (text.isEmpty) {
+                          return locale.t('Password is required.', 'Kinakailangan ang password.');
+                        }
                         if (text.length < 8) {
-                          return 'Password must be at least 8 characters.';
+                          return locale.t('Password must be at least 8 characters.', 'Ang password ay dapat hindi bababa sa 8 na karakter.');
                         }
                         return null;
                       },
@@ -684,8 +672,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                     const SizedBox(height: 14),
                     _AppField(
                       ctrl: _confirmPasswordCtrl,
-                      label: 'Confirm Password',
-                      hint: 'Re-enter your password',
+                      label: locale.t('Confirm Password', 'Kumpirmahin ang Password'),
+                      hint: locale.t('Re-enter your password', 'Ulitin ang iyong password'),
                       icon: Icons.lock_outline_rounded,
                       required: true,
                       keyboardType: TextInputType.visiblePassword,
@@ -707,10 +695,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       ),
                       validator: (value) {
                         if ((value ?? '').isEmpty) {
-                          return 'Please confirm your password.';
+                          return locale.t('Please confirm your password.', 'Paki-kumpirma ang iyong password.');
                         }
                         if (value != _passwordCtrl.text) {
-                          return 'Passwords do not match.';
+                          return locale.t('Passwords do not match.', 'Hindi magkatugma ang mga password.');
                         }
                         return null;
                       },
@@ -733,7 +721,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               width: double.infinity,
               height: 54,
               child: ElevatedButton(
-                onPressed: _isCheckingAvailability ? null : _goToBiometrics,
+                onPressed: _isCheckingAvailability ? null : _submitForm,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: BrandColors.cyan,
                   foregroundColor: Colors.white,
@@ -750,18 +738,18 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                           color: Colors.white,
                         ),
                       )
-                    : const Row(
+                    : Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           Text(
-                            'Next',
-                            style: TextStyle(
+                            locale.t('Submit Registration', 'Isumite ang Rehistrasyon'),
+                            style: const TextStyle(
                               fontSize: 16,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-                          SizedBox(width: 8),
-                          Icon(Icons.arrow_forward_rounded, size: 20),
+                          const SizedBox(width: 8),
+                          const Icon(Icons.send_rounded, size: 20),
                         ],
                       ),
               ),
@@ -772,300 +760,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     );
   }
 
-  Widget _buildBiometricsScreen() {
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (didPop) return;
-        unawaited(_backToForm());
-      },
-      child: Scaffold(
-        backgroundColor: BrandColors.bg,
-        appBar: AppBar(
-          backgroundColor: BrandColors.surface,
-          elevation: 0,
-          toolbarHeight: 72,
-          leading: IconButton(
-            icon: const Icon(
-              Icons.arrow_back_ios_new_rounded,
-              color: BrandColors.text,
-              size: 20,
-            ),
-            onPressed: () async {
-              await _backToForm();
-            },
-          ),
-          title: const BrandMark(
-            compact: true,
-            titleColor: BrandColors.text,
-            subtitleColor: BrandColors.textMuted,
-          ),
-          bottom: PreferredSize(
-            preferredSize: const Size.fromHeight(1),
-            child: Container(height: 1, color: BrandColors.border),
-          ),
-        ),
-        body: SafeArea(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(20, 24, 20, 24),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 480),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const _StepBar(currentStep: 1),
-                    const SizedBox(height: 22),
-                    Container(
-                      padding: const EdgeInsets.all(22),
-                      decoration: BoxDecoration(
-                        color: BrandColors.surface.withValues(alpha: 0.96),
-                        borderRadius: BorderRadius.circular(32),
-                        border: Border.all(
-                          color: BrandColors.border.withValues(alpha: 0.95),
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.08),
-                            blurRadius: 28,
-                            offset: const Offset(0, 16),
-                          ),
-                        ],
-                      ),
-                      child: Column(
-                        children: [
-                          const SizedBox(height: 8),
-                          Container(
-                            width: 96,
-                            height: 96,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: const Color(0xFF00B8A9)
-                                  .withValues(alpha: 0.12),
-                              border: Border.all(
-                                color: const Color(0xFF00B8A9)
-                                    .withValues(alpha: 0.35),
-                              ),
-                            ),
-                            child: _biometricsVerified
-                                ? const Icon(
-                                    Icons.check_rounded,
-                                    color: Color(0xFF00B8A9),
-                                    size: 52,
-                                  )
-                                : const Icon(
-                                    Icons.fingerprint_rounded,
-                                    color: Color(0xFF00B8A9),
-                                    size: 52,
-                                  ),
-                          ),
-                          const SizedBox(height: 20),
-                          const Text(
-                            'Verify Fingerprint',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: BrandColors.text,
-                              fontSize: 22,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            _biometricsVerified
-                                ? 'Fingerprint verified.\nSubmitting your registration...'
-                                : _hasBiometrics
-                                    ? 'Confirm with your fingerprint to\nfinish setting up your account.'
-                                    : 'No fingerprint is available on this device.\nYou can still continue without one.',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: BrandColors.textMuted,
-                              fontSize: 13,
-                              height: 1.4,
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                          Material(
-                            color: Colors.transparent,
-                            child: InkWell(
-                              onTap: _biometricsVerified ? null : _verifyBiometrics,
-                              borderRadius: BorderRadius.circular(22),
-                              child: Ink(
-                                padding: const EdgeInsets.all(20),
-                                decoration: BoxDecoration(
-                                  gradient: const LinearGradient(
-                                    colors: [
-                                      Color(0xFF073B36),
-                                      Color(0xFF041E1B),
-                                    ],
-                                  ),
-                                  borderRadius: BorderRadius.circular(22),
-                                  border: Border.all(
-                                    color: const Color(0xFF00B8A9)
-                                        .withValues(alpha: 0.4),
-                                  ),
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: const Color(0xFF00B8A9)
-                                          .withValues(alpha: 0.14),
-                                      blurRadius: 22,
-                                      offset: const Offset(0, 10),
-                                    ),
-                                  ],
-                                ),
-                                child: Row(
-                                  children: [
-                                    Container(
-                                      width: 56,
-                                      height: 56,
-                                      decoration: BoxDecoration(
-                                        shape: BoxShape.circle,
-                                        color: const Color(0xFF00B8A9)
-                                            .withValues(alpha: 0.15),
-                                        border: Border.all(
-                                          color: const Color(0xFF00B8A9)
-                                              .withValues(alpha: 0.4),
-                                        ),
-                                      ),
-                                      child: _biometricsVerified
-                                          ? const Icon(
-                                              Icons.check_rounded,
-                                              color: Color(0xFF00B8A9),
-                                              size: 28,
-                                            )
-                                          : const Icon(
-                                              Icons.fingerprint_rounded,
-                                              color: Color(0xFF00B8A9),
-                                              size: 28,
-                                            ),
-                                    ),
-                                    const SizedBox(width: 16),
-                                    const Expanded(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Text(
-                                            'VERIFY FINGERPRINT',
-                                            style: TextStyle(
-                                              color: Color(0xFF00B8A9),
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.bold,
-                                              letterSpacing: 1,
-                                            ),
-                                          ),
-                                          SizedBox(height: 4),
-                                          Text(
-                                            'Tap to scan your fingerprint',
-                                            style: TextStyle(
-                                              color: Color(0xFF7FD9D1),
-                                              fontSize: 13,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 20),
-                          Container(
-                            padding: const EdgeInsets.all(14),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF00B8A9)
-                                  .withValues(alpha: 0.06),
-                              borderRadius: BorderRadius.circular(16),
-                              border: Border.all(
-                                color: const Color(0xFF00B8A9)
-                                    .withValues(alpha: 0.15),
-                              ),
-                            ),
-                            child: Row(
-                              children: [
-                                const Icon(
-                                  Icons.lock_rounded,
-                                  color: Color(0xFF00B8A9),
-                                  size: 18,
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Text(
-                                    _hasBiometrics
-                                        ? 'Your fingerprint stays on this device. It is never uploaded.'
-                                        : 'No fingerprint is available on this device. You can still continue.',
-                                    style: TextStyle(
-                                      color: BrandColors.textMuted,
-                                      fontSize: 12,
-                                      height: 1.4,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 18),
-                    if (_statusMsg.isNotEmpty) ...[
-                      _NoticeBox(
-                        title: _noticeTitleForMessage(_statusMsg),
-                        message: _statusMsg,
-                        icon: _noticeIconForMessage(_statusMsg),
-                        accentColor: _noticeColorForMessage(_statusMsg),
-                      ),
-                      const SizedBox(height: 14),
-                    ],
-                    if (!_hasBiometrics)
-                      SizedBox(
-                        width: double.infinity,
-                        height: 54,
-                        child: ElevatedButton.icon(
-                          onPressed: _biometricsVerified
-                              ? null
-                              : () {
-                                  HapticFeedback.mediumImpact();
-                                  setState(() {
-                                    _biometricsVerified = true;
-                                    _statusMsg = '';
-                                  });
-                                  _submitRegistration();
-                                },
-                          icon: const Icon(Icons.skip_next_rounded, size: 20),
-                          label: const Text('Continue without fingerprint'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF364152),
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Future<void> _backToForm() async {
-    setState(() {
-      _pageStep = 0;
-      _statusMsg = '';
-      _biometricsVerified = false;
-      _submissionStatus =
-          'Please wait while we submit your registration.';
-      _submissionAttempt = 0;
-    });
-  }
 
   Widget _buildSubmitting() {
+    final locale = context.appLocale;
     return PopScope(
       canPop: false,
       child: Scaffold(
@@ -1091,9 +788,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                   ),
                 ),
                 const SizedBox(height: 22),
-                const Text(
-                  'Submitting Registration...',
-                  style: TextStyle(
+                Text(
+                  locale.t('Submitting Registration...', 'Sinisumite ang Rehistrasyon...'),
+                  style: const TextStyle(
                     color: BrandColors.text,
                     fontSize: 17,
                     fontWeight: FontWeight.w800,

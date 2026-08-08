@@ -73,6 +73,48 @@ class ApiClient {
         );
   }
 
+  static Future<http.Response> postJson(
+    String path, {
+    Map<String, dynamic>? body,
+    Map<String, String>? headers,
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    return http
+        .post(
+          url(path),
+          headers: {
+            'Content-Type': 'application/json',
+            ...?headers,
+          },
+          body: body == null ? null : jsonEncode(body),
+        )
+        .timeout(
+          timeout,
+          onTimeout: () => throw const SocketException('Request timed out.'),
+        );
+  }
+
+  static Future<http.Response> putJson(
+    String path, {
+    Map<String, dynamic>? body,
+    Map<String, String>? headers,
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    return http
+        .put(
+          url(path),
+          headers: {
+            'Content-Type': 'application/json',
+            ...?headers,
+          },
+          body: body == null ? null : jsonEncode(body),
+        )
+        .timeout(
+          timeout,
+          onTimeout: () => throw const SocketException('Request timed out.'),
+        );
+  }
+
   static Future<ApiResponse> sendMultipart(
     String path, {
     required Map<String, String> fields,
